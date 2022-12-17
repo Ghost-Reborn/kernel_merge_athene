@@ -1,4 +1,4 @@
-/* Copyright (c) 2011, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2011, 2013, 2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -39,11 +39,6 @@
 #define SPS_STATE_ENABLE      SPS_STATE_DEF(3)
 #define SPS_STATE_DISABLE     SPS_STATE_DEF(4)
 
-/* Connection mapping control struct */
-struct sps_rm {
-	struct list_head connections_q;
-	struct mutex lock;
-};
 
 /**
  * Find the BAM device from the handle
@@ -56,7 +51,7 @@ struct sps_rm {
  * @return - pointer to the BAM device struct, or NULL on error
  *
  */
-struct sps_bam *sps_h2bam(u32 h);
+struct sps_bam *sps_h2bam(unsigned long h);
 
 /**
  * Initialize resource manager module

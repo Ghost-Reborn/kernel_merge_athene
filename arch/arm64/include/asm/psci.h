@@ -14,8 +14,7 @@
 #ifndef __ASM_PSCI_H
 #define __ASM_PSCI_H
 
-#define PSCI_POWER_STATE_TYPE_STANDBY		0
-#define PSCI_POWER_STATE_TYPE_POWER_DOWN	1
+int psci_init(void);
 
 struct psci_power_state {
 	u16	id;
@@ -24,15 +23,20 @@ struct psci_power_state {
 };
 
 struct psci_operations {
-	int (*cpu_suspend)(struct psci_power_state state,
+	int (*get_version)(void);
+	int (*cpu_suspend)(unsigned long state_id,
 			   unsigned long entry_point);
 	int (*cpu_off)(struct psci_power_state state);
 	int (*cpu_on)(unsigned long cpuid, unsigned long entry_point);
 	int (*migrate)(unsigned long cpuid);
+	int (*affinity_info)(unsigned long target_affinity,
+			unsigned long lowest_affinity_level);
+	int (*migrate_info_type)(void);
 };
 
 extern struct psci_operations psci_ops;
-
-int psci_init(void);
+#ifdef CONFIG_HARDEN_BRANCH_PREDICTOR
+int psci_apply_bp_hardening(void);
+#endif /* CONFIG_HARDEN_BRANCH_PREDICTOR */
 
 #endif /* __ASM_PSCI_H */

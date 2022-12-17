@@ -11,6 +11,11 @@
 #define KGSL_CLK_MEM_IFACE 0x00000010
 #define KGSL_CLK_AXI	0x00000020
 #define KGSL_CLK_ALT_MEM_IFACE 0x00000040
+#define KGSL_CLK_RBBMTIMER	0x00000080
+#define KGSL_CLK_GFX_GTCU   0x00000100
+#define KGSL_CLK_GFX_GTBU   0x00000200
+#define KGSL_CLK_AON	0x00000400
+#define KGSL_CLK_GFX_GTBU1   0x00000800
 
 #define KGSL_MAX_PWRLEVELS 10
 
@@ -18,49 +23,19 @@
 #define KGSL_3D0_SHADER_MEMORY	"kgsl_3d0_shader_memory"
 #define KGSL_3D0_IRQ		"kgsl_3d0_irq"
 
-enum kgsl_iommu_context_id {
-	KGSL_IOMMU_CONTEXT_USER = 0,
-	KGSL_IOMMU_CONTEXT_PRIV = 1,
-};
-
-/**
- * struct kgsl_iommu_ctx - Struct holding context name and id
- * @iommu_ctx_name:	Context name
- * @ctx_id:		Iommu context ID - user or priv
- */
-struct kgsl_iommu_ctx {
-	const char *iommu_ctx_name;
-	enum kgsl_iommu_context_id ctx_id;
-};
-
-/**
- * struct kgsl_device_iommu_data - Struct holding iommu context data obtained
- * from dtsi file
- * @iommu_ctxs:		Pointer to array of struct holding context name and id
- * @iommu_ctx_count:	Number of contexts defined in the dtsi file
- * @iommu_halt_enable:	Indicates if smmu halt h/w feature is supported
- * @physstart:		Start of iommu registers physical address
- * @physend:		End of iommu registers physical address
- */
-struct kgsl_device_iommu_data {
-	const struct kgsl_iommu_ctx *iommu_ctxs;
-	int iommu_ctx_count;
-	int iommu_halt_enable;
-	unsigned int physstart;
-	unsigned int physend;
-};
-
 /**
  * struct kgsl_pwrlevel - Struct holding different pwrlevel info obtained from
  * from dtsi file
  * @gpu_freq:		GPU frequency vote in Hz
- * @bus_freq:		Bus bandwidth vote in Mbps
- * @io_fraction:	IO percetage vote to the CPU
+ * @bus_freq:		Bus bandwidth vote index
+ * @bus_min:		Min bus index @gpu_freq
+ * @bus_max:		Max bus index @gpu_freq
  */
 struct kgsl_pwrlevel {
 	unsigned int gpu_freq;
 	unsigned int bus_freq;
-	unsigned int io_fraction;
+	unsigned int bus_min;
+	unsigned int bus_max;
 };
 
 /**
@@ -72,6 +47,7 @@ struct kgsl_pwrlevel {
  * @idle_timeout:	Timeout for GPU to turn its resources off
  * @strtstp_sleepwake:  Flag to decide b/w SLEEP and SLUMBER
  * @bus_control:	Flag if independent bus voting is supported
+ * @popp_enable:	Flag to enable POPP feature
  * @clk_map:		Clocks map per platform
  * @bus_scale_table:	Bus table with different b/w votes
  * @iommu_data:		Struct holding iommu context data
@@ -79,7 +55,8 @@ struct kgsl_pwrlevel {
  * @csdev:		Pointer to the coresight device for this device
  * @coresight_pdata:	Coresight configuration for specific device
  * @chipid:		Chip ID for the device's GPU
- * @pm_qos_latency:		latency value for cpu
+ * @pm_qos_active_latency:	GPU PM QoS latency request for active state
+ * @pm_qos_wakeup_latency:	GPU PM QoS latency request during wakeup
  */
 struct kgsl_device_platform_data {
 	struct kgsl_pwrlevel pwrlevel[KGSL_MAX_PWRLEVELS];
@@ -88,6 +65,7 @@ struct kgsl_device_platform_data {
 	unsigned int idle_timeout;
 	bool strtstp_sleepwake;
 	bool bus_control;
+	bool popp_enable;
 	unsigned int clk_map;
 	unsigned int step_mul;
 	struct msm_bus_scale_pdata *bus_scale_table;
@@ -96,8 +74,16 @@ struct kgsl_device_platform_data {
 	struct coresight_device *csdev;
 	struct coresight_platform_data *coresight_pdata;
 	unsigned int chipid;
-	unsigned int pm_qos_latency;
+	unsigned int pm_qos_active_latency;
+	unsigned int pm_qos_wakeup_latency;
 };
+
+/* Limits mitigations APIs */
+void *kgsl_pwr_limits_add(enum kgsl_deviceid id);
+void kgsl_pwr_limits_del(void *limit);
+int kgsl_pwr_limits_set_freq(void *limit, unsigned int freq);
+void kgsl_pwr_limits_set_default(void *limit);
+unsigned int kgsl_pwr_limits_get_freq(enum kgsl_deviceid id);
 
 #ifdef CONFIG_MSM_KGSL_DRM
 int kgsl_gem_obj_addr(int drm_fd, int handle, unsigned long *start,

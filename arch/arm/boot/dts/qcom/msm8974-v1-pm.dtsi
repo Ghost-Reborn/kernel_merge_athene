@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2014, 2016, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -119,15 +119,15 @@
 		qcom,saw2-spm-ctl = <0x1>;
 		qcom,saw2-pmic-data0 = <0x02030080>;
 		qcom,saw2-pmic-data1 = <0x00030000>;
-		qcom,vctl-timeout-us = <50>;
+		qcom,vctl-timeout-us = <500>;
 		qcom,vctl-port = <0x0>;
 		qcom,phase-port = <0x1>;
+		qcom,cpu-vctl-mask = <0xf>;
 		qcom,pfm-port = <0x2>;
 		qcom,saw2-spm-cmd-ret = [1f 00 20 03 22 00 0f];
 		qcom,saw2-spm-cmd-gdhs = [00 20 32 42 03 44 22 50 02 32 50 0f];
 		qcom,saw2-spm-cmd-pc = [00 10 32 b0 11 42 07 01 b0 12 44
 				50 02 32 50 0f];
-		qcom,L2-spm-is-apcs-master;
 	};
 
 	qcom,lpm-levels {
@@ -194,6 +194,8 @@
 		    <0xf9011008 0x4>;   /* MSM_APCS_GCC_BASE 4K */
 		reg-names = "vmpm", "ipc";
 		interrupts = <0 171 1>;
+		clocks = <&clock_rpm clk_cxo_lpm_clk>;
+		clock-names = "xo";
 
 		qcom,ipc-bit-offset = <1>;
 
@@ -303,8 +305,14 @@
 		#size-cells = <1>;
 		ranges;
 		reg = <0xfe805664 0x40>;
-		qcom,pc-mode = "tz_l2_int";
 		qcom,use-sync-timer;
+		clock-names = "l2_clk", "cpu0_clk", "cpu1_clk", "cpu2_clk",
+				"cpu3_clk";
+		clocks = <&clock_krait clk_l2_clk>,
+			 <&clock_krait clk_krait0_clk>,
+			 <&clock_krait clk_krait1_clk>,
+			 <&clock_krait clk_krait2_clk>,
+			 <&clock_krait clk_krait3_clk>;
 	};
 
 	qcom,cpu-sleep-status@f9088008 {

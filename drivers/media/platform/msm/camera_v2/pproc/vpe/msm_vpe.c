@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2015 The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -18,7 +18,7 @@
 #include <linux/msm_ion.h>
 #include <linux/iommu.h>
 #include <linux/msm_iommu_domains.h>
-#include <mach/iommu.h>
+#include <linux/qcom_iommu.h>
 #include <media/v4l2-dev.h>
 #include <media/v4l2-event.h>
 #include <media/v4l2-fh.h>
@@ -27,6 +27,10 @@
 #include <media/media-entity.h>
 #include <media/msmb_generic_buf_mgr.h>
 #include <media/msmb_pproc.h>
+#include <asm/dma-iommu.h>
+#include <linux/dma-direction.h>
+#include <linux/dma-attrs.h>
+#include <linux/dma-buf.h>
 #include "msm_vpe.h"
 #include "msm_camera_io_util.h"
 
@@ -52,12 +56,12 @@ static void vpe_mem_dump(const char * const name, const void * const addr,
 	int i;
 	u32 *p = (u32 *) addr;
 	u32 data;
-	VPE_DBG("%s: (%s) %p %d\n", __func__, name, addr, size);
+	VPE_DBG("%s: (%s) %pK %d\n", __func__, name, addr, size);
 	line_str[0] = '\0';
 	p_str = line_str;
 	for (i = 0; i < size/4; i++) {
 		if (i % 4 == 0) {
-			snprintf(p_str, 12, "%08x: ", (u32) p);
+			snprintf(p_str, 12, "%pK: ", p);
 			p_str += 10;
 		}
 		data = *p++;
@@ -201,20 +205,35 @@ static unsigned long msm_vpe_queue_buffer_info(struct vpe_device *vpe_dev,
 	}
 
 	buff->map_info.buff_info = *buffer_info;
-	buff->map_info.ion_handle = ion_import_dma_buf(vpe_dev->client,
-		buffer_info->fd);
-	if (IS_ERR_OR_NULL(buff->map_info.ion_handle)) {
-		pr_err("ION import failed\n");
-		goto queue_buff_error1;
+	buff->map_info.dbuf = dma_buf_get(buffer_info->fd);
+	if (IS_ERR_OR_NULL(buff->map_info.dbuf)) {
+		pr_err("Ion dma get buf failed\n");
+		rc = PTR_ERR(buff->map_info.dbuf);
+		goto err_get;
 	}
 
-	rc = ion_map_iommu(vpe_dev->client, buff->map_info.ion_handle,
+	buff->map_info.attachment = dma_buf_attach(buff->map_info.dbuf,
+		&vpe_dev->pdev->dev);
+	if (IS_ERR_OR_NULL(buff->map_info.attachment)) {
+		pr_err("Ion dma buf attach failed\n");
+		rc = PTR_ERR(buff->map_info.attachment);
+		goto err_put;
+	}
+
+	buff->map_info.table =
+		dma_buf_map_attachment(buff->map_info.attachment,
+			DMA_BIDIRECTIONAL);
+	if (IS_ERR_OR_NULL(buff->map_info.table)) {
+		pr_err("DMA buf map attachment failed\n");
+		rc = PTR_ERR(buff->map_info.table);
+		goto err_detach;
+	}
+	if (msm_map_dma_buf(buff->map_info.dbuf, buff->map_info.table,
 		vpe_dev->domain_num, 0, SZ_4K, 0,
 		&buff->map_info.phy_addr,
-		&buff->map_info.len, 0, 0);
-	if (rc < 0) {
-		pr_err("ION mmap failed\n");
-		goto queue_buff_error2;
+		&buff->map_info.len, 0, 0)) {
+		pr_err("%s: cannot map address", __func__);
+		goto err_detachment;
 	}
 
 	INIT_LIST_HEAD(&buff->entry);
@@ -222,25 +241,26 @@ static unsigned long msm_vpe_queue_buffer_info(struct vpe_device *vpe_dev,
 
 	return buff->map_info.phy_addr;
 
-queue_buff_error2:
-	ion_unmap_iommu(vpe_dev->client, buff->map_info.ion_handle,
-		vpe_dev->domain_num, 0);
-queue_buff_error1:
-	ion_free(vpe_dev->client, buff->map_info.ion_handle);
-	buff->map_info.ion_handle = NULL;
+err_detachment:
+	dma_buf_unmap_attachment(buff->map_info.attachment,
+		buff->map_info.table, DMA_BIDIRECTIONAL);
+err_detach:
+	dma_buf_detach(buff->map_info.dbuf, buff->map_info.attachment);
+err_put:
+	dma_buf_put(buff->map_info.dbuf);
+err_get:
 	kzfree(buff);
-
 	return 0;
 }
 
 static void msm_vpe_dequeue_buffer_info(struct vpe_device *vpe_dev,
 	struct msm_vpe_buffer_map_list_t *buff)
 {
-	ion_unmap_iommu(vpe_dev->client, buff->map_info.ion_handle,
-		vpe_dev->domain_num, 0);
-	ion_free(vpe_dev->client, buff->map_info.ion_handle);
-	buff->map_info.ion_handle = NULL;
-
+	msm_unmap_dma_buf(buff->map_info.table, vpe_dev->domain_num, 0);
+	dma_buf_unmap_attachment(buff->map_info.attachment,
+		buff->map_info.table, DMA_BIDIRECTIONAL);
+	dma_buf_detach(buff->map_info.dbuf, buff->map_info.attachment);
+	dma_buf_put(buff->map_info.dbuf);
 	list_del_init(&buff->entry);
 	kzfree(buff);
 
@@ -411,7 +431,7 @@ static int vpe_init_mem(struct vpe_device *vpe_dev)
 {
 	kref_init(&vpe_dev->refcount);
 	kref_get(&vpe_dev->refcount);
-	vpe_dev->client = msm_ion_client_create(-1, "vpe");
+	vpe_dev->client = msm_ion_client_create("vpe");
 
 	if (!vpe_dev->client) {
 		pr_err("couldn't create ion client\n");
@@ -594,7 +614,7 @@ static int vpe_open_node(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 		goto err_mutex_unlock;
 	}
 
-	VPE_DBG("open %d %p\n", i, &fh->vfh);
+	VPE_DBG("open %d %pK\n", i, &fh->vfh);
 	vpe_dev->vpe_open_cnt++;
 	if (vpe_dev->vpe_open_cnt == 1) {
 		rc = vpe_init_hardware(vpe_dev);
@@ -649,7 +669,7 @@ static int vpe_close_node(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 		return -ENODEV;
 	}
 
-	VPE_DBG("close %d %p\n", i, &fh->vfh);
+	VPE_DBG("close %d %pK\n", i, &fh->vfh);
 	vpe_dev->vpe_open_cnt--;
 	if (vpe_dev->vpe_open_cnt == 0) {
 		vpe_deinit_mem(vpe_dev);
@@ -689,6 +709,11 @@ static int msm_vpe_notify_frame_done(struct vpe_device *vpe_dev)
 
 	if (queue->len > 0) {
 		frame_qcmd = msm_dequeue(queue, list_frame);
+		if (!frame_qcmd) {
+			pr_err("%s: %d frame_qcmd is NULL\n",
+				 __func__ , __LINE__);
+			return -EINVAL;
+		}
 		processed_frame = frame_qcmd->command;
 		do_gettimeofday(&(processed_frame->out_time));
 		kfree(frame_qcmd);
@@ -969,12 +994,12 @@ static int vpe_start(struct vpe_device *vpe_dev)
 {
 	/*  enable the frame irq, bit 0 = Display list 0 ROI done */
 	msm_camera_io_w_mb(1, vpe_dev->base + VPE_INTR_ENABLE_OFFSET);
-	msm_camera_io_dump(vpe_dev->base, 0x120);
-	msm_camera_io_dump(vpe_dev->base + 0x00400, 0x18);
-	msm_camera_io_dump(vpe_dev->base + 0x10000, 0x250);
-	msm_camera_io_dump(vpe_dev->base + 0x30000, 0x20);
-	msm_camera_io_dump(vpe_dev->base + 0x50000, 0x30);
-	msm_camera_io_dump(vpe_dev->base + 0x50400, 0x10);
+	msm_camera_io_dump(vpe_dev->base, 0x120, CONFIG_MSM_VPE_DBG);
+	msm_camera_io_dump(vpe_dev->base + 0x00400, 0x18, CONFIG_MSM_VPE_DBG);
+	msm_camera_io_dump(vpe_dev->base + 0x10000, 0x250, CONFIG_MSM_VPE_DBG);
+	msm_camera_io_dump(vpe_dev->base + 0x30000, 0x20, CONFIG_MSM_VPE_DBG);
+	msm_camera_io_dump(vpe_dev->base + 0x50000, 0x30, CONFIG_MSM_VPE_DBG);
+	msm_camera_io_dump(vpe_dev->base + 0x50400, 0x10, CONFIG_MSM_VPE_DBG);
 
 	/*
 	 * This triggers the operation. When the VPE is done,
@@ -1005,8 +1030,8 @@ static int vpe_reset(struct vpe_device *vpe_dev)
 	msm_camera_io_w(0x10, vpe_dev->base + VPE_SW_RESET_OFFSET);
 	/* then poll the reset bit, it should be self-cleared. */
 	while (1) {
-		rc = msm_camera_io_r(vpe_dev->base + VPE_SW_RESET_OFFSET) \
-			& 0x10;
+		rc = msm_camera_io_r(
+			vpe_dev->base + VPE_SW_RESET_OFFSET) & 0x10;
 		if (rc == 0)
 			break;
 		cpu_relax();
@@ -1156,6 +1181,7 @@ static int msm_vpe_cfg(struct vpe_device *vpe_dev,
 	memset(&buff_mgr_info, 0, sizeof(struct msm_buf_mngr_info));
 	buff_mgr_info.session_id = ((new_frame->identity >> 16) & 0xFFFF);
 	buff_mgr_info.stream_id = (new_frame->identity & 0xFFFF);
+	buff_mgr_info.type = MSM_CAMERA_BUF_MNGR_BUF_PLANAR;
 	rc = msm_vpe_buffer_ops(vpe_dev, VIDIOC_MSM_BUF_MNGR_GET_BUF,
 				&buff_mgr_info);
 	if (rc < 0) {
@@ -1219,7 +1245,7 @@ static long msm_vpe_subdev_ioctl(struct v4l2_subdev *sd,
 		struct msm_vpe_transaction_setup_cfg *cfg;
 		VPE_DBG("VIDIOC_MSM_VPE_TRANSACTION_SETUP\n");
 		if (sizeof(*cfg) != ioctl_ptr->len) {
-			pr_err("%s: size mismatch cmd=%d, len=%d, expected=%d",
+			pr_err("%s: size mismatch cmd=%d, len=%zu, expected=%zu",
 				__func__, cmd, ioctl_ptr->len,
 				sizeof(*cfg));
 			rc = -EINVAL;
@@ -1366,12 +1392,19 @@ static long msm_vpe_subdev_ioctl(struct v4l2_subdev *sd,
 		struct msm_vpe_frame_info_t *process_frame;
 		VPE_DBG("VIDIOC_MSM_VPE_GET_EVENTPAYLOAD\n");
 		event_qcmd = msm_dequeue(queue, list_eventdata);
+		if (!event_qcmd) {
+			pr_err("%s: %d event_qcmd is NULL\n",
+				__func__ , __LINE__);
+			return -EINVAL;
+		}
 		process_frame = event_qcmd->command;
 		VPE_DBG("fid %d\n", process_frame->frame_id);
 		if (copy_to_user((void __user *)ioctl_ptr->ioctl_ptr,
 				process_frame,
 				sizeof(struct msm_vpe_frame_info_t))) {
 					mutex_unlock(&vpe_dev->mutex);
+					kfree(process_frame);
+					kfree(event_qcmd);
 					return -EINVAL;
 		}
 
@@ -1551,12 +1584,7 @@ static int vpe_probe(struct platform_device *pdev)
 	vpe_dev->msm_sd.sd.entity.group_id = MSM_CAMERA_SUBDEV_VPE;
 	vpe_dev->msm_sd.sd.entity.name = pdev->name;
 	msm_sd_register(&vpe_dev->msm_sd);
-	msm_vpe_v4l2_subdev_fops.owner = v4l2_subdev_fops.owner;
-	msm_vpe_v4l2_subdev_fops.open = v4l2_subdev_fops.open;
-	msm_vpe_v4l2_subdev_fops.unlocked_ioctl = msm_vpe_subdev_fops_ioctl;
-	msm_vpe_v4l2_subdev_fops.release = v4l2_subdev_fops.release;
-	msm_vpe_v4l2_subdev_fops.poll = v4l2_subdev_fops.poll;
-
+	msm_cam_copy_v4l2_subdev_fops(&msm_vpe_v4l2_subdev_fops);
 	vpe_dev->msm_sd.sd.devnode->fops = &msm_vpe_v4l2_subdev_fops;
 	vpe_dev->msm_sd.sd.entity.revision = vpe_dev->msm_sd.sd.devnode->num;
 	vpe_dev->state = VPE_STATE_BOOT;

@@ -1,4 +1,5 @@
-/* Copyright (c) 2009-2014, The Linux Foundation. All rights reserved.
+/*
+ * Copyright (c) 2009-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -54,16 +55,42 @@
 
 #define early_machine_is_msm8610()	\
 	of_flat_dt_is_compatible(of_get_flat_dt_root(), "qcom,msm8610")
-#define early_machine_is_mpq8092()	\
-	of_flat_dt_is_compatible(of_get_flat_dt_root(), "qcom,mpq8092")
+#define early_machine_is_msm8909()	\
+	of_flat_dt_is_compatible(of_get_flat_dt_root(), "qcom,msm8909")
+#define early_machine_is_msm8916()	\
+	of_flat_dt_is_compatible(of_get_flat_dt_root(), "qcom,msm8916")
+#define early_machine_is_msm8936()	\
+	of_flat_dt_is_compatible(of_get_flat_dt_root(), "qcom,msm8936")
+#define early_machine_is_msm8939()	\
+	of_flat_dt_is_compatible(of_get_flat_dt_root(), "qcom,msm8939")
 #define early_machine_is_apq8084()	\
 	of_flat_dt_is_compatible(of_get_flat_dt_root(), "qcom,apq8084")
 #define early_machine_is_mdm9630()	\
 	of_flat_dt_is_compatible(of_get_flat_dt_root(), "qcom,mdm9630")
+#define early_machine_is_mdm9640()	\
+	of_flat_dt_is_compatible(of_get_flat_dt_root(), "qcom,mdm9640")
+#define early_machine_is_mdmcalifornium()	\
+	of_flat_dt_is_compatible(of_get_flat_dt_root(), "qcom,mdmcalifornium")
+#define early_machine_is_msmvpipa()	\
+	of_flat_dt_is_compatible(of_get_flat_dt_root(), "qcom,msmvpipa")
 #define early_machine_is_fsm9900()	\
 	of_flat_dt_is_compatible(of_get_flat_dt_root(), "qcom,fsm9900")
-#define early_machine_is_msmsamarium()	\
-	of_flat_dt_is_compatible(of_get_flat_dt_root(), "qcom,msmsamarium")
+#define early_machine_is_msm8994()	\
+	of_flat_dt_is_compatible(of_get_flat_dt_root(), "qcom,msm8994")
+#define early_machine_is_msm8992()	\
+	of_flat_dt_is_compatible(of_get_flat_dt_root(), "qcom,msm8992")
+#define early_machine_is_fsm9010()	\
+	of_flat_dt_is_compatible(of_get_flat_dt_root(), "qcom,fsm9010")
+#define early_machine_is_msm8976()	\
+	of_flat_dt_is_compatible(of_get_flat_dt_root(), "qcom,msm8976")
+#define early_machine_is_msm8956()	\
+	of_flat_dt_is_compatible(of_get_flat_dt_root(), "qcom,msm8956")
+#define early_machine_is_msm8952()	\
+	of_flat_dt_is_compatible(of_get_flat_dt_root(), "qcom,msm8952")
+#define early_machine_is_msm8929()	\
+	of_flat_dt_is_compatible(of_get_flat_dt_root(), "qcom,msm8929")
+#define early_machine_is_mdmfermium()	\
+	of_flat_dt_is_compatible(of_get_flat_dt_root(), "qcom,mdmfermium")
 #else
 #define of_board_is_sim()		0
 #define of_board_is_rumi()		0
@@ -84,12 +111,20 @@
 #define machine_is_apq8074()		0
 #define machine_is_msm8926()		0
 
-#define early_machine_is_msm8610()	0
-#define early_machine_is_mpq8092()	0
-#define early_machine_is_apq8084()	0
-#define early_machine_is_mdm9630()	0
-#define early_machine_is_fsm9900()	0
-#define early_machine_is_msmsamarium()	0
+#define early_machine_is_msm8610()		0
+#define early_machine_is_msm8909()		0
+#define early_machine_is_msm8916()		0
+#define early_machine_is_msm8936()		0
+#define early_machine_is_msm8939()		0
+#define early_machine_is_apq8084()		0
+#define early_machine_is_mdm9630()		0
+#define early_machine_is_mdmcalifornium()	0
+#define early_machine_is_fsm9900()		0
+#define early_machine_is_fsm9010()		0
+#define early_machine_is_msm8952()		0
+#define early_machine_is_msm8976()		0
+#define early_machine_is_msm8929()		0
+#define early_machine_is_mdmfermium		0
 #endif
 
 #define PLATFORM_SUBTYPE_MDM	1
@@ -128,14 +163,32 @@ enum msm_cpu {
 	MSM_CPU_8627,
 	MSM_CPU_8625,
 	MSM_CPU_9625,
-	MSM_CPU_8092,
+	MSM_CPU_8909,
+	MSM_CPU_8916,
+	MSM_CPU_8936,
+	MSM_CPU_8939,
 	MSM_CPU_8226,
 	MSM_CPU_8610,
 	MSM_CPU_8625Q,
 	MSM_CPU_8084,
 	MSM_CPU_9630,
 	FSM_CPU_9900,
-	MSM_CPU_SAMARIUM,
+	MSM_CPU_9640,
+	MSM_CPU_8994,
+	MSM_CPU_8992,
+	FSM_CPU_9010,
+	MSM_CPU_8952,
+	MSM_CPU_8976,
+	MSM_CPU_8956,
+	MSM_CPU_8929,
+	MSM_CPU_FERMIUM,
+	MSM_CPU_CALIFORNIUM,
+};
+
+struct msm_soc_info {
+	enum msm_cpu generic_soc_type;
+	char *soc_id_string;
+	char *suffix;
 };
 
 enum pmic_model {
@@ -159,10 +212,12 @@ enum msm_cpu socinfo_get_msm_cpu(void);
 uint32_t socinfo_get_id(void);
 uint32_t socinfo_get_version(void);
 uint32_t socinfo_get_raw_id(void);
+uint32_t socinfo_get_raw_version(void);
 char *socinfo_get_build_id(void);
 uint32_t socinfo_get_platform_type(void);
 uint32_t socinfo_get_platform_subtype(void);
 uint32_t socinfo_get_platform_version(void);
+uint32_t socinfo_get_serial_number(void);
 enum pmic_model socinfo_get_pmic_model(void);
 uint32_t socinfo_get_pmic_die_revision(void);
 int __init socinfo_init(void) __must_check;
@@ -472,17 +527,80 @@ static inline int cpu_is_msm8974pro_ac(void)
 #endif
 }
 
-static inline int cpu_is_mpq8092(void)
+static inline int cpu_is_msm8909(void)
 {
-#ifdef CONFIG_ARCH_MPQ8092
+#ifdef CONFIG_ARCH_MSM8909
 	enum msm_cpu cpu = socinfo_get_msm_cpu();
 
 	BUG_ON(cpu == MSM_CPU_UNKNOWN);
-	return cpu == MSM_CPU_8092;
+	return cpu == MSM_CPU_8909;
+#else
+	return 0;
+#endif
+}
+
+static inline int cpu_is_msm8916(void)
+{
+#ifdef CONFIG_ARCH_MSM8916
+	enum msm_cpu cpu = socinfo_get_msm_cpu();
+
+	BUG_ON(cpu == MSM_CPU_UNKNOWN);
+	return cpu == MSM_CPU_8916;
 #else
 	return 0;
 #endif
 
+}
+
+static inline int cpu_is_msm8936(void)
+{
+#ifdef CONFIG_ARCH_MSM8916
+	enum msm_cpu cpu = socinfo_get_msm_cpu();
+
+	BUG_ON(cpu == MSM_CPU_UNKNOWN);
+	return cpu == MSM_CPU_8936;
+#else
+	return 0;
+#endif
+
+}
+
+static inline int cpu_is_msm8939(void)
+{
+#ifdef CONFIG_ARCH_MSM8916
+	enum msm_cpu cpu = socinfo_get_msm_cpu();
+
+	BUG_ON(cpu == MSM_CPU_UNKNOWN);
+	return cpu == MSM_CPU_8939;
+#else
+	return 0;
+#endif
+
+}
+
+static inline int cpu_is_msm8952(void)
+{
+#ifdef CONFIG_ARCH_MSM8916
+	enum msm_cpu cpu = socinfo_get_msm_cpu();
+
+	BUG_ON(cpu == MSM_CPU_UNKNOWN);
+	return cpu == MSM_CPU_8952;
+#else
+	return 0;
+#endif
+
+}
+
+static inline int cpu_is_msm8929(void)
+{
+#ifdef CONFIG_ARCH_MSM8916
+	enum msm_cpu cpu = socinfo_get_msm_cpu();
+
+	BUG_ON(cpu == MSM_CPU_UNKNOWN);
+	return cpu == MSM_CPU_8929;
+#else
+	return 0;
+#endif
 }
 
 static inline int cpu_is_msm8226(void)

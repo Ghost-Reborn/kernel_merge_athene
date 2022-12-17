@@ -8,9 +8,12 @@ Required properties:
 - reg:			Specifies the register base address and size. The second interval
 			specifies the shader memory base address and size.
 - reg-names:		Resource names used for the physical address of device registers
-			and shader memory. "kgsl_3d0_reg_memory" gives the physical address
-			and length of device registers while "kgsl_3d0_shader_memory" gives
-			physical address and length of device shader memory.
+			and shader memory.
+			"kgsl_3d0_reg_memory" gives the physical address and length of device
+			 registers.
+			"kgsl_3d0_shader_memory" gives the physical address and length of
+			device shader memory.
+			"qfprom_memory" gives the physical address and length of qfprom memory.
 - interrupts:		Interrupt mapping for GPU IRQ.
 - interrupt-names:	String property to describe the name of the interrupt.
 - qcom,id:		An integer used as an identification number for the device.
@@ -22,6 +25,21 @@ Required properties:
 				KGSL_CLK_MEM    0x00000008
 				KGSL_CLK_MEM_IFACE 0x00000010
 				KGSL_CLK_AXI    0x00000020
+				KGSL_CLK_RBBMTIMER 0x00000080
+				KGSL_CLK_GFX_GTCU 0x00000100
+				KGSL_CLK_GFX_GTBU 0x00000200
+				KGSL_CLK_AON	0x00000400
+				KGSL_CLK_GFX_GTBU1 0x00000800
+
+- clocks:		List of phandle and clock specifier pairs, one pair
+			for each clock input to the device.
+- clock-names:		List of clock input name strings sorted in the same
+			order as the clocks property.
+				Current values of clock-names are:
+				"src_clk", "core_clk", "iface_clk", "mem_clk", "mem_iface_clk",
+				"alt_mem_iface_clk", "rbbmtimer_clk", "gtcu_iface_clk", "gtcu_clk",
+				"gtbu_clk", "aon_clk", "gtbu1_clk"
+				"core_clk" and "iface_clk" are required and others are optional
 
 Bus Scaling Data:
 - qcom,msm-bus,name: String property to describe the name of the 3D graphics processor.
@@ -43,8 +61,15 @@ Bus Scaling Data:
 					Current values of dst are:
 						0 = MSM_BUS_SLAVE_EBI_CH0
 						1 = MSM_BUS_SLAVE_OCMEM
-					ab: Represents aggregated bandwidth. This value is 0 for Graphics.
+					ab: Represents aggregated bandwidth.
 					ib: Represents instantaneous bandwidth. This value has a range <0 8000 MB/s>
+
+- qcom,ocmem-bus-client: Container for another set of bus scaling properties
+						qcom,msm-bus,name
+						qcom,msm-bus,num-cases
+						qcom,msm-bus,num-paths
+						qcom,msm-bus,vectors-KBps
+			to be used by ocmem msm bus scaling client.
 
 GDSC Oxili Regulators:
 - vddcx-supply:			Phandle for vddcx regulator device node.
@@ -65,11 +90,59 @@ Optional Properties:
 - qcom,initial-powerlevel: This value indicates which qcom,gpu-pwrlevel should be used at start time
 			   and when coming back out of resume
 - qcom,bus-control:	   Boolean. Enables an independent bus vote from the gpu frequency
-- qcom,idle-timeout:	   This property represents the time in microseconds for idle timeout.
+- qcom,bus-width:	   Bus width in number of bytes. This enables dynamic AB bus voting based on
+			   bus width and actual bus transactions.
+- qcom,gpubw-dev:	   a phandle to a device representing bus bandwidth requirements
+			   (see devdw.txt)
+- qcom,idle-timeout:	   This property represents the time in milliseconds for idle timeout.
 - qcom,chipid:		   If it exists this property is used to replace
 			   the chip identification read from the GPU hardware.
 			   This is used to override faulty hardware readings.
 - qcom,strtstp-sleepwake:  Boolean. Enables use of GPU SLUMBER instead of SLEEP for power savings
+
+- qcom,pm-qos-active-latency:
+				Right after GPU wakes up from sleep, driver votes for
+				acceptable maximum latency to the pm-qos driver. This
+				voting demands that the system can not go into any
+				power save state *if* the latency to bring system back
+				into active state is more than this value.
+				Value is in microseconds.
+- qcom,pm-qos-wakeup-latency:
+				Similar to the above. Driver votes against deep low
+				power modes right before GPU wakes up from sleep.
+- qcom,gpu-speed-config:
+				This property enables support for dynamic GPU powerlevel
+				configuration based on the efuse register.
+				<offset shift mask speed>
+				offset - offset of the efuse register from the base.
+				shift  - number of bits to right shift to get the speed value.
+				mask   - mask for the relevant bits in the efuse register.
+				speed  - speed for loading specific GPU powerlevel.
+
+- qcom,gpu-fuse-numconfigs:	Number of PTE fuse configuration.
+- qcom,gpu-fuse-config:	This property enables support for dynamic GPU powerlevel
+				configuration based on the PTE fuse bin (OR) PTE speed bin registers.
+				First entry speed/fuse bit will fit into the MSB of speed plan value
+				later bit values will added towards LSB.
+				A series of 3 cell properties, format of which is:
+				<offset shift mask>
+				offset - offset of the fuse/speedbin register from the base.
+				shift  - number of bits to right shift to get the bin/fuse value.
+				mask   - mask for the relevant bits in the fuse register.
+
+- qcom,gpu-speed-numplans:	Number of Powerlevels configuration.
+- qcom,gpu-speed-plan:          This property enables to defines the various GPU powerlevel plans.
+				A series of 2 cell properties, format of which is:
+				<value plan>
+				value - Value of speed bin to choose the proper PowerLevel Plan.
+				plan  - Number for a spedd config Powerlevels.
+- qcom,popp-enable:
+				Boolean. Enables the POPP feature in the gpu kernel driver.
+
+- qcom,l2pc-cpu-mask: unsigned int
+				Disables L2PC on masked CPUs when any of Graphics
+				rendering thread is running on masked CPUs.
+				Bit 0 is for CPU-0, bit 1 is for CPU-1...
 
 The following properties are optional as collecting data via coresight might
 not be supported for every chipset. The documentation for coresight
@@ -85,46 +158,66 @@ Documentation/devicetree/bindings/coresight/coresight.txt
 - coresight-child-ports  List of input port numbers of the children.
 
 
-Example of A330 GPU in MSM8974:
+Example of A330 GPU in MSM8916:
 
-/ {
-	qcom,kgsl-3d0@fdb00000 {
+&soc {
+	msm_gpu: qcom,kgsl-3d0@01c00000 {
 		label = "kgsl-3d0";
 		compatible = "qcom,kgsl-3d0", "qcom,kgsl-3d";
-		reg = <0xfdb00000 0x10000
-		       0xfdb20000 0x10000>;
-		reg-names = "kgsl_3d0_reg_memory", "kgsl_3d0_shader_memory";
+		reg = <0x01c00000 0x10000
+		       0x01c20000 0x20000
+		       0x0005c00c 0x8>;
+		reg-names = "kgsl_3d0_reg_memory" , "kgsl_3d0_shader_memory" , "qfprom_memory";
 		interrupts = <0 33 0>;
 		interrupt-names = "kgsl_3d0_irq";
 		qcom,id = <0>;
 
-		qcom,chipid = <0x03030000>;
-
-		/* Power Settings */
+		qcom,chipid = <0x03000600>;
 
 		qcom,initial-pwrlevel = <1>;
-		qcom,idle-timeout = <83>; //<HZ/12>
-		qcom,clk-map = <0x00000016>; //KGSL_CLK_CORE | KGSL_CLK_IFACE | KGSL_CLK_MEM_IFACE
+
+		/* Idle Timeout = HZ/12 */
+		qcom,idle-timeout = <8>;
+		qcom,strtstp-sleepwake;
+
+		/*
+		 * Clocks = KGSL_CLK_CORE | KGSL_CLK_IFACE | KGSL_CLK_MEM |
+		 * KGSL_CLK_MEM_IFACE | KGSL_CLK_ALT_MEM_IFACE
+		 */
+		qcom,clk-map = <0x0000005E>;
+		clocks = <&clock_gcc clk_gcc_oxili_gfx3d_clk>,
+			<&clock_gcc clk_gcc_oxili_ahb_clk>,
+			<&clock_gcc clk_gcc_oxili_gmem_clk>,
+			<&clock_gcc clk_gcc_bimc_gfx_clk>,
+			<&clock_gcc clk_gcc_bimc_gpu_clk>;
+		clock-names = "core_clk", "iface_clk", "mem_clk",
+				"mem_iface_clk", "alt_mem_iface_clk";
 
 		/* Bus Scale Settings */
 		qcom,msm-bus,name = "grp3d";
-		qcom,msm-bus,num-cases = <6>;
-		qcom,msm-bus,num-paths = <2>;
+		qcom,msm-bus,num-cases = <4>;
+		qcom,msm-bus,num-paths = <1>;
 		qcom,msm-bus,vectors-KBps =
-				<26 512 0 0>, <89 604 0 0>,
-				<26 512 0 2200000>, <89 604 0 3000000>,
-				<26 512 0 4000000>, <89 604 0 3000000>,
-				<26 512 0 4000000>, <89 604 0 4500000>,
-				<26 512 0 6400000>, <89 604 0 4500000>,
-				<26 512 0 6400000>, <89 604 0 7600000>;
+			<26 512 0 0>,
+			<26 512 0 1600000>,
+			<26 512 0 3200000>,
+			<26 512 0 4264000>;
 
 		/* GDSC oxili regulators */
-		vddcx-supply = <&gdsc_oxili_cx>;
 		vdd-supply = <&gdsc_oxili_gx>;
 
 		/* IOMMU Data */
-		iommu = <&kgsl>;
+		iommu = <&gfx_iommu>;
 
+		/* Trace bus */
+		coresight-id = <67>;
+		coresight-name = "coresight-gfx";
+		coresight-nr-inports = <0>;
+		coresight-outports = <0>;
+		coresight-child-list = <&funnel_in0>;
+		coresight-child-ports = <5>;
+
+		/* Power levels */
 		qcom,gpu-pwrlevels {
 			#address-cells = <1>;
 			#size-cells = <0>;
@@ -133,53 +226,32 @@ Example of A330 GPU in MSM8974:
 
 			qcom,gpu-pwrlevel@0 {
 				reg = <0>;
-				qcom,gpu-freq = <5000000000>;
+				qcom,gpu-freq = <400000000>;
 				qcom,bus-freq = <3>;
+				qcom,io-fraction = <33>;
+			};
+
+			qcom,gpu-pwrlevel@1 {
+				reg = <1>;
+				qcom,gpu-freq = <310000000>;
+				qcom,bus-freq = <2>;
+				qcom,io-fraction = <66>;
+			};
+
+			qcom,gpu-pwrlevel@2 {
+				reg = <2>;
+				qcom,gpu-freq = <200000000>;
+				qcom,bus-freq = <1>;
+				qcom,io-fraction = <100>;
+			};
+
+			qcom,gpu-pwrlevel@3 {
+				reg = <3>;
+				qcom,gpu-freq = <27000000>;
+				qcom,bus-freq = <0>;
 				qcom,io-fraction = <0>;
 			};
 		};
 
-		qcom,dcvs-core-info {
-			#address-cells = <1>;
-			#size-cells = <0>;
-
-			compatible = "qcom,dcvs-core-info";
-
-			qcom,core-max-time-us = <100000>;
-			qcom,algo-slack-time-us = <39000>;
-			qcom,algo-disable-pc-threshold = <86000>;
-			qcom,algo-ss-window-size = <1000000>;
-			qcom,algo-ss-util-pct = <95>;
-			qcom,algo-em-max-util-pct = <97>;
-			qcom,algo-ss-no-corr-below-freq = <0>;
-
-			qcom,dcvs-freq@0 {
-				reg = <0>;
-				qcom,freq = <0>;
-				qcom,idle-energy = <0>;
-				qcom,active-energy = <333932>;
-			};
-
-			qcom,dcvs-freq@1 {
-				reg = <1>;
-				qcom,freq = <0>;
-				qcom,idle-energy = <0>;
-				qcom,active-energy = <497532>;
-			};
-
-			qcom,dcvs-freq@2 {
-				reg = <2>;
-				qcom,freq = <0>;
-				qcom,idle-energy = <0>;
-				qcom,active-energy = <707610>;
-			};
-
-			qcom,dcvs-freq@3 {
-				reg = <3>;
-				qcom,freq = <0>;
-				qcom,idle-energy = <0>;
-				qcom,active-energy = <844545>;
-			};
-		};
 	};
 };

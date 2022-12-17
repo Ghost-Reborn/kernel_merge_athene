@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -44,13 +44,42 @@ struct pll_freq_tbl {
  * @vco_mask: mask for vco bits location
  * @mn_en_mask: ORed with pll config register to enable the mn counter
  * @main_output_mask: ORed with pll config register to enable the main output
+ * @apc_pdn_mask: ORed with pll config register to enable/disable APC PDN
+ * @lock_mask: Mask that indicates that the PLL has locked
  */
 struct pll_config_masks {
+	u32 apc_pdn_mask;
 	u32 post_div_mask;
 	u32 pre_div_mask;
 	u32 vco_mask;
 	u32 mn_en_mask;
 	u32 main_output_mask;
+	u32 early_output_mask;
+	u32 lock_mask;
+};
+
+struct pll_config_vals {
+	u32 post_div_masked;
+	u32 pre_div_masked;
+	u32 vco_mode_masked;
+	u32 config_ctl_val;
+	u32 test_ctl_lo_val;
+	u32 test_ctl_hi_val;
+	u32 alpha_val;
+	bool enable_mn;
+};
+
+struct pll_vco_data {
+	unsigned long min_freq;
+	unsigned long max_freq;
+	u32 vco_val;
+	u32 config_ctl_val;
+};
+
+struct pll_spm_ctrl {
+	u32 offset;
+	u32 event_bit;
+	void __iomem *spm_base;
 };
 
 #define PLL_FREQ_END	(UINT_MAX-1)
@@ -68,11 +97,11 @@ struct pll_config_masks {
  */
 struct pll_vote_clk {
 	u32 *soft_vote;
-	const u32 soft_vote_mask;
+	u32 soft_vote_mask;
 	void __iomem *const en_reg;
-	const u32 en_mask;
+	u32 en_mask;
 	void __iomem *const status_reg;
-	const u32 status_mask;
+	u32 status_mask;
 
 	struct clk c;
 	void *const __iomem *base;
@@ -84,6 +113,7 @@ extern struct clk_ops clk_ops_pll_acpu_vote;
 /* Soft voting values */
 #define PLL_SOFT_VOTE_PRIMARY   BIT(0)
 #define PLL_SOFT_VOTE_ACPU      BIT(1)
+#define PLL_SOFT_VOTE_AUX       BIT(2)
 
 static inline struct pll_vote_clk *to_pll_vote_clk(struct clk *c)
 {
@@ -100,8 +130,14 @@ static inline struct pll_vote_clk *to_pll_vote_clk(struct clk *c)
  *   post divider and vco configuration. register name can be configure register
  *   or user_ctl register depending on targets
  * @status_reg: status register, contains the lock detection bit
+ * @init_test_ctl: initialize the test control register
+ * @pgm_test_ctl_enable: program the test_ctl register in the enable sequence
  * @masks: masks used for settings in config_reg
+ * @vals: configuration values to be written to PLL registers
  * @freq_tbl: pll freq table
+ * @no_prepared_reconfig: Fail round_rate if pll is prepared
+ * @pll_vco_data: If any VCO setting is required at runtime when frequencies
+ *		 are modified.
  * @c: clk
  * @base: pointer to base address of ioremapped registers.
  */
@@ -110,18 +146,40 @@ struct pll_clk {
 	void __iomem *const l_reg;
 	void __iomem *const m_reg;
 	void __iomem *const n_reg;
+	void __iomem *const alpha_reg;
 	void __iomem *const config_reg;
+	void __iomem *const config_ctl_reg;
 	void __iomem *const status_reg;
+	void __iomem *const alt_status_reg;
+	void __iomem *const test_ctl_lo_reg;
+	void __iomem *const test_ctl_hi_reg;
+
+	bool init_test_ctl;
+	bool pgm_test_ctl_enable;
 
 	struct pll_config_masks masks;
+	struct pll_config_vals vals;
 	struct pll_freq_tbl *freq_tbl;
 
+	unsigned long src_rate;
+	unsigned long min_rate;
+	unsigned long max_rate;
+
+	bool inited;
+	bool no_prepared_reconfig;
+
+	struct pll_vco_data data;
+
+	struct pll_spm_ctrl spm_ctrl;
 	struct clk c;
 	void *const __iomem *base;
 };
 
 extern struct clk_ops clk_ops_local_pll;
 extern struct clk_ops clk_ops_sr2_pll;
+extern struct clk_ops clk_ops_variable_rate_pll;
+extern struct clk_ops clk_ops_hf_pll;
+extern struct clk_ops clk_ops_sr_pll;
 
 static inline struct pll_clk *to_pll_clk(struct clk *c)
 {
@@ -152,6 +210,7 @@ struct pll_config {
 	u32 main_output_mask;
 	u32 aux_output_val;
 	u32 aux_output_mask;
+	u32 cfg_ctl_val;
 	/* SR2 PLL specific fields */
 	u32 add_factor_val;
 	u32 add_factor_mask;
@@ -164,6 +223,7 @@ struct pll_config_regs {
 	void __iomem *n_reg;
 	void __iomem *config_reg;
 	void __iomem *config_alt_reg;
+	void __iomem *config_ctl_reg;
 	void __iomem *mode_reg;
 	void *const __iomem *base;
 };

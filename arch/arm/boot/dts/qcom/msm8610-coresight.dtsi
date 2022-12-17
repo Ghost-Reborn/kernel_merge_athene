@@ -1,4 +1,4 @@
-/* Copyright (c) 2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2013-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -20,6 +20,7 @@
 		interrupt-names = "byte-cntr-irq";
 
 		qcom,memory-size = <0x100000>;
+		qcom,sg-enable;
 
 		coresight-id = <0>;
 		coresight-name = "coresight-tmc-etr";
@@ -29,8 +30,9 @@
 
 	tpiu: tpiu@fc320000 {
 		compatible = "arm,coresight-tpiu";
-		reg = <0xfc320000 0x1000>;
-		reg-names = "tpiu-base";
+		reg = <0xfc320000 0x1000>,
+		      <0xfd512000 0x1000>;
+		reg-names = "tpiu-base", "nidnt-base";
 
 		coresight-id = <1>;
 		coresight-name = "coresight-tpiu";
@@ -46,7 +48,9 @@
 		qcom,vdd-io-voltage-level = <2950000 2950000>;
 		qcom,vdd-io-current-level = <200 50000>;
 
-		qcom,nidnt;
+		qcom,nidntsw;
+		qcom,nidnt-swduart;
+		qcom,nidnt-swdtrc;
 	};
 
 	replicator: replicator@fc324000 {
@@ -154,6 +158,7 @@
 		coresight-outports = <0>;
 		coresight-child-list = <&funnel_a7ss>;
 		coresight-child-ports = <0>;
+		coresight-etm-cpu = <&CPU0>;
 
 		qcom,pc-save;
 		qcom,round-robin;
@@ -170,6 +175,7 @@
 		coresight-outports = <0>;
 		coresight-child-list = <&funnel_a7ss>;
 		coresight-child-ports = <1>;
+		coresight-etm-cpu = <&CPU1>;
 
 		qcom,pc-save;
 		qcom,round-robin;
@@ -186,6 +192,7 @@
 		coresight-outports = <0>;
 		coresight-child-list = <&funnel_a7ss>;
 		coresight-child-ports = <2>;
+		coresight-etm-cpu = <&CPU2>;
 
 		qcom,pc-save;
 		qcom,round-robin;
@@ -202,13 +209,14 @@
 		coresight-outports = <0>;
 		coresight-child-list = <&funnel_a7ss>;
 		coresight-child-ports = <3>;
+		coresight-etm-cpu = <&CPU3>;
 
 		qcom,pc-save;
 		qcom,round-robin;
 	};
 
 	audio_etm0 {
-		compatible = "qcom,coresight-audio-etm";
+		compatible = "qcom,coresight-remote-etm";
 
 		coresight-id = <13>;
 		coresight-name = "coresight-audio-etm0";
@@ -216,10 +224,12 @@
 		coresight-outports = <0>;
 		coresight-child-list = <&funnel_in0>;
 		coresight-child-ports = <2>;
+
+		qcom,inst-id = <5>;
 	};
 
 	modem_etm0 {
-		compatible = "qcom,coresight-modem-etm";
+		compatible = "qcom,coresight-remote-etm";
 
 		coresight-id = <14>;
 		coresight-name = "coresight-modem-etm0";
@@ -227,10 +237,12 @@
 		coresight-outports = <0>;
 		coresight-child-list = <&funnel_in0>;
 		coresight-child-ports = <1>;
+
+		qcom,inst-id = <2>;
 	};
 
 	wcn_etm0 {
-		compatible = "qcom,coresight-wcn-etm";
+		compatible = "qcom,coresight-remote-etm";
 
 		coresight-id = <15>;
 		coresight-name = "coresight-wcn-etm0";
@@ -238,10 +250,12 @@
 		coresight-outports = <0>;
 		coresight-child-list = <&funnel_in1>;
 		coresight-child-ports = <0>;
+
+		qcom,inst-id = <3>;
 	};
 
 	rpm_etm0 {
-		compatible = "qcom,coresight-rpm-etm";
+		compatible = "qcom,coresight-remote-etm";
 
 		coresight-id = <16>;
 		coresight-name = "coresight-rpm-etm0";
@@ -249,6 +263,8 @@
 		coresight-outports = <0>;
 		coresight-child-list = <&funnel_in0>;
 		coresight-child-ports = <0>;
+
+		qcom,inst-id = <4>;
 	};
 
 	csr: csr@fc301000 {

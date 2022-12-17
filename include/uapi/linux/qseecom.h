@@ -5,7 +5,7 @@
 #include <linux/ioctl.h>
 
 #define MAX_ION_FD  4
-#define MAX_APP_NAME_SIZE  32
+#define MAX_APP_NAME_SIZE  64
 #define QSEECOM_HASH_SIZE  32
 /*
  * struct qseecom_register_listener_req -
@@ -18,7 +18,7 @@
 struct qseecom_register_listener_req {
 	uint32_t listener_id; /* in */
 	int32_t ifd_data_fd; /* in */
-	uint32_t virt_sb_base; /* in */
+	void *virt_sb_base; /* in */
 	uint32_t sb_size; /* in */
 };
 
@@ -84,18 +84,20 @@ struct qseecom_send_resp_req {
  * @img_len - Length of the .mdt + .b00 +..+.bxx images files in bytes
  * @ion_fd - Ion file descriptor used when allocating memory.
  * @img_name - Name of the image.
+ * @app_arch - Architecture of the image, i.e. 32bit or 64bit app
 */
 struct qseecom_load_img_req {
 	uint32_t mdt_len; /* in */
 	uint32_t img_len; /* in */
 	int32_t  ifd_data_fd; /* in */
 	char	 img_name[MAX_APP_NAME_SIZE]; /* in */
+	uint32_t app_arch; /* in */
 	int app_id; /* out*/
 };
 
 struct qseecom_set_sb_mem_param_req {
 	int32_t ifd_data_fd; /* in */
-	uint32_t virt_sb_base; /* in */
+	void *virt_sb_base; /* in */
 	uint32_t sb_len; /* in */
 };
 
@@ -108,6 +110,13 @@ struct qseecom_qseos_version_req {
 };
 
 /*
+ * struct qseecom_qsee_version_req - get qsee version
+ * @qsee_version - version number
+ */
+struct qseecom_qsee_version_req {
+	unsigned int qsee_version;
+};
+/*
  * struct qseecom_qseos_app_load_query - verify if app is loaded in qsee
  * @app_name[MAX_APP_NAME_SIZE]-  name of the app.
  * @app_id - app id.
@@ -115,6 +124,7 @@ struct qseecom_qseos_version_req {
 struct qseecom_qseos_app_load_query {
 	char app_name[MAX_APP_NAME_SIZE]; /* in */
 	int app_id; /* out */
+	uint32_t app_arch;
 };
 
 struct qseecom_send_svc_cmd_req {
@@ -127,6 +137,9 @@ struct qseecom_send_svc_cmd_req {
 
 enum qseecom_key_management_usage_type {
 	QSEOS_KM_USAGE_DISK_ENCRYPTION = 0x01,
+	QSEOS_KM_USAGE_FILE_ENCRYPTION = 0x02,
+	QSEOS_KM_USAGE_UFS_ICE_DISK_ENCRYPTION = 0x03,
+	QSEOS_KM_USAGE_SDCC_ICE_DISK_ENCRYPTION = 0x04,
 	QSEOS_KM_USAGE_MAX
 };
 
@@ -137,6 +150,8 @@ struct qseecom_create_key_req {
 
 struct qseecom_wipe_key_req {
 	enum qseecom_key_management_usage_type usage;
+	int wipe_key_flag;/* 1->remove key from storage(alone with clear key) */
+			  /* 0->do not remove from storage (clear key) */
 };
 
 struct qseecom_update_key_userinfo_req {
@@ -164,6 +179,22 @@ struct qseecom_is_es_activated_req {
 	int is_activated; /* out */
 };
 
+/*
+ * struct qseecom_mdtp_cipher_dip_req
+ * @in_buf - input buffer
+ * @in_buf_size - input buffer size
+ * @out_buf - output buffer
+ * @out_buf_size - output buffer size
+ * @direction - 0=encrypt, 1=decrypt
+ */
+struct qseecom_mdtp_cipher_dip_req {
+	uint8_t *in_buf;
+	uint32_t in_buf_size;
+	uint8_t *out_buf;
+	uint32_t out_buf_size;
+	uint32_t direction;
+};
+
 enum qseecom_bandwidth_request_mode {
 	INACTIVE = 0,
 	LOW,
@@ -184,6 +215,56 @@ struct qseecom_send_modfd_listener_resp {
 	struct qseecom_ion_fd_info ifd_data[MAX_ION_FD]; /* in */
 };
 
+struct qseecom_qteec_req {
+	void    *req_ptr;
+	uint32_t    req_len;
+	void    *resp_ptr;
+	uint32_t    resp_len;
+};
+
+struct qseecom_qteec_modfd_req {
+	void    *req_ptr;
+	uint32_t    req_len;
+	void    *resp_ptr;
+	uint32_t    resp_len;
+	struct qseecom_ion_fd_info ifd_data[MAX_ION_FD];
+};
+
+struct qseecom_sg_entry {
+	uint32_t phys_addr;
+	uint32_t len;
+};
+
+struct qseecom_sg_entry_64bit {
+	uint64_t phys_addr;
+	uint32_t len;
+} __attribute__ ((packed));
+
+/*
+ * sg list buf format version
+ * 1: Legacy format to support only 512 SG list entries
+ * 2: new format to support > 512 entries
+ */
+#define QSEECOM_SG_LIST_BUF_FORMAT_VERSION_1	1
+#define QSEECOM_SG_LIST_BUF_FORMAT_VERSION_2	2
+
+struct qseecom_sg_list_buf_hdr_64bit {
+	struct qseecom_sg_entry_64bit  blank_entry;	/* must be all 0 */
+	uint32_t version;		/* sg list buf format version */
+	uint64_t new_buf_phys_addr;	/* PA of new buffer */
+	uint32_t nents_total;		/* Total number of SG entries */
+} __attribute__ ((packed));
+
+#define QSEECOM_SG_LIST_BUF_HDR_SZ_64BIT	\
+			sizeof(struct qseecom_sg_list_buf_hdr_64bit)
+
+#define SG_ENTRY_SZ		sizeof(struct qseecom_sg_entry)
+#define SG_ENTRY_SZ_64BIT	sizeof(struct qseecom_sg_entry_64bit)
+
+struct file;
+
+extern long qseecom_ioctl(struct file *file,
+					unsigned cmd, unsigned long arg);
 
 #define QSEECOM_IOC_MAGIC    0x97
 
@@ -257,5 +338,27 @@ struct qseecom_send_modfd_listener_resp {
 #define QSEECOM_IOCTL_UPDATE_KEY_USER_INFO_REQ \
 	_IOWR(QSEECOM_IOC_MAGIC, 24, struct qseecom_update_key_userinfo_req)
 
+#define QSEECOM_QTEEC_IOCTL_OPEN_SESSION_REQ \
+	_IOWR(QSEECOM_IOC_MAGIC, 30, struct qseecom_qteec_modfd_req)
 
+#define QSEECOM_QTEEC_IOCTL_CLOSE_SESSION_REQ \
+	_IOWR(QSEECOM_IOC_MAGIC, 31, struct qseecom_qteec_req)
+
+#define QSEECOM_QTEEC_IOCTL_INVOKE_MODFD_CMD_REQ \
+	_IOWR(QSEECOM_IOC_MAGIC, 32, struct qseecom_qteec_modfd_req)
+
+#define QSEECOM_QTEEC_IOCTL_REQUEST_CANCELLATION_REQ \
+	_IOWR(QSEECOM_IOC_MAGIC, 33, struct qseecom_qteec_modfd_req)
+
+#define QSEECOM_IOCTL_MDTP_CIPHER_DIP_REQ \
+	_IOWR(QSEECOM_IOC_MAGIC, 34, struct qseecom_mdtp_cipher_dip_req)
+
+#define QSEECOM_IOCTL_SEND_MODFD_CMD_64_REQ \
+	_IOWR(QSEECOM_IOC_MAGIC, 35, struct qseecom_send_modfd_cmd_req)
+
+#define QSEECOM_IOCTL_SEND_MODFD_RESP_64 \
+	_IOWR(QSEECOM_IOC_MAGIC, 36, struct qseecom_send_modfd_listener_resp)
+
+#define QSEECOM_IOCTL_GET_QSEE_VERSION_REQ \
+	_IOWR(QSEECOM_IOC_MAGIC, 37, struct qseecom_qsee_version_req)
 #endif /* _UAPI_QSEECOM_H_ */

@@ -12,10 +12,14 @@ Required properties:
   - qcom,msm_bus,active-only: Boolean flag for context of request (actve/dual)
   - qcom,msm_bus,num_paths: The paths for source and destination ports
   - qcom,msm_bus,vectors: Vectors for bus topology.
+  - qcom,ce-device: Device number.
+  - qcom,ce-opp-freq: indicates the CE operating frequency in Hz, changes from target to target.
 
 Optional properties:
   - qcom,ce-hw-shared : optional, indicates if the hardware is shared between EE.
   - qcom,ce-hw-key : optional, indicates if the hardware supports use of HW KEY.
+  - qcom,support-core-clk-only : optional, indicates if the HW supports single crypto core clk.
+  - qcom,bsm-ee : optional, indicate the BAM EE value, changes from target to target. Default value is 1 if not specified.
 
 Example:
 
@@ -27,6 +31,7 @@ Example:
 		interrupts = <0 235 0>;
 		qcom,bam-pipe-pair = <0>;
 		qcom,ce-hw-instance = <1>;
+		qcom,ce-device = <0>;
 		qcom,ce-hw-shared;
                 qcom,msm-bus,name = "qcedev-noc";
 		qcom,msm-bus,num-cases = <2>;
@@ -34,4 +39,5 @@ Example:
 		qcom,msm-bus,vectors-KBps =
 				<56 512 0 0>,
 				<56 512 3936000 393600>,
+		qcom,ce-opp-freq = <100000000>;
 	};

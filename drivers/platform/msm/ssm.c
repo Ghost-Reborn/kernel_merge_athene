@@ -1,4 +1,4 @@
-/* Copyright (c) 2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2013-2014, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -28,7 +28,7 @@
 #include <linux/msm_ion.h>
 #include <linux/platform_data/qcom_ssm.h>
 #include <soc/qcom/scm.h>
-#include <mach/msm_smd.h>
+#include <soc/qcom/smd.h>
 
 #include "qseecom_kernel.h"
 #include "ssm.h"
@@ -249,7 +249,6 @@ static int ssm_load_app(struct ssm_driver *ssm)
 static struct ssm_platform_data *populate_ssm_pdata(struct device *dev)
 {
 	struct ssm_platform_data *pdata;
-	int rc;
 
 	pdata = devm_kzalloc(dev, sizeof(struct ssm_platform_data),
 								GFP_KERNEL);
@@ -259,13 +258,7 @@ static struct ssm_platform_data *populate_ssm_pdata(struct device *dev)
 	pdata->need_key_exchg =
 		of_property_read_bool(dev->of_node, "qcom,need-keyexhg");
 
-	rc = of_property_read_string(dev->of_node, "qcom,channel-name",
-							&pdata->channel_name);
-	if (rc && rc != -EINVAL) {
-		dev_err(dev, "Error reading channel_name property %d\n", rc);
-		return NULL;
-	} else if (rc == -EINVAL)
-		pdata->channel_name = CHANNEL_NAME;
+	pdata->channel_name = CHANNEL_NAME;
 
 	return pdata;
 }
@@ -346,7 +339,7 @@ static int ssm_remove(struct platform_device *pdev)
 	 */
 	ssm_drv->ready = false;
 	smd_close(ssm_drv->ch);
-	flush_work_sync(&ssm_drv->ipc_work);
+	flush_work(&ssm_drv->ipc_work);
 
 	/* Shutdown tzapp */
 	dev_dbg(&pdev->dev, "Shutting down TZapp\n");

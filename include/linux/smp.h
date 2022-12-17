@@ -35,6 +35,7 @@ int smp_call_function_single(int cpuid, smp_call_func_t func, void *info,
 #include <linux/kernel.h>
 #include <linux/compiler.h>
 #include <linux/thread_info.h>
+#include <asm/percpu.h>
 #include <asm/smp.h>
 
 /*
@@ -86,14 +87,10 @@ void kick_all_cpus_sync(void);
 /*
  * Generic and arch helpers
  */
-#ifdef CONFIG_USE_GENERIC_SMP_HELPERS
 void __init call_function_init(void);
 void generic_smp_call_function_single_interrupt(void);
 #define generic_smp_call_function_interrupt \
 	generic_smp_call_function_single_interrupt
-#else
-static inline void call_function_init(void) { }
-#endif
 
 /*
  * Call a function on all processors
@@ -222,6 +219,19 @@ static inline void kick_all_cpus_sync(void) {  }
 
 #define get_cpu()		({ preempt_disable(); smp_processor_id(); })
 #define put_cpu()		preempt_enable()
+
+#ifdef CONFIG_LOCKUP_IPI_CALL_WDT
+DECLARE_PER_CPU(int, csd_lock_waiting_flag);
+static inline int is_csd_lock_waiting(void)
+{
+	return __get_cpu_var(csd_lock_waiting_flag);
+}
+#else
+static inline int is_csd_lock_waiting(void)
+{
+	return 0;
+}
+#endif
 
 /*
  * Callback to arch code if there's nosmp or maxcpus=0 on the

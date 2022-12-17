@@ -1,4 +1,4 @@
-/* Copyright (c) 2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2013-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -49,17 +49,20 @@
 		vdd-io-supply = <&pma8084_l13>;
 	};
 
-	qcom,mdss_dsi@fd922800 {
-		vdd-supply = <&pma8084_l22>;
-		vddio-supply = <&pma8084_l12>;
+	qcom,mdss_dsi@0 {
 		vdda-supply = <&pma8084_l2>;
-		qcom,platform-reset-gpio = <&pma8084_gpios 20 0>;
-	};
+		vddio-supply = <&pma8084_l12>;
 
-	qcom,mdss_dsi@fd922e00 {
-		vdd-supply = <&pma8084_l22>;
-		vddio-supply = <&pma8084_l12>;
-		vdda-supply = <&pma8084_l2>;
+		qcom,mdss_dsi_ctrl0@fd922800 {
+			vdd-supply = <&pma8084_l22>;
+			vddio-supply = <&pma8084_l12>;
+			qcom,platform-reset-gpio = <&pma8084_gpios 20 0>;
+		};
+
+		qcom,mdss_dsi_ctrl1@fd922e00 {
+			vdd-supply = <&pma8084_l22>;
+			vddio-supply = <&pma8084_l12>;
+		};
 	};
 
 	qcom,hdmi_tx@fd922100 {
@@ -76,16 +79,6 @@
 		HSUSB_VDDCX-supply = <&pma8084_s2_corner>;
 		HSUSB_1p8-supply = <&pma8084_l6>;
 		HSUSB_3p3-supply = <&pma8084_l24>;
-	};
-
-	qcom,sdcc@f9824000 {
-		vdd-supply = <&pma8084_l20>;
-		vdd-io-supply = <&pma8084_s4>;
-	};
-
-	qcom,sdcc@f98a4000 {
-		vdd-supply = <&pma8084_l21>;
-		vdd-io-supply = <&pma8084_l13>;
 	};
 
 	slim@fe12f000 {
@@ -143,6 +136,8 @@
 		HSUSB_VDDCX-supply = <&pma8084_s2>;
 		HSUSB_1p8-supply = <&pma8084_l6>;
 		HSUSB_3p3-supply = <&pma8084_l24>;
+		hsusb_vdd_dig-supply = <&pma8084_s2_corner>;
+		qcom,vdd-voltage-level = <1 2 3 5 7>;
 	};
 
 	qcom,gdsc@fd8c4024 {
@@ -205,6 +200,10 @@
 	qcom,use-phase-switching;
 };
 
+&mdss_mdp {
+    vdd-cx-supply = <&pma8084_s2_corner>;
+};
+
 &tspp {
 	vdd_cx-supply = <&pma8084_s2_corner>;
 };
@@ -227,4 +226,14 @@
 	qcom,freq@2b00 {
 		status = "ok";
 	};
+};
+
+&dsi_generic_720p_cmd {
+	qcom,mdss-dsi-bl-pmic-bank-select = <3>;
+	qcom,panel-supply-entries = <&dsi_panel_pwr_supply>;
+};
+
+&usb3 {
+	vdda33-supply = <&pma8084_l24>;
+	vdda18-supply = <&pma8084_l6>;
 };

@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2011-2014, 2018, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -27,9 +27,13 @@
 #include <linux/memblock.h>
 #include <linux/dma-mapping.h>
 #include <linux/dma-contiguous.h>
+#include <linux/vmalloc.h>
+#include <linux/highmem.h>
+#include <linux/show_mem_notifier.h>
 #include <asm/cacheflush.h>
 #include "../ion_priv.h"
 #include "ion_cp_common.h"
+#include "compat_msm_ion.h"
 
 #define ION_COMPAT_STR	"qcom,msm-ion"
 
@@ -54,6 +58,10 @@ static struct ion_heap_desc ion_heap_meta[] = {
 	{
 		.id	= ION_SYSTEM_CONTIG_HEAP_ID,
 		.name	= ION_KMALLOC_HEAP_NAME,
+	},
+	{
+		.id	= ION_SECURE_HEAP_ID,
+		.name	= ION_SECURE_HEAP_NAME,
 	},
 	{
 		.id	= ION_CP_MM_HEAP_ID,
@@ -104,8 +112,18 @@ static struct ion_heap_desc ion_heap_meta[] = {
 };
 #endif
 
-struct ion_client *msm_ion_client_create(unsigned int heap_mask,
-					const char *name)
+static int msm_ion_lowmem_notifier(struct notifier_block *nb,
+					unsigned long action, void *data)
+{
+	show_ion_usage(idev);
+	return 0;
+}
+
+static struct notifier_block msm_ion_nb = {
+	.notifier_call = msm_ion_lowmem_notifier,
+};
+
+struct ion_client *msm_ion_client_create(const char *name)
 {
 	/*
 	 * The assumption is that if there is a NULL device, the ion
@@ -134,7 +152,7 @@ static int ion_no_pages_cache_ops(struct ion_client *client,
 			unsigned int offset, unsigned int length,
 			unsigned int cmd)
 {
-	unsigned int size_to_vmap, total_size;
+	unsigned long size_to_vmap, total_size;
 	int i, j, ret;
 	void *ptr = NULL;
 	ion_phys_addr_t buff_phys = 0;
@@ -227,11 +245,8 @@ static int ion_pages_cache_ops(struct ion_client *client,
 			dmac_clean_range(vaddr, vaddr + length);
 		break;
 	case ION_IOC_INV_CACHES:
-		if (!vaddr)
-			dma_sync_sg_for_cpu(NULL, table->sgl,
-				table->nents, DMA_FROM_DEVICE);
-		else
-			dmac_inv_range(vaddr, vaddr + length);
+		dma_sync_sg_for_cpu(NULL, table->sgl,
+			table->nents, DMA_FROM_DEVICE);
 		break;
 	case ION_IOC_CLEAN_INV_CACHES:
 		if (!vaddr) {
@@ -266,7 +281,7 @@ int ion_do_cache_op(struct ion_client *client, struct ion_handle *handle,
 	if (!ION_IS_CACHED(flags))
 		return 0;
 
-	if (flags & ION_FLAG_SECURE)
+	if ((flags & ION_FLAG_SECURE) || (get_secure_vmid(flags) > 0))
 		return 0;
 
 	table = ion_sg_table(client, handle);
@@ -293,45 +308,6 @@ static void msm_ion_allocate(struct ion_platform_heap *heap)
 	if (!heap->base && heap->extra_data) {
 		WARN(1, "Specifying carveout heaps without a base is deprecated. Convert to the DMA heap type instead");
 		return;
-	}
-}
-
-static int is_heap_overlapping(const struct ion_platform_heap *heap1,
-				const struct ion_platform_heap *heap2)
-{
-	ion_phys_addr_t heap1_base = heap1->base;
-	ion_phys_addr_t heap2_base = heap2->base;
-	ion_phys_addr_t heap1_end = heap1->base + heap1->size - 1;
-	ion_phys_addr_t heap2_end = heap2->base + heap2->size - 1;
-
-	if (heap1_base == heap2_base)
-		return 1;
-	if (heap1_base < heap2_base && heap1_end >= heap2_base)
-		return 1;
-	if (heap2_base < heap1_base && heap2_end >= heap1_base)
-		return 1;
-	return 0;
-}
-
-static void check_for_heap_overlap(const struct ion_platform_heap heap_list[],
-				   unsigned long nheaps)
-{
-	unsigned long i;
-	unsigned long j;
-
-	for (i = 0; i < nheaps; ++i) {
-		const struct ion_platform_heap *heap1 = &heap_list[i];
-		if (!heap1->base)
-			continue;
-		for (j = i + 1; j < nheaps; ++j) {
-			const struct ion_platform_heap *heap2 = &heap_list[j];
-			if (!heap2->base)
-				continue;
-			if (is_heap_overlapping(heap1, heap2)) {
-				panic("Memory in heap %s overlaps with heap %s\n",
-					heap1->name, heap2->name);
-			}
-		}
 	}
 }
 
@@ -394,6 +370,7 @@ static struct heap_types_info {
 	MAKE_HEAP_TYPE_MAPPING(DMA),
 	MAKE_HEAP_TYPE_MAPPING(SECURE_DMA),
 	MAKE_HEAP_TYPE_MAPPING(REMOVED),
+	MAKE_HEAP_TYPE_MAPPING(SYSTEM_SECURE),
 };
 
 static int msm_ion_get_heap_type_from_dt_node(struct device_node *node,
@@ -578,7 +555,7 @@ static struct ion_platform_data *msm_ion_parse_dt(struct platform_device *pdev)
 	uint32_t num_heaps = 0;
 	int idx = 0;
 
-	for_each_child_of_node(dt_node, node)
+	for_each_available_child_of_node(dt_node, node)
 		num_heaps++;
 
 	if (!num_heaps)
@@ -597,7 +574,7 @@ static struct ion_platform_data *msm_ion_parse_dt(struct platform_device *pdev)
 	pdata->heaps = heaps;
 	pdata->nr = num_heaps;
 
-	for_each_child_of_node(dt_node, node) {
+	for_each_available_child_of_node(dt_node, node) {
 		new_dev = of_platform_device_create(node, NULL, &pdev->dev);
 		if (!new_dev) {
 			pr_err("Failed to create device %s\n", node->name);
@@ -672,6 +649,11 @@ out:
 	return ret;
 }
 
+int ion_heap_is_system_secure_heap_type(enum ion_heap_type type)
+{
+	return type == ((enum ion_heap_type) ION_HEAP_TYPE_SYSTEM_SECURE);
+}
+
 int ion_heap_allow_secure_allocation(enum ion_heap_type type)
 {
 	return type == ((enum ion_heap_type) ION_HEAP_TYPE_SECURE_DMA);
@@ -702,7 +684,7 @@ static unsigned int msm_ion_ioctl_dir(unsigned int cmd)
 	}
 }
 
-static long msm_ion_custom_ioctl(struct ion_client *client,
+long msm_ion_custom_ioctl(struct ion_client *client,
 				unsigned int cmd,
 				unsigned long arg)
 {
@@ -742,7 +724,7 @@ static long msm_ion_custom_ioctl(struct ion_client *client,
 		} else {
 			handle = ion_import_dma_buf(client, data.flush_data.fd);
 			if (IS_ERR(handle)) {
-				pr_info("%s: Could not import handle: %p\n",
+				pr_info("%s: Could not import handle: %pK\n",
 					__func__, handle);
 				return -EINVAL;
 			}
@@ -750,13 +732,13 @@ static long msm_ion_custom_ioctl(struct ion_client *client,
 
 		down_read(&mm->mmap_sem);
 
-		start = (unsigned long) data.flush_data.vaddr;
-		end = (unsigned long) data.flush_data.vaddr
-			+ data.flush_data.length;
+		start = (unsigned long)data.flush_data.vaddr +
+			data.flush_data.offset;
+		end = start + data.flush_data.length;
 
-		if (start && check_vaddr_bounds(start, end)) {
-			pr_err("%s: virtual address %p is out of bounds\n",
-				__func__, data.flush_data.vaddr);
+		if (check_vaddr_bounds(start, end)) {
+			pr_err("%s: virtual address %pK is out of bounds\n",
+			       __func__, data.flush_data.vaddr);
 			ret = -EINVAL;
 		} else {
 			ret = ion_do_cache_op(
@@ -774,16 +756,28 @@ static long msm_ion_custom_ioctl(struct ion_client *client,
 	}
 	case ION_IOC_PREFETCH:
 	{
-		ion_walk_heaps(client, data.prefetch_data.heap_id,
+		int ret;
+
+		ret = ion_walk_heaps(client, data.prefetch_data.heap_id,
+			ION_HEAP_TYPE_SECURE_DMA,
 			(void *)data.prefetch_data.len,
 			ion_secure_cma_prefetch);
+
+		if (ret)
+			return ret;
 		break;
 	}
 	case ION_IOC_DRAIN:
 	{
-		ion_walk_heaps(client, data.prefetch_data.heap_id,
+		int ret;
+
+		ret = ion_walk_heaps(client, data.prefetch_data.heap_id,
+			ION_HEAP_TYPE_SECURE_DMA,
 			(void *)data.prefetch_data.len,
 			ion_secure_cma_drain_pool);
+
+		if (ret)
+			return ret;
 		break;
 	}
 
@@ -793,16 +787,143 @@ static long msm_ion_custom_ioctl(struct ion_client *client,
 	return 0;
 }
 
+#define MAX_VMAP_RETRIES 10
+
+/**
+ * An optimized page-zero'ing function. vmaps arrays of pages in large
+ * chunks to minimize the number of memsets and vmaps/vunmaps.
+ *
+ * Note that the `pages' array should be composed of all 4K pages.
+ *
+ * NOTE: This function does not guarantee synchronization of the caches
+ * and thus caller is responsible for handling any cache maintenance
+ * operations needed.
+ */
+int msm_ion_heap_pages_zero(struct page **pages, int num_pages)
+{
+	int i, j, npages_to_vmap;
+	void *ptr = NULL;
+
+	/*
+	 * As an optimization, we manually zero out all of the pages
+	 * in one fell swoop here. To safeguard against insufficient
+	 * vmalloc space, we only vmap `npages_to_vmap' at a time,
+	 * starting with a conservative estimate of 1/8 of the total
+	 * number of vmalloc pages available.
+	 */
+	npages_to_vmap = ((VMALLOC_END - VMALLOC_START)/8)
+			>> PAGE_SHIFT;
+	for (i = 0; i < num_pages; i += npages_to_vmap) {
+		npages_to_vmap = min(npages_to_vmap, num_pages - i);
+		for (j = 0; j < MAX_VMAP_RETRIES && npages_to_vmap;
+			++j) {
+			ptr = vmap(&pages[i], npages_to_vmap,
+					VM_IOREMAP, PAGE_KERNEL);
+			if (ptr)
+				break;
+			else
+				npages_to_vmap >>= 1;
+		}
+		if (!ptr)
+			return -ENOMEM;
+
+		memset(ptr, 0, npages_to_vmap * PAGE_SIZE);
+		vunmap(ptr);
+	}
+
+	return 0;
+}
+
+int msm_ion_heap_alloc_pages_mem(struct pages_mem *pages_mem)
+{
+	struct page **pages;
+	unsigned int page_tbl_size;
+
+	pages_mem->free_fn = kfree;
+	page_tbl_size = sizeof(struct page *) * (pages_mem->size >> PAGE_SHIFT);
+	if (page_tbl_size > SZ_8K) {
+		/*
+		 * Do fallback to ensure we have a balance between
+		 * performance and availability.
+		 */
+		pages = kmalloc(page_tbl_size,
+				__GFP_COMP | __GFP_NORETRY |
+				__GFP_NO_KSWAPD | __GFP_NOWARN);
+		if (!pages) {
+			pages = vmalloc(page_tbl_size);
+			pages_mem->free_fn = vfree;
+		}
+	} else {
+		pages = kmalloc(page_tbl_size, GFP_KERNEL);
+	}
+
+	if (!pages)
+		return -ENOMEM;
+
+	pages_mem->pages = pages;
+	return 0;
+}
+
+void msm_ion_heap_free_pages_mem(struct pages_mem *pages_mem)
+{
+	pages_mem->free_fn(pages_mem->pages);
+}
+
+int msm_ion_heap_high_order_page_zero(struct page *page, int order)
+{
+	int i, ret;
+	struct pages_mem pages_mem;
+	int npages = 1 << order;
+	pages_mem.size = npages * PAGE_SIZE;
+
+	if (msm_ion_heap_alloc_pages_mem(&pages_mem))
+		return -ENOMEM;
+
+	for (i = 0; i < (1 << order); ++i)
+		pages_mem.pages[i] = page + i;
+
+	ret = msm_ion_heap_pages_zero(pages_mem.pages, npages);
+	dma_sync_single_for_device(NULL, page_to_phys(page), pages_mem.size,
+				   DMA_BIDIRECTIONAL);
+	msm_ion_heap_free_pages_mem(&pages_mem);
+	return ret;
+}
+
+int msm_ion_heap_buffer_zero(struct ion_buffer *buffer)
+{
+	struct sg_table *table = buffer->sg_table;
+	struct scatterlist *sg;
+	int i, j, ret = 0, npages = 0;
+	struct pages_mem pages_mem;
+
+	pages_mem.size = PAGE_ALIGN(buffer->size);
+
+	if (msm_ion_heap_alloc_pages_mem(&pages_mem))
+		return -ENOMEM;
+
+	for_each_sg(table->sgl, sg, table->nents, i) {
+		struct page *page = sg_page(sg);
+		unsigned long len = sg->length;
+		/* needed to make dma_sync_sg_for_device work: */
+		sg->dma_address = sg_phys(sg);
+
+		for (j = 0; j < len / PAGE_SIZE; j++)
+			pages_mem.pages[npages++] = page + j;
+	}
+
+	ret = msm_ion_heap_pages_zero(pages_mem.pages, npages);
+	dma_sync_sg_for_device(NULL, table->sgl, table->nents,
+			       DMA_BIDIRECTIONAL);
+	msm_ion_heap_free_pages_mem(&pages_mem);
+	return ret;
+}
+
 static struct ion_heap *msm_ion_heap_create(struct ion_platform_heap *heap_data)
 {
 	struct ion_heap *heap = NULL;
 
 	switch ((int)heap_data->type) {
 #ifdef CONFIG_CMA
-	case ION_HEAP_TYPE_DMA:
-		heap = ion_cma_heap_create(heap_data);
-		break;
-
 	case ION_HEAP_TYPE_SECURE_DMA:
 		heap = ion_secure_cma_heap_create(heap_data);
 		break;
@@ -810,7 +931,9 @@ static struct ion_heap *msm_ion_heap_create(struct ion_platform_heap *heap_data)
 	case ION_HEAP_TYPE_REMOVED:
 		heap = ion_removed_heap_create(heap_data);
 		break;
-
+	case ION_HEAP_TYPE_SYSTEM_SECURE:
+		heap = ion_system_secure_heap_create(heap_data);
+		break;
 	default:
 		heap = ion_heap_create(heap_data);
 	}
@@ -835,9 +958,6 @@ static void msm_ion_heap_destroy(struct ion_heap *heap)
 
 	switch ((int)heap->type) {
 #ifdef CONFIG_CMA
-	case ION_HEAP_TYPE_DMA:
-		ion_cma_heap_destroy(heap);
-		break;
 	case ION_HEAP_TYPE_SECURE_DMA:
 		ion_secure_cma_heap_destroy(heap);
 		break;
@@ -845,9 +965,27 @@ static void msm_ion_heap_destroy(struct ion_heap *heap)
 	case ION_HEAP_TYPE_REMOVED:
 		ion_removed_heap_destroy(heap);
 		break;
+	case ION_HEAP_TYPE_SYSTEM_SECURE:
+		ion_system_secure_heap_destroy(heap);
+		break;
 	default:
 		ion_heap_destroy(heap);
 	}
+}
+
+struct ion_heap *get_ion_heap(int heap_id)
+{
+	int i;
+	struct ion_heap *heap;
+
+	for (i = 0; i < num_heaps; i++) {
+		heap = heaps[i];
+		if (heap->id == heap_id)
+			return heap;
+	}
+
+	pr_err("%s: heap_id %d not found\n", __func__, heap_id);
+	return NULL;
 }
 
 static int msm_ion_probe(struct platform_device *pdev)
@@ -878,7 +1016,7 @@ static int msm_ion_probe(struct platform_device *pdev)
 		goto out;
 	}
 
-	new_dev = ion_device_create(msm_ion_custom_ioctl);
+	new_dev = ion_device_create(compat_msm_ion_ioctl);
 	if (IS_ERR_OR_NULL(new_dev)) {
 		/*
 		 * set this to the ERR to indicate to the clients
@@ -912,7 +1050,6 @@ static int msm_ion_probe(struct platform_device *pdev)
 
 		ion_device_add_heap(new_dev, heaps[i]);
 	}
-	check_for_heap_overlap(pdata->heaps, num_heaps);
 	if (pdata_needs_to_be_freed)
 		free_pdata(pdata);
 
@@ -922,6 +1059,8 @@ static int msm_ion_probe(struct platform_device *pdev)
 	 * completely until Ion is setup
 	 */
 	idev = new_dev;
+
+	show_mem_notifier_register(&msm_ion_nb);
 	return 0;
 
 freeheaps:

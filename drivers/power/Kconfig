@@ -204,16 +204,6 @@ config BATTERY_MAX17042
 	  with MAX17042. This driver also supports max17047/50 chips which are
 	  improved version of max17042.
 
-config BATTERY_ANDROID
-	tristate "Battery driver for Android"
-	help
-	  Say Y to enable generic support for battery charging according
-	  to common Android policies.
-	  This driver adds periodic battery level and health monitoring,
-	  kernel log reporting and other debugging features, common board
-	  battery file glue logic for battery/case temperature sensors,
-	  etc.
-
 config BATTERY_Z2
 	tristate "Z2 battery driver"
 	depends on I2C && MACH_ZIPIT2
@@ -272,7 +262,6 @@ config CHARGER_ISP1704
 
 config CHARGER_MAX8903
 	tristate "MAX8903 Battery DC-DC Charger for USB and Adapter Power"
-	depends on GENERIC_HARDIRQS
 	help
 	  Say Y to enable support for the MAX8903 DC-DC charger and sysfs.
 	  The driver supports controlling charger-enable and current-limit
@@ -371,6 +360,26 @@ config SMB349_USB_CHARGER
 	 notification support. The driver controls SMB349 via I2C and
 	 supports device-tree interface.
 
+config SMB349_DUAL_CHARGER
+	tristate "smb349 dual charger"
+	depends on I2C
+	help
+	 Say Y to enable support for the SMB349 dual charger single path
+	 switching mode charger. The driver supports charging in conjuction
+	 with an external charger on the same path by providing hand-off
+	 control and charge-current limiting. The driver controls SMB349
+	 via I2C in STAT IRQ driven mode and supports device-tree interface.
+
+config SMB1351_USB_CHARGER
+	tristate "smb1351 usb charger (with VBUS detection)"
+	depends on I2C
+	help
+	 Say Y to enable support for the SMB1351 switching mode based charger.
+	 The driver supports charging control (enable/disable) and
+	 charge-current limiting. It also provides USB VBUS detection and
+	 notification support. The driver controls SMB1351 via I2C and
+	 supports device-tree interface.
+
 config SMB350_CHARGER
 	tristate "smb350 charger"
 	depends on I2C
@@ -390,6 +399,39 @@ config SMB135X_CHARGER
 	  Say Y to include support for SMB135X Battery Charger.
 	  SMB135X is a dual path switching mode charger capable of charging
 	  the battery with 3Amps of current.
+	  The driver supports charger enable/disable.
+	  The driver reports the charger status via the power supply framework.
+	  A charger status change triggers an IRQ via the device STAT pin.
+
+config SMB1360_CHARGER_FG
+	tristate "SMB1360 Charger and Fuel Guage"
+	depends on I2C
+	help
+	  Say Y to include support for SMB1360 Charger and Fuel Guage.
+	  SMB1360 is a single path switching mode charger capable of charging
+	  the battery with 1.5Amps of current. It supports a fuel gauge which
+	  uses voltage and coloumb counting for state of charge reporting.
+	  The driver reports the status via the power supply framework.
+	  A status change triggers an IRQ via the device STAT pin.
+
+config SMB138X_CHARGER
+	tristate "SMB138X Battery Charger"
+	depends on MFD_I2C_PMIC
+	help
+	  Say Y to include support for SMB138X Battery Charger.
+	  SMB1380 is a dual phase 6A battery charger, and SMB1381 is a single
+	  phase 5A battery charger.
+	  The driver supports charger enable/disable.
+	  The driver reports the charger status via the power supply framework.
+	  A charger status change triggers an IRQ via the device STAT pin.
+
+config SMB358_CHARGER
+	tristate "SMB358 Battery Charger"
+	depends on I2C
+	help
+	  Say Y to include support for SMB358 Battery Charger.
+	  SMB358 is a single path switching mode charger capable of charging
+	  the battery with 2Amps of current.
 	  The driver supports charger enable/disable.
 	  The driver reports the charger status via the power supply framework.
 	  A charger status change triggers an IRQ via the device STAT pin.
@@ -424,6 +466,26 @@ config QPNP_CHARGER
 	  also offers relevant information to userspace via the power supply
 	  framework.
 
+config QPNP_SMBCHARGER
+	tristate "QPNP SMB Charger driver"
+	depends on SPMI
+	depends on OF_SPMI
+	help
+	  Say Y here to enable the dual path switch mode battery charger which
+	  supports USB detection and battery charging up to 3A.
+	  The driver also offers relevant information to userspace via the
+	  power supply framework.
+
+config QPNP_FG
+	tristate "QPNP fuel gauge driver"
+	depends on SPMI
+	depends on OF_SPMI
+	help
+	  Say Y here to enable the Fuel Gauge driver. This adds support for
+	  battery fuel gauging and state of charge of battery connected to the
+	  fuel gauge. The state of charge is reported through a BMS power
+	  supply property and also sends uevents when the capacity is updated.
+
 config PM8921_BMS
 	tristate "PM8921 Battery Monitoring System driver"
 	depends on MFD_PM8921_CORE
@@ -432,6 +494,7 @@ config PM8921_BMS
 
 config BATTERY_BCL
 	tristate "Battery Current Limit driver"
+	depends on THERMAL_MONITOR
 	help
 	  Say Y here to enable support for battery current limit
 	  device. The BCL driver will poll BMS if
@@ -461,7 +524,6 @@ config AB8500_BM
 
 config BATTERY_GOLDFISH
 	tristate "Goldfish battery driver"
-	depends on GENERIC_HARDIRQS
 	help
 	  Say Y to enable support for the battery and AC power in the
 	  Goldfish emulator.
@@ -485,8 +547,37 @@ config QPNP_BMS
 	  It registers a fuelgauge bms power supply to report
 	  State of Charge.
 
+config QPNP_LINEAR_CHARGER
+	tristate "QPNP Linear Charger driver"
+	depends on SPMI
+	depends on OF_SPMI
+	depends on MSM_QPNP_INT
+	depends on THERMAL_QPNP_ADC_TM
+	help
+	  Say Y here to enable the Linear battery charger which supports USB
+	  detection and charging. The driver also offers relevant information
+	  to userspace via the power supply framework.
+
+config MSM_BCL_CTL
+	bool "BCL Framework driver"
+	help
+	  Say Y here to enable this BCL Framework driver. This driver provides
+	  interface, which can be used by the BCL h/w drivers to implement the
+	  basic functionalities. This framework abstracts the underlying
+	  hardware for the top level modules.
+
+config MSM_BCL_PERIPHERAL_CTL
+	bool "BCL driver to control the PMIC BCL peripheral"
+	depends on SPMI
+	depends on MSM_BCL_CTL
+	help
+	  Say Y here to enable this BCL PMIC peripheral driver. This driver
+	  provides routines to configure and monitor the BCL
+	  PMIC peripheral.
+
 source "drivers/power/reset/Kconfig"
 
 endif # POWER_SUPPLY
 
 source "drivers/power/avs/Kconfig"
+source "drivers/power/qcom/Kconfig"

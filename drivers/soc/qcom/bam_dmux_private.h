@@ -1,4 +1,4 @@
-/* Copyright (c) 2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2013-2014, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -16,7 +16,7 @@
 #include <linux/types.h>
 #include <linux/dma-mapping.h>
 
-#include <mach/sps.h>
+#include <linux/msm-sps.h>
 
 #define BAM_MUX_HDR_MAGIC_NO			0x33fc
 #define BAM_MUX_HDR_CMD_DATA			0
@@ -24,7 +24,12 @@
 #define BAM_MUX_HDR_CMD_CLOSE			2
 #define BAM_MUX_HDR_CMD_STATUS			3 /* unused */
 #define BAM_MUX_HDR_CMD_OPEN_NO_A2_PC		4
-#define BUFFER_SIZE				2048
+#define DEFAULT_BUFFER_SIZE			SZ_2K
+
+#define DYNAMIC_MTU_MASK			0x2
+#define MTU_SIZE_MASK				0xc0
+#define MTU_SIZE_SHIFT				0x6
+#define DL_POOL_SIZE_SHIFT			0x4
 
 /**
  * struct bam_ops_if - collection of function pointers to allow swappable
@@ -74,9 +79,9 @@ struct bam_ops_if {
 
 	int (*sps_register_bam_device_ptr)(
 		const struct sps_bam_props *bam_props,
-		u32 *dev_handle);
+		unsigned long *dev_handle);
 
-	int (*sps_deregister_bam_device_ptr)(u32 dev_handle);
+	int (*sps_deregister_bam_device_ptr)(unsigned long dev_handle);
 
 	struct sps_pipe *(*sps_alloc_endpoint_ptr)(void);
 
@@ -88,13 +93,13 @@ struct bam_ops_if {
 	int (*sps_get_config_ptr)(struct sps_pipe *h,
 		struct sps_connect *config);
 
-	int (*sps_device_reset_ptr)(u32 dev);
+	int (*sps_device_reset_ptr)(unsigned long dev);
 
 	int (*sps_register_event_ptr)(struct sps_pipe *h,
 		struct sps_register_event *reg);
 
 	int (*sps_transfer_one_ptr)(struct sps_pipe *h,
-		u32 addr, u32 size,
+		phys_addr_t addr, u32 size,
 		void *user, u32 flags);
 
 	int (*sps_get_iovec_ptr)(struct sps_pipe *h,
@@ -112,7 +117,7 @@ struct bam_ops_if {
  * struct bam_mux_hdr - struct which contains bam dmux header info
  * @magic_num: magic number placed at start to ensure that it is actually a
  * valid bam dmux header
- * @reserved: for later use
+ * @signal: optional signaling bits with commmand type specific definitions
  * @cmd: the command
  * @pad_len: the length of padding
  * @ch_id: the id of the bam dmux channel that this is sent on
@@ -120,7 +125,7 @@ struct bam_ops_if {
  */
 struct bam_mux_hdr {
 	uint16_t magic_num;
-	uint8_t reserved;
+	uint8_t signal;
 	uint8_t cmd;
 	uint8_t pad_len;
 	uint8_t ch_id;
@@ -133,12 +138,16 @@ struct bam_mux_hdr {
  * @dma_address: dma mapped address of the packet
  * @work: work_struct for processing the packet
  * @list_node: list_head for placing this on a list
+ * @sps_size: size of the sps_iovec for this packet
+ * @len: total length of the buffer containing this packet
  */
 struct rx_pkt_info {
 	struct sk_buff *skb;
 	dma_addr_t dma_address;
 	struct work_struct work;
 	struct list_head list_node;
+	uint16_t sps_size;
+	uint16_t len;
 };
 
 /**

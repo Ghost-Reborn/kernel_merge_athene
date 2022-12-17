@@ -26,13 +26,14 @@
 #include <linux/sysfs.h>
 #include <linux/stat.h>
 #include <linux/spinlock.h>
+#include <linux/mutex.h>
 #include <linux/clk.h>
 #include <linux/cpu.h>
 #include <linux/of_coresight.h>
 #include <linux/coresight.h>
 #include <asm/sections.h>
 #include <soc/qcom/socinfo.h>
-#include <mach/msm_memory_dump.h>
+#include <soc/qcom/memory_dump.h>
 
 #include "coresight-priv.h"
 
@@ -150,8 +151,11 @@ do {									\
 #define ETMPDSR				(0x314)
 
 #define ETM_MAX_ADDR_CMP		(16)
+#define ETM_MAX_DATA_CMP		(8)
 #define ETM_MAX_CNTR			(4)
 #define ETM_MAX_CTXID_CMP		(3)
+#define ETM_MAX_EXT_INP			(4)
+#define ETM_MAX_EXT_OUTP		(4)
 
 #define ETM_MODE_EXCLUDE		BIT(0)
 #define ETM_MODE_CYCACC			BIT(1)
@@ -183,6 +187,15 @@ enum etm_addr_type {
 	ETM_ADDR_TYPE_STOP,
 };
 
+#ifdef CONFIG_CORESIGHT_ETM_DEFAULT_RESET
+static int boot_reset = 1;
+#else
+static int boot_reset;
+#endif
+module_param_named(
+	boot_reset, boot_reset, int, S_IRUGO
+);
+
 #ifdef CONFIG_CORESIGHT_ETM_DEFAULT_ENABLE
 static int boot_enable = 1;
 #else
@@ -203,17 +216,20 @@ module_param_named(
 
 struct etm_drvdata {
 	void __iomem			*base;
+	uint32_t			reg_size;
 	struct device			*dev;
 	struct coresight_device		*csdev;
 	struct clk			*clk;
 	spinlock_t			spinlock;
-	struct wake_lock		wake_lock;
+	struct mutex			mutex;
+	struct wakeup_source		ws;
 	int				cpu;
 	uint8_t				arch;
 	bool				enable;
 	bool				sticky_enable;
 	bool				boot_enable;
 	bool				os_unlock;
+	bool				init;
 	uint8_t				nr_addr_cmp;
 	uint8_t				nr_cntr;
 	uint8_t				nr_ext_inp;
@@ -261,9 +277,12 @@ struct etm_drvdata {
 	bool				pcsave_sticky_enable;
 	bool				pcsave_boot_enable;
 	bool				round_robin;
+	struct msm_dump_data		reg_data;
 };
 
+static int count;
 static struct etm_drvdata *etmdrvdata[NR_CPUS];
+static struct notifier_block etm_cpu_notifier;
 
 static bool etm_os_lock_present(struct etm_drvdata *drvdata)
 {
@@ -463,6 +482,73 @@ static bool etm_version_gte(uint8_t arch, uint8_t base_arch)
 		return false;
 }
 
+static void etm_reset_data(struct etm_drvdata *drvdata)
+{
+	int i;
+
+	spin_lock(&drvdata->spinlock);
+
+	drvdata->mode = ETM_MODE_EXCLUDE;
+	drvdata->ctrl = 0x0;
+	if (etm_version_gte(drvdata->arch, ETM_ARCH_V1_0))
+		drvdata->ctrl |= BIT(11);
+	if (cpu_is_krait_v1()) {
+		drvdata->mode |= ETM_MODE_CYCACC;
+		drvdata->ctrl |= BIT(12);
+	}
+	drvdata->trigger_event = 0x406F;
+	drvdata->startstop_ctrl = 0x0;
+	if (etm_version_gte(drvdata->arch, ETM_ARCH_V1_2))
+		drvdata->enable_ctrl2 = 0x0;
+	drvdata->enable_event = 0x6F;
+	drvdata->enable_ctrl1 = 0x1000000;
+	drvdata->fifofull_level = 0x28;
+	if (drvdata->data_trace_support == true) {
+		drvdata->mode |= (ETM_MODE_DATA_TRACE_VAL |
+					ETM_MODE_DATA_TRACE_ADDR);
+		drvdata->ctrl |= BIT(2) | BIT(3);
+		drvdata->viewdata_event = 0x6F;
+		drvdata->viewdata_ctrl1 = 0x0;
+		drvdata->viewdata_ctrl3 = 0x10000;
+	}
+	drvdata->addr_idx = 0x0;
+	for (i = 0; i < drvdata->nr_addr_cmp; i++) {
+		drvdata->addr_val[i] = 0x0;
+		drvdata->addr_acctype[i] = 0x0;
+		drvdata->addr_type[i] = ETM_ADDR_TYPE_NONE;
+	}
+	for (i = 0; i < drvdata->nr_data_cmp; i++) {
+		drvdata->data_val[i] = 0;
+		drvdata->data_mask[i] = ~(0);
+	}
+	drvdata->cntr_idx = 0x0;
+	for (i = 0; i < drvdata->nr_cntr; i++) {
+		drvdata->cntr_rld_val[i] = 0x0;
+		drvdata->cntr_event[i] = 0x406F;
+		drvdata->cntr_rld_event[i] = 0x406F;
+		drvdata->cntr_val[i] = 0x0;
+	}
+	drvdata->seq_12_event = 0x406F;
+	drvdata->seq_21_event = 0x406F;
+	drvdata->seq_23_event = 0x406F;
+	drvdata->seq_31_event = 0x406F;
+	drvdata->seq_32_event = 0x406F;
+	drvdata->seq_13_event = 0x406F;
+	drvdata->seq_curr_state = 0x0;
+	drvdata->ctxid_idx = 0x0;
+	for (i = 0; i < drvdata->nr_ctxid_cmp; i++)
+		drvdata->ctxid_val[i] = 0x0;
+	drvdata->ctxid_mask = 0x0;
+	/* Bits[7:0] of ETMSYNCFR are reserved on Krait pass3 onwards */
+	if (cpu_is_krait() && !cpu_is_krait_v1() && !cpu_is_krait_v2())
+		drvdata->sync_freq = 0x100;
+	else
+		drvdata->sync_freq = 0x80;
+	drvdata->timestamp_event = 0x406F;
+
+	spin_unlock(&drvdata->spinlock);
+}
+
 static void __etm_enable(void *info)
 {
 	int i;
@@ -545,7 +631,7 @@ static int etm_enable(struct coresight_device *csdev)
 	struct etm_drvdata *drvdata = dev_get_drvdata(csdev->dev.parent);
 	int ret;
 
-	wake_lock(&drvdata->wake_lock);
+	pm_stay_awake(drvdata->dev);
 
 	ret = clk_prepare_enable(drvdata->clk);
 	if (ret)
@@ -565,7 +651,7 @@ static int etm_enable(struct coresight_device *csdev)
 
 	spin_unlock(&drvdata->spinlock);
 
-	wake_unlock(&drvdata->wake_lock);
+	pm_relax(drvdata->dev);
 
 	dev_info(drvdata->dev, "ETM tracing enabled\n");
 	return 0;
@@ -573,7 +659,7 @@ err:
 	spin_unlock(&drvdata->spinlock);
 	clk_disable_unprepare(drvdata->clk);
 err_clk:
-	wake_unlock(&drvdata->wake_lock);
+	pm_relax(drvdata->dev);
 	return ret;
 }
 
@@ -598,7 +684,7 @@ static void etm_disable(struct coresight_device *csdev)
 {
 	struct etm_drvdata *drvdata = dev_get_drvdata(csdev->dev.parent);
 
-	wake_lock(&drvdata->wake_lock);
+	pm_stay_awake(drvdata->dev);
 
 	/*
 	 * Taking hotplug lock here protects from clocks getting disabled
@@ -621,7 +707,7 @@ static void etm_disable(struct coresight_device *csdev)
 
 	clk_disable_unprepare(drvdata->clk);
 
-	wake_unlock(&drvdata->wake_lock);
+	pm_relax(drvdata->dev);
 
 	dev_info(drvdata->dev, "ETM tracing disabled\n");
 }
@@ -680,73 +766,14 @@ static ssize_t etm_store_reset(struct device *dev,
 			       size_t size)
 {
 	struct etm_drvdata *drvdata = dev_get_drvdata(dev->parent);
-	int i;
 	unsigned long val;
 
 	if (sscanf(buf, "%lx", &val) != 1)
 		return -EINVAL;
 
-	spin_lock(&drvdata->spinlock);
-	if (val) {
-		drvdata->mode = ETM_MODE_EXCLUDE;
-		drvdata->ctrl = 0x0;
-		if (etm_version_gte(drvdata->arch, ETM_ARCH_V1_0))
-			drvdata->ctrl |= BIT(11);
-		if (cpu_is_krait_v1()) {
-			drvdata->mode |= ETM_MODE_CYCACC;
-			drvdata->ctrl |= BIT(12);
-		}
-		drvdata->trigger_event = 0x406F;
-		drvdata->startstop_ctrl = 0x0;
-		if (etm_version_gte(drvdata->arch, ETM_ARCH_V1_2))
-			drvdata->enable_ctrl2 = 0x0;
-		drvdata->enable_event = 0x6F;
-		drvdata->enable_ctrl1 = 0x1000000;
-		drvdata->fifofull_level = 0x28;
-		if (drvdata->data_trace_support == true) {
-			drvdata->mode |= (ETM_MODE_DATA_TRACE_VAL |
-						ETM_MODE_DATA_TRACE_ADDR);
-			drvdata->ctrl |= BIT(2) | BIT(3);
-			drvdata->viewdata_event = 0x6F;
-			drvdata->viewdata_ctrl1 = 0x0;
-			drvdata->viewdata_ctrl3 = 0x10000;
-		}
-		drvdata->addr_idx = 0x0;
-		for (i = 0; i < drvdata->nr_addr_cmp; i++) {
-			drvdata->addr_val[i] = 0x0;
-			drvdata->addr_acctype[i] = 0x0;
-			drvdata->addr_type[i] = ETM_ADDR_TYPE_NONE;
-		}
-		for (i = 0; i < drvdata->nr_data_cmp; i++) {
-			drvdata->data_val[i] = 0;
-			drvdata->data_mask[i] = ~(0);
-		}
-		drvdata->cntr_idx = 0x0;
-		for (i = 0; i < drvdata->nr_cntr; i++) {
-			drvdata->cntr_rld_val[i] = 0x0;
-			drvdata->cntr_event[i] = 0x406F;
-			drvdata->cntr_rld_event[i] = 0x406F;
-			drvdata->cntr_val[i] = 0x0;
-		}
-		drvdata->seq_12_event = 0x406F;
-		drvdata->seq_21_event = 0x406F;
-		drvdata->seq_23_event = 0x406F;
-		drvdata->seq_31_event = 0x406F;
-		drvdata->seq_32_event = 0x406F;
-		drvdata->seq_13_event = 0x406F;
-		drvdata->seq_curr_state = 0x0;
-		drvdata->ctxid_idx = 0x0;
-		for (i = 0; i < drvdata->nr_ctxid_cmp; i++)
-			drvdata->ctxid_val[i] = 0x0;
-		drvdata->ctxid_mask = 0x0;
-		/* Bits[7:0] of ETMSYNCFR are reserved on Krait pass3 onwards */
-		if (cpu_is_krait() && !cpu_is_krait_v1() && !cpu_is_krait_v2())
-			drvdata->sync_freq = 0x100;
-		else
-			drvdata->sync_freq = 0x80;
-		drvdata->timestamp_event = 0x406F;
-	}
-	spin_unlock(&drvdata->spinlock);
+	if (val)
+		etm_reset_data(drvdata);
+
 	return size;
 }
 static DEVICE_ATTR(reset, S_IRUGO | S_IWUSR, etm_show_reset, etm_store_reset);
@@ -1835,6 +1862,20 @@ static ssize_t etm_store_pcsave(struct device *dev,
 static DEVICE_ATTR(pcsave, S_IRUGO | S_IWUSR, etm_show_pcsave,
 		   etm_store_pcsave);
 
+static ssize_t etm_show_cpu(struct device *dev,
+				   struct device_attribute *attr,
+				   char *buf)
+{
+	struct etm_drvdata *drvdata = dev_get_drvdata(dev->parent);
+	int cpu;
+
+	cpu = drvdata->cpu;
+	if (cpu < 0)
+		return -EINVAL;
+	return scnprintf(buf, PAGE_SIZE, "%#x\n", cpu);
+}
+static DEVICE_ATTR(cpu, S_IRUGO, etm_show_cpu, NULL);
+
 static struct attribute *etm_attrs[] = {
 	&dev_attr_nr_addr_cmp.attr,
 	&dev_attr_nr_cntr.attr,
@@ -1869,6 +1910,7 @@ static struct attribute *etm_attrs[] = {
 	&dev_attr_ctxid_mask.attr,
 	&dev_attr_sync_freq.attr,
 	&dev_attr_timestamp_event.attr,
+	&dev_attr_cpu.attr,
 	NULL,
 };
 
@@ -1881,78 +1923,17 @@ static const struct attribute_group *etm_attr_grps[] = {
 	NULL,
 };
 
-static int etm_cpu_callback(struct notifier_block *nfb, unsigned long action,
-			    void *hcpu)
+int coresight_etm_get_funnel_port(int cpu)
 {
-	unsigned int cpu = (unsigned long)hcpu;
-	static bool clk_disable[NR_CPUS];
-	int ret;
+	struct coresight_platform_data *pdata;
 
 	if (!etmdrvdata[cpu])
-		goto out;
+		return -ENODEV;
 
-	switch (action & (~CPU_TASKS_FROZEN)) {
-	case CPU_UP_PREPARE:
-		if (!etmdrvdata[cpu]->os_unlock) {
-			ret = clk_prepare_enable(etmdrvdata[cpu]->clk);
-			if (ret) {
-				dev_err(etmdrvdata[cpu]->dev,
-					"ETM clk enable during hotplug failed"
-					"for cpu: %d, ret: %d\n", cpu, ret);
-				return notifier_from_errno(ret);
-			}
-			clk_disable[cpu] = true;
-		}
-		break;
-
-	case CPU_STARTING:
-		spin_lock(&etmdrvdata[cpu]->spinlock);
-		if (!etmdrvdata[cpu]->os_unlock) {
-			etm_os_unlock(etmdrvdata[cpu]);
-			etmdrvdata[cpu]->os_unlock = true;
-		}
-
-		if (etmdrvdata[cpu]->enable && etmdrvdata[cpu]->round_robin)
-			__etm_enable(etmdrvdata[cpu]);
-		spin_unlock(&etmdrvdata[cpu]->spinlock);
-		break;
-
-	case CPU_ONLINE:
-		if (clk_disable[cpu]) {
-			clk_disable_unprepare(etmdrvdata[cpu]->clk);
-			clk_disable[cpu] = false;
-		}
-
-		if (etmdrvdata[cpu]->boot_enable &&
-		    !etmdrvdata[cpu]->sticky_enable)
-			coresight_enable(etmdrvdata[cpu]->csdev);
-
-		if (etmdrvdata[cpu]->pcsave_boot_enable &&
-		    !etmdrvdata[cpu]->pcsave_sticky_enable)
-			__etm_store_pcsave(etmdrvdata[cpu], 1);
-		break;
-
-	case CPU_UP_CANCELED:
-		if (clk_disable[cpu]) {
-			clk_disable_unprepare(etmdrvdata[cpu]->clk);
-			clk_disable[cpu] = false;
-		}
-		break;
-
-	case CPU_DYING:
-		spin_lock(&etmdrvdata[cpu]->spinlock);
-		if (etmdrvdata[cpu]->enable && etmdrvdata[cpu]->round_robin)
-			__etm_disable(etmdrvdata[cpu]);
-		spin_unlock(&etmdrvdata[cpu]->spinlock);
-		break;
-	}
-out:
-	return NOTIFY_OK;
+	pdata = etmdrvdata[cpu]->dev->platform_data;
+	return pdata->child_ports[0];
 }
-
-static struct notifier_block etm_cpu_notifier = {
-	.notifier_call = etm_cpu_callback,
-};
+EXPORT_SYMBOL(coresight_etm_get_funnel_port);
 
 static bool etm_arch_supported(uint8_t arch)
 {
@@ -1998,11 +1979,42 @@ static void etm_init_arch_data(void *info)
 
 	etmccr = etm_readl(drvdata, ETMCCR);
 	drvdata->nr_addr_cmp = BMVAL(etmccr, 0, 3) * 2;
+	if (drvdata->nr_addr_cmp > ETM_MAX_ADDR_CMP) {
+		dev_err(drvdata->dev,
+			"nr_addr_cmp out of bounds %u\n", drvdata->nr_addr_cmp);
+		drvdata->nr_addr_cmp = ETM_MAX_ADDR_CMP;
+	}
 	drvdata->nr_cntr = BMVAL(etmccr, 13, 15);
+	if (drvdata->nr_cntr > ETM_MAX_CNTR) {
+		dev_err(drvdata->dev,
+			"nr_cntr out of bounds %u\n", drvdata->nr_cntr);
+		drvdata->nr_cntr = ETM_MAX_CNTR;
+	}
 	drvdata->nr_ext_inp = BMVAL(etmccr, 17, 19);
+	if (drvdata->nr_ext_inp > ETM_MAX_EXT_INP) {
+		dev_err(drvdata->dev,
+			"nr_ext_inp out of bounds %u\n", drvdata->nr_ext_inp);
+		drvdata->nr_ext_inp = ETM_MAX_EXT_INP;
+	}
 	drvdata->nr_ext_out = BMVAL(etmccr, 20, 22);
+	if (drvdata->nr_ext_out > ETM_MAX_EXT_OUTP) {
+		dev_err(drvdata->dev,
+			"nr_ext_out out of bounds %u\n", drvdata->nr_ext_out);
+		drvdata->nr_ext_out = ETM_MAX_EXT_OUTP;
+	}
 	drvdata->nr_ctxid_cmp = BMVAL(etmccr, 24, 25);
+	if (drvdata->nr_ctxid_cmp > ETM_MAX_CTXID_CMP) {
+		dev_err(drvdata->dev,
+			"nr_ctxid_cmp out of bounds %u\n",
+			drvdata->nr_ctxid_cmp);
+		drvdata->nr_ctxid_cmp = ETM_MAX_CTXID_CMP;
+	}
 	drvdata->nr_data_cmp = BMVAL(etmccr, 4, 7);
+	if (drvdata->nr_data_cmp > ETM_MAX_DATA_CMP) {
+		dev_err(drvdata->dev,
+			"nr_data_cmp out of bounds %u\n", drvdata->nr_data_cmp);
+		drvdata->nr_data_cmp = ETM_MAX_DATA_CMP;
+	}
 
 	if (etm_version_gte(drvdata->arch, ETM_ARCH_V1_0)) {
 		etmcr = etm_readl(drvdata, ETMCR);
@@ -2018,18 +2030,6 @@ static void etm_init_arch_data(void *info)
 
 	etm_set_pwrdwn(drvdata);
 	ETM_LOCK(drvdata);
-}
-
-static void etm_copy_arch_data(struct etm_drvdata *drvdata)
-{
-	drvdata->arch = etmdrvdata[0]->arch;
-	drvdata->nr_addr_cmp = etmdrvdata[0]->nr_addr_cmp;
-	drvdata->nr_cntr = etmdrvdata[0]->nr_cntr;
-	drvdata->nr_ext_inp = etmdrvdata[0]->nr_ext_inp;
-	drvdata->nr_ext_out = etmdrvdata[0]->nr_ext_out;
-	drvdata->nr_ctxid_cmp = etmdrvdata[0]->nr_ctxid_cmp;
-	drvdata->nr_data_cmp = etmdrvdata[0]->nr_data_cmp;
-	drvdata->data_trace_support = etmdrvdata[0]->data_trace_support;
 }
 
 static void etm_init_default_data(struct etm_drvdata *drvdata)
@@ -2100,18 +2100,216 @@ static void etm_init_default_data(struct etm_drvdata *drvdata)
 	}
 }
 
+static int etm_late_init(struct etm_drvdata *drvdata)
+{
+	void *baddr;
+	struct msm_client_dump dump;
+	struct msm_dump_entry dump_entry;
+	struct coresight_desc *desc;
+	struct device *dev = drvdata->dev;
+	int ret;
+
+	if (etm_arch_supported(drvdata->arch) == false)
+		return -EINVAL;
+
+	etm_init_default_data(drvdata);
+
+	if (MSM_DUMP_MAJOR(msm_dump_table_version()) == 1) {
+		baddr = devm_kzalloc(dev, PAGE_SIZE + drvdata->reg_size,
+				     GFP_KERNEL);
+		if (baddr) {
+			dump.id = MSM_ETM0_REG + drvdata->cpu;
+			dump.start_addr = virt_to_phys(baddr);
+			dump.end_addr = dump.start_addr + PAGE_SIZE +
+					drvdata->reg_size;
+			ret = msm_dump_tbl_register(&dump);
+			if (ret) {
+				devm_kfree(dev, baddr);
+				dev_err(dev, "ETM REG dump setup failed\n");
+			}
+		} else {
+			dev_err(dev, "ETM REG dump space allocation failed\n");
+		}
+	} else {
+		baddr = devm_kzalloc(dev, drvdata->reg_size, GFP_KERNEL);
+		if (baddr) {
+			drvdata->reg_data.addr = virt_to_phys(baddr);
+			drvdata->reg_data.len = drvdata->reg_size;
+			dump_entry.id = MSM_DUMP_DATA_ETM_REG + drvdata->cpu;
+			dump_entry.addr = virt_to_phys(&drvdata->reg_data);
+			ret = msm_dump_data_register(MSM_DUMP_TABLE_APPS,
+						     &dump_entry);
+			if (ret) {
+				devm_kfree(dev, baddr);
+				dev_err(dev, "ETM REG dump setup failed\n");
+			}
+		} else {
+			dev_err(dev, "ETM REG dump space allocation failed\n");
+		}
+	}
+
+	desc = devm_kzalloc(dev, sizeof(*desc), GFP_KERNEL);
+	if (!desc) {
+		ret = -ENOMEM;
+		goto err0;
+	}
+
+	desc->type = CORESIGHT_DEV_TYPE_SOURCE;
+	desc->subtype.source_subtype = CORESIGHT_DEV_SUBTYPE_SOURCE_PROC;
+	desc->ops = &etm_cs_ops;
+	desc->pdata = drvdata->dev->platform_data;
+	desc->dev = drvdata->dev;
+	desc->groups = etm_attr_grps;
+	desc->owner = THIS_MODULE;
+	drvdata->csdev = coresight_register(desc);
+	if (IS_ERR(drvdata->csdev)) {
+		ret = PTR_ERR(drvdata->csdev);
+		goto err1;
+	}
+
+	if (drvdata->pcsave_impl) {
+		ret = device_create_file(&drvdata->csdev->dev,
+					 &dev_attr_pcsave);
+		if (ret)
+			dev_err(dev, "ETM pcsave dev node creation failed\n");
+	}
+
+	dev_info(dev, "ETM initialized\n");
+
+	if (boot_reset)
+		etm_reset_data(drvdata);
+
+	if (boot_enable) {
+		coresight_enable(drvdata->csdev);
+		drvdata->boot_enable = true;
+	}
+
+	if (drvdata->pcsave_impl && boot_pcsave_enable) {
+		__etm_store_pcsave(drvdata, 1);
+		drvdata->pcsave_boot_enable = true;
+	}
+
+	return 0;
+err1:
+	devm_kfree(dev, desc);
+err0:
+	devm_kfree(dev, baddr);
+	return ret;
+}
+
+static int etm_cpu_callback(struct notifier_block *nfb, unsigned long action,
+			    void *hcpu)
+{
+	unsigned int cpu = (unsigned long)hcpu;
+	static bool clk_disable[NR_CPUS];
+	int ret;
+	struct platform_device *pdev;
+
+	if (!etmdrvdata[cpu])
+		goto out;
+
+	switch (action & (~CPU_TASKS_FROZEN)) {
+	case CPU_UP_PREPARE:
+		if (!etmdrvdata[cpu]->os_unlock) {
+			ret = clk_prepare_enable(etmdrvdata[cpu]->clk);
+			if (ret) {
+				dev_err(etmdrvdata[cpu]->dev,
+					"ETM clk enable during hotplug failed"
+					"for cpu: %d, ret: %d\n", cpu, ret);
+				goto err0;
+			}
+			clk_disable[cpu] = true;
+		}
+		break;
+
+	case CPU_STARTING:
+		spin_lock(&etmdrvdata[cpu]->spinlock);
+		if (!etmdrvdata[cpu]->os_unlock) {
+			etm_os_unlock(etmdrvdata[cpu]);
+			etmdrvdata[cpu]->os_unlock = true;
+			etm_init_arch_data(etmdrvdata[cpu]);
+		}
+
+		if (etmdrvdata[cpu]->enable && etmdrvdata[cpu]->round_robin)
+			__etm_enable(etmdrvdata[cpu]);
+		spin_unlock(&etmdrvdata[cpu]->spinlock);
+		break;
+
+	case CPU_ONLINE:
+		mutex_lock(&etmdrvdata[cpu]->mutex);
+		if (!etmdrvdata[cpu]->init) {
+			ret = etm_late_init(etmdrvdata[cpu]);
+			if (ret) {
+				dev_err(etmdrvdata[cpu]->dev,
+					"ETM init failed. Cpu: %d, ret: %d\n",
+					cpu, ret);
+				mutex_unlock(&etmdrvdata[cpu]->mutex);
+				goto err1;
+			}
+			etmdrvdata[cpu]->init = true;
+		}
+		mutex_unlock(&etmdrvdata[cpu]->mutex);
+
+		if (clk_disable[cpu]) {
+			clk_disable_unprepare(etmdrvdata[cpu]->clk);
+			clk_disable[cpu] = false;
+		}
+
+		if (etmdrvdata[cpu]->boot_enable &&
+		    !etmdrvdata[cpu]->sticky_enable)
+			coresight_enable(etmdrvdata[cpu]->csdev);
+
+		if (etmdrvdata[cpu]->pcsave_boot_enable &&
+		    !etmdrvdata[cpu]->pcsave_sticky_enable)
+			__etm_store_pcsave(etmdrvdata[cpu], 1);
+		break;
+
+	case CPU_UP_CANCELED:
+		if (clk_disable[cpu]) {
+			clk_disable_unprepare(etmdrvdata[cpu]->clk);
+			clk_disable[cpu] = false;
+		}
+		break;
+
+	case CPU_DYING:
+		spin_lock(&etmdrvdata[cpu]->spinlock);
+		if (etmdrvdata[cpu]->enable && etmdrvdata[cpu]->round_robin)
+			__etm_disable(etmdrvdata[cpu]);
+		spin_unlock(&etmdrvdata[cpu]->spinlock);
+		break;
+	}
+out:
+	return NOTIFY_OK;
+err1:
+	if (--count == 0)
+		unregister_hotcpu_notifier(&etm_cpu_notifier);
+	if (clk_disable[cpu]) {
+		clk_disable_unprepare(etmdrvdata[cpu]->clk);
+		clk_disable[cpu] = false;
+	}
+	devm_clk_put(etmdrvdata[cpu]->dev, etmdrvdata[cpu]->clk);
+	wakeup_source_trash(&etmdrvdata[cpu]->ws);
+	devm_iounmap(etmdrvdata[cpu]->dev, etmdrvdata[cpu]->base);
+	pdev = to_platform_device(etmdrvdata[cpu]->dev);
+	platform_set_drvdata(pdev, NULL);
+	devm_kfree(etmdrvdata[cpu]->dev, etmdrvdata[cpu]);
+	etmdrvdata[cpu] = NULL;
+err0:
+	return notifier_from_errno(ret);
+}
+
+static struct notifier_block etm_cpu_notifier = {
+	.notifier_call = etm_cpu_callback,
+};
+
 static int etm_probe(struct platform_device *pdev)
 {
-	int ret;
+	int ret, cpu;
 	struct device *dev = &pdev->dev;
 	struct coresight_platform_data *pdata;
 	struct etm_drvdata *drvdata;
 	struct resource *res;
-	uint32_t reg_size;
-	static int count;
-	void *baddr;
-	struct msm_client_dump dump;
-	struct coresight_desc *desc;
+	struct device_node *cpu_node;
 
 	if (coresight_fuse_access_disabled() ||
 	    coresight_fuse_apps_access_disabled())
@@ -2133,14 +2331,41 @@ static int etm_probe(struct platform_device *pdev)
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "etm-base");
 	if (!res)
 		return -ENODEV;
-	reg_size = resource_size(res);
+	drvdata->reg_size = resource_size(res);
 
 	drvdata->base = devm_ioremap(dev, res->start, resource_size(res));
 	if (!drvdata->base)
 		return -ENOMEM;
 
 	spin_lock_init(&drvdata->spinlock);
-	wake_lock_init(&drvdata->wake_lock, WAKE_LOCK_SUSPEND, "coresight-etm");
+	mutex_init(&drvdata->mutex);
+	wakeup_source_init(&drvdata->ws, "coresight-etm");
+
+	if (pdev->dev.of_node)
+		drvdata->pcsave_impl = of_property_read_bool(pdev->dev.of_node,
+							     "qcom,pc-save");
+
+	drvdata->cpu = -1;
+	cpu_node = of_parse_phandle(pdev->dev.of_node, "coresight-etm-cpu", 0);
+	if (!cpu_node) {
+		dev_err(drvdata->dev, "ETM cpu handle not specified\n");
+		ret = -ENODEV;
+		goto err0;
+	}
+	for_each_possible_cpu(cpu) {
+		if (cpu_node == of_get_cpu_node(cpu, NULL)) {
+			drvdata->cpu = cpu;
+			break;
+		}
+	}
+	if (drvdata->cpu == -1) {
+		dev_err(drvdata->dev, "invalid ETM cpu handle\n");
+		ret = -EINVAL;
+		goto err0;
+	}
+
+	if (count++ == 0)
+		register_hotcpu_notifier(&etm_cpu_notifier);
 
 	drvdata->clk = devm_clk_get(dev, "core_clk");
 	if (IS_ERR(drvdata->clk)) {
@@ -2156,111 +2381,49 @@ static int etm_probe(struct platform_device *pdev)
 	if (ret)
 		goto err0;
 
-	drvdata->cpu = count++;
-
-	etmdrvdata[drvdata->cpu] = drvdata;
+	get_online_cpus();
 
 	/*
 	 * This is safe wrt CPU_UP_PREPARE and CPU_STARTING hotplug callbacks
-	 * on the secondary cores that may enable the clock and perform
+	 * on the non-boot CPUs that may enable the clock and perform
 	 * etm_os_unlock since they occur before the cpu online mask is updated
 	 * for the cpu which is checked by this smp call.
 	 */
-	if (!smp_call_function_single(drvdata->cpu, etm_os_unlock, drvdata, 1))
+	if (!smp_call_function_single(drvdata->cpu, etm_os_unlock, drvdata,
+				      1)) {
 		drvdata->os_unlock = true;
-
-	/*
-	 * OS unlock must have happened on cpu0 so use it to populate read-only
-	 * configuration data for ETM0. For other ETMs copy it over from ETM0.
-	 */
-	if (drvdata->cpu == 0) {
-		register_hotcpu_notifier(&etm_cpu_notifier);
-		if (smp_call_function_single(drvdata->cpu, etm_init_arch_data,
-					     drvdata, 1))
-			dev_err(dev, "ETM arch init failed\n");
-	} else {
-		etm_copy_arch_data(drvdata);
+		ret = smp_call_function_single(drvdata->cpu, etm_init_arch_data,
+					 drvdata, 1);
+		if (ret) {
+			put_online_cpus();
+			clk_disable_unprepare(drvdata->clk);
+			goto err1;
+		}
 	}
 
-	if (etm_arch_supported(drvdata->arch) == false) {
-		ret = -EINVAL;
-		goto err1;
-	}
-	etm_init_default_data(drvdata);
+	etmdrvdata[drvdata->cpu] = drvdata;
+
+	put_online_cpus();
 
 	clk_disable_unprepare(drvdata->clk);
 
-	if (pdev->dev.of_node)
-		drvdata->round_robin = of_property_read_bool(pdev->dev.of_node,
-							"qcom,round-robin");
-
-	baddr = devm_kzalloc(dev, PAGE_SIZE + reg_size, GFP_KERNEL);
-	if (baddr) {
-		*(uint32_t *)(baddr + ETM_REG_DUMP_VER_OFF) = ETM_REG_DUMP_VER;
-		dump.id = MSM_ETM0_REG + drvdata->cpu;
-		dump.start_addr = virt_to_phys(baddr);
-		dump.end_addr = dump.start_addr + PAGE_SIZE + reg_size;
-		ret = msm_dump_table_register(&dump);
+	mutex_lock(&drvdata->mutex);
+	if (drvdata->os_unlock && !drvdata->init) {
+		ret = etm_late_init(drvdata);
 		if (ret) {
-			devm_kfree(dev, baddr);
-			dev_err(dev, "ETM REG dump setup failed/unsupported\n");
+			mutex_unlock(&drvdata->mutex);
+			goto err1;
 		}
-	} else {
-		dev_err(dev, "ETM REG dump space allocation failed\n");
+		drvdata->init = true;
 	}
-
-	desc = devm_kzalloc(dev, sizeof(*desc), GFP_KERNEL);
-	if (!desc) {
-		ret = -ENOMEM;
-		goto err2;
-	}
-	desc->type = CORESIGHT_DEV_TYPE_SOURCE;
-	desc->subtype.source_subtype = CORESIGHT_DEV_SUBTYPE_SOURCE_PROC;
-	desc->ops = &etm_cs_ops;
-	desc->pdata = pdev->dev.platform_data;
-	desc->dev = &pdev->dev;
-	desc->groups = etm_attr_grps;
-	desc->owner = THIS_MODULE;
-	drvdata->csdev = coresight_register(desc);
-	if (IS_ERR(drvdata->csdev)) {
-		ret = PTR_ERR(drvdata->csdev);
-		goto err2;
-	}
-
-	if (pdev->dev.of_node)
-		drvdata->pcsave_impl = of_property_read_bool(pdev->dev.of_node,
-							     "qcom,pc-save");
-	if (drvdata->pcsave_impl) {
-		ret = device_create_file(&drvdata->csdev->dev,
-					 &dev_attr_pcsave);
-		if (ret)
-			dev_err(dev, "ETM pcsave dev node creation failed\n");
-	}
-
-	dev_info(dev, "ETM initialized\n");
-
-	if (boot_enable) {
-		coresight_enable(drvdata->csdev);
-		drvdata->boot_enable = true;
-	}
-
-	if (drvdata->pcsave_impl && boot_pcsave_enable) {
-		__etm_store_pcsave(drvdata, 1);
-		drvdata->pcsave_boot_enable = true;
-	}
+	mutex_unlock(&drvdata->mutex);
 
 	return 0;
-err2:
-	if (drvdata->cpu == 0)
-		unregister_hotcpu_notifier(&etm_cpu_notifier);
-	wake_lock_destroy(&drvdata->wake_lock);
-	return ret;
 err1:
-	if (drvdata->cpu == 0)
+	if (--count == 0)
 		unregister_hotcpu_notifier(&etm_cpu_notifier);
-	clk_disable_unprepare(drvdata->clk);
 err0:
-	wake_lock_destroy(&drvdata->wake_lock);
+	wakeup_source_trash(&drvdata->ws);
 	return ret;
 }
 
@@ -2268,11 +2431,13 @@ static int etm_remove(struct platform_device *pdev)
 {
 	struct etm_drvdata *drvdata = platform_get_drvdata(pdev);
 
-	device_remove_file(&drvdata->csdev->dev, &dev_attr_pcsave);
-	coresight_unregister(drvdata->csdev);
-	if (drvdata->cpu == 0)
-		unregister_hotcpu_notifier(&etm_cpu_notifier);
-	wake_lock_destroy(&drvdata->wake_lock);
+	if (drvdata) {
+		device_remove_file(&drvdata->csdev->dev, &dev_attr_pcsave);
+		coresight_unregister(drvdata->csdev);
+		if (--count == 0)
+			unregister_hotcpu_notifier(&etm_cpu_notifier);
+		wakeup_source_trash(&drvdata->ws);
+	}
 	return 0;
 }
 

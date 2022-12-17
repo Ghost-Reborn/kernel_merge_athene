@@ -1,4 +1,4 @@
-/* Copyright (c) 2012 The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012, 2014 The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -14,6 +14,7 @@
 #define __MDSS_HDMI_HDCP_H__
 
 #include "mdss_hdmi_util.h"
+#include <soc/qcom/scm.h>
 
 enum hdmi_hdcp_state {
 	HDCP_STATE_INACTIVE,
@@ -32,6 +33,8 @@ struct hdmi_hdcp_init_data {
 	void (*notify_status)(void *cb_data, enum hdmi_hdcp_state status);
 
 	struct hdmi_tx_ddc_ctrl *ddc_ctrl;
+
+	u32 phy_addr;
 };
 
 const char *hdcp_state_name(enum hdmi_hdcp_state hdcp_state);
@@ -41,4 +44,5 @@ int hdmi_hdcp_isr(void *ptr);
 int hdmi_hdcp_reauthenticate(void *input);
 int hdmi_hdcp_authenticate(void *hdcp_ctrl);
 void hdmi_hdcp_off(void *hdcp_ctrl);
+void hdmi_hdcp_cancel_auth(void *input, bool req);
 #endif /* __MDSS_HDMI_HDCP_H__ */

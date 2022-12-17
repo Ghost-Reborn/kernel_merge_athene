@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2008-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -30,14 +30,14 @@
 #include <linux/completion.h>
 #include <linux/msm_smd_pkt.h>
 #include <linux/poll.h>
-#include <soc/qcom/subsystem_restart.h>
 #include <asm/ioctls.h>
 #include <linux/pm.h>
 #include <linux/of.h>
 #include <linux/ipc_logging.h>
 
-#include <mach/msm_smd.h>
-#include <mach/msm_smsm.h>
+#include <soc/qcom/smd.h>
+#include <soc/qcom/smsm.h>
+#include <soc/qcom/subsystem_restart.h>
 
 #ifdef CONFIG_ARCH_FSM9XXX
 #define DEFAULT_NUM_SMD_PKT_PORTS 4
@@ -121,8 +121,6 @@ enum {
 	SMD_PKT_STATUS = 1U << 0,
 	SMD_PKT_READ = 1U << 1,
 	SMD_PKT_WRITE = 1U << 2,
-	SMD_PKT_READ_DUMP_BUFFER = 1U << 3,
-	SMD_PKT_WRITE_DUMP_BUFFER = 1U << 4,
 	SMD_PKT_POLL = 1U << 5,
 };
 
@@ -134,18 +132,6 @@ enum {
 do { \
 	if (smd_pkt_ilctxt) \
 		ipc_log_string(smd_pkt_ilctxt, "<SMD_PKT>: "x); \
-} while (0)
-
-#define SMD_PKT_LOG_BUF(buf, cnt) \
-do { \
-	char log_buf[128]; \
-	int i; \
-	if (smd_pkt_ilctxt) { \
-		i = cnt < 16 ? cnt : 16; \
-		hex_dump_to_buffer(buf, i, 16, 1, log_buf, \
-				   sizeof(log_buf), false); \
-		ipc_log_string(smd_pkt_ilctxt, "<SMD_PKT>: %s", log_buf); \
-	} \
 } while (0)
 
 #define D_STATUS(x...) \
@@ -169,24 +155,6 @@ do { \
 	SMD_PKT_LOG_STRING(x); \
 } while (0)
 
-#define D_READ_DUMP_BUFFER(prestr, cnt, buf) \
-do { \
-	if (msm_smd_pkt_debug_mask & SMD_PKT_READ_DUMP_BUFFER) \
-		print_hex_dump(KERN_INFO, prestr, \
-			       DUMP_PREFIX_NONE, 16, 1, \
-			       buf, cnt, 1); \
-	SMD_PKT_LOG_BUF(buf, cnt); \
-} while (0)
-
-#define D_WRITE_DUMP_BUFFER(prestr, cnt, buf) \
-do { \
-	if (msm_smd_pkt_debug_mask & SMD_PKT_WRITE_DUMP_BUFFER) \
-		print_hex_dump(KERN_INFO, prestr, \
-			       DUMP_PREFIX_NONE, 16, 1, \
-			       buf, cnt, 1); \
-	SMD_PKT_LOG_BUF(buf, cnt); \
-} while (0)
-
 #define D_POLL(x...) \
 do { \
 	if (msm_smd_pkt_debug_mask & SMD_PKT_POLL) \
@@ -204,8 +172,6 @@ do { \
 #define D_STATUS(x...) do {} while (0)
 #define D_READ(x...) do {} while (0)
 #define D_WRITE(x...) do {} while (0)
-#define D_READ_DUMP_BUFFER(prestr, cnt, buf) do {} while (0)
-#define D_WRITE_DUMP_BUFFER(prestr, cnt, buf) do {} while (0)
 #define D_POLL(x...) do {} while (0)
 #define E_SMD_PKT_SSR(x) do {} while (0)
 #endif
@@ -393,6 +359,7 @@ static long smd_pkt_ioctl(struct file *file, unsigned int cmd,
 {
 	int ret;
 	struct smd_pkt_dev *smd_pkt_devp;
+	uint32_t val;
 
 	smd_pkt_devp = file->private_data;
 	if (!smd_pkt_devp)
@@ -406,15 +373,22 @@ static long smd_pkt_ioctl(struct file *file, unsigned int cmd,
 		ret = smd_tiocmget(smd_pkt_devp->ch);
 		break;
 	case TIOCMSET:
-		D_STATUS("%s TIOCSET command on smd_pkt_dev id:%d\n",
-			 __func__, smd_pkt_devp->i);
-		ret = smd_tiocmset(smd_pkt_devp->ch, arg, ~arg);
+		ret = get_user(val, (uint32_t *)arg);
+		if (ret) {
+			pr_err("Error getting TIOCMSET value\n");
+			mutex_unlock(&smd_pkt_devp->ch_lock);
+			return ret;
+		}
+		D_STATUS("%s TIOCSET command on smd_pkt_dev id:%d arg[0x%x]\n",
+			 __func__, smd_pkt_devp->i, val);
+		ret = smd_tiocmset(smd_pkt_devp->ch, val, ~val);
 		break;
 	case SMD_PKT_IOCTL_BLOCKING_WRITE:
 		ret = get_user(smd_pkt_devp->blocking_write, (int *)arg);
 		break;
 	default:
-		pr_err("%s: Unrecognized ioctl command %d\n", __func__, cmd);
+		pr_err_ratelimited("%s: Unrecognized ioctl command %d\n",
+			__func__, cmd);
 		ret = -ENOIOCTLCMD;
 	}
 	mutex_unlock(&smd_pkt_devp->ch_lock);
@@ -423,7 +397,7 @@ static long smd_pkt_ioctl(struct file *file, unsigned int cmd,
 }
 
 ssize_t smd_pkt_read(struct file *file,
-		       char __user *buf,
+		       char __user *_buf,
 		       size_t count,
 		       loff_t *ppos)
 {
@@ -432,16 +406,17 @@ ssize_t smd_pkt_read(struct file *file,
 	int pkt_size;
 	struct smd_pkt_dev *smd_pkt_devp;
 	unsigned long flags;
+	void *buf;
 
 	smd_pkt_devp = file->private_data;
 
 	if (!smd_pkt_devp) {
-		pr_err("%s on NULL smd_pkt_dev\n", __func__);
+		pr_err_ratelimited("%s on NULL smd_pkt_dev\n", __func__);
 		return -EINVAL;
 	}
 
 	if (!smd_pkt_devp->ch) {
-		pr_err("%s on a closed smd_pkt_dev id:%d\n",
+		pr_err_ratelimited("%s on a closed smd_pkt_dev id:%d\n",
 			__func__, smd_pkt_devp->i);
 		return -EINVAL;
 	}
@@ -454,6 +429,10 @@ ssize_t smd_pkt_read(struct file *file,
 	D_READ("Begin %s on smd_pkt_dev id:%d buffer_size %zu\n",
 		__func__, smd_pkt_devp->i, count);
 
+	buf = kmalloc(count, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
 wait_for_packet:
 	r = wait_event_interruptible(smd_pkt_devp->ch_read_wait_queue,
 				     !smd_pkt_devp->ch ||
@@ -465,13 +444,15 @@ wait_for_packet:
 	if (smd_pkt_devp->has_reset) {
 		mutex_unlock(&smd_pkt_devp->rx_lock);
 		E_SMD_PKT_SSR(smd_pkt_devp);
+		kfree(buf);
 		return notify_reset(smd_pkt_devp);
 	}
 
 	if (!smd_pkt_devp->ch) {
 		mutex_unlock(&smd_pkt_devp->rx_lock);
-		pr_err("%s on a closed smd_pkt_dev id:%d\n",
+		pr_err_ratelimited("%s on a closed smd_pkt_dev id:%d\n",
 			__func__, smd_pkt_devp->i);
+		kfree(buf);
 		return -EINVAL;
 	}
 
@@ -480,9 +461,10 @@ wait_for_packet:
 		/* qualify error message */
 		if (r != -ERESTARTSYS) {
 			/* we get this anytime a signal comes in */
-			pr_err("%s: wait_event_interruptible on smd_pkt_dev id:%d ret %i\n",
+			pr_err_ratelimited("%s: wait_event_interruptible on smd_pkt_dev id:%d ret %i\n",
 				__func__, smd_pkt_devp->i, r);
 		}
+		kfree(buf);
 		return r;
 	}
 
@@ -490,29 +472,31 @@ wait_for_packet:
 	pkt_size = smd_cur_packet_size(smd_pkt_devp->ch);
 
 	if (!pkt_size) {
-		pr_err("%s: No data on smd_pkt_dev id:%d, False wakeup\n",
+		pr_err_ratelimited("%s: No data on smd_pkt_dev id:%d, False wakeup\n",
 			__func__, smd_pkt_devp->i);
 		mutex_unlock(&smd_pkt_devp->rx_lock);
 		goto wait_for_packet;
 	}
 
 	if (pkt_size < 0) {
-		pr_err("%s: Error %d obtaining packet size for Channel %s",
+		pr_err_ratelimited("%s: Error %d obtaining packet size for Channel %s",
 				__func__, pkt_size, smd_pkt_devp->ch_name);
+		kfree(buf);
 		return pkt_size;
 	}
 
 	if ((uint32_t)pkt_size > count) {
-		pr_err("%s: failure on smd_pkt_dev id: %d - packet size %d > buffer size %zu,",
+		pr_err_ratelimited("%s: failure on smd_pkt_dev id: %d - packet size %d > buffer size %zu,",
 			__func__, smd_pkt_devp->i,
 			pkt_size, count);
 		mutex_unlock(&smd_pkt_devp->rx_lock);
+		kfree(buf);
 		return -ETOOSMALL;
 	}
 
 	bytes_read = 0;
 	do {
-		r = smd_read_user_buffer(smd_pkt_devp->ch,
+		r = smd_read(smd_pkt_devp->ch,
 					 (buf + bytes_read),
 					 (pkt_size - bytes_read));
 		if (r < 0) {
@@ -521,7 +505,9 @@ wait_for_packet:
 				E_SMD_PKT_SSR(smd_pkt_devp);
 				return notify_reset(smd_pkt_devp);
 			}
-			pr_err("%s Error while reading %d\n", __func__, r);
+			pr_err_ratelimited("%s Error while reading %d\n",
+				__func__, r);
+			kfree(buf);
 			return r;
 		}
 		bytes_read += r;
@@ -532,10 +518,10 @@ wait_for_packet:
 		if (smd_pkt_devp->has_reset) {
 			mutex_unlock(&smd_pkt_devp->rx_lock);
 			E_SMD_PKT_SSR(smd_pkt_devp);
+			kfree(buf);
 			return notify_reset(smd_pkt_devp);
 		}
 	} while (pkt_size != bytes_read);
-	D_READ_DUMP_BUFFER("Read: ", (bytes_read > 16 ? 16 : bytes_read), buf);
 	mutex_unlock(&smd_pkt_devp->rx_lock);
 
 	mutex_lock(&smd_pkt_devp->ch_lock);
@@ -551,8 +537,14 @@ wait_for_packet:
 	spin_unlock_irqrestore(&smd_pkt_devp->pa_spinlock, flags);
 	mutex_unlock(&smd_pkt_devp->ch_lock);
 
+	r = copy_to_user(_buf, buf, bytes_read);
+	if (r) {
+		kfree(buf);
+		return -EFAULT;
+	}
 	D_READ("Finished %s on smd_pkt_dev id:%d  %d bytes\n",
 		__func__, smd_pkt_devp->i, bytes_read);
+	kfree(buf);
 
 	/* check and wakeup read threads waiting on this device */
 	check_and_wakeup_reader(smd_pkt_devp);
@@ -561,23 +553,24 @@ wait_for_packet:
 }
 
 ssize_t smd_pkt_write(struct file *file,
-		       const char __user *buf,
+		       const char __user *_buf,
 		       size_t count,
 		       loff_t *ppos)
 {
 	int r = 0, bytes_written;
 	struct smd_pkt_dev *smd_pkt_devp;
 	DEFINE_WAIT(write_wait);
+	void *buf;
 
 	smd_pkt_devp = file->private_data;
 
 	if (!smd_pkt_devp) {
-		pr_err("%s on NULL smd_pkt_dev\n", __func__);
+		pr_err_ratelimited("%s on NULL smd_pkt_dev\n", __func__);
 		return -EINVAL;
 	}
 
 	if (!smd_pkt_devp->ch) {
-		pr_err("%s on a closed smd_pkt_dev id:%d\n",
+		pr_err_ratelimited("%s on a closed smd_pkt_dev id:%d\n",
 			__func__, smd_pkt_devp->i);
 		return -EINVAL;
 	}
@@ -590,12 +583,23 @@ ssize_t smd_pkt_write(struct file *file,
 	D_WRITE("Begin %s on smd_pkt_dev id:%d data_size %zu\n",
 		__func__, smd_pkt_devp->i, count);
 
+	buf = kmalloc(count, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	r = copy_from_user(buf, _buf, count);
+	if (r) {
+		kfree(buf);
+		return -EFAULT;
+	}
+
 	mutex_lock(&smd_pkt_devp->tx_lock);
 	if (!smd_pkt_devp->blocking_write) {
 		if (smd_write_avail(smd_pkt_devp->ch) < count) {
-			pr_err("%s: Not enough space in smd_pkt_dev id:%d\n",
+			pr_err_ratelimited("%s: Not enough space in smd_pkt_dev id:%d\n",
 				   __func__, smd_pkt_devp->i);
 			mutex_unlock(&smd_pkt_devp->tx_lock);
+			kfree(buf);
 			return -ENOMEM;
 		}
 	}
@@ -603,8 +607,9 @@ ssize_t smd_pkt_write(struct file *file,
 	r = smd_write_start(smd_pkt_devp->ch, count);
 	if (r < 0) {
 		mutex_unlock(&smd_pkt_devp->tx_lock);
-		pr_err("%s: Error:%d in smd_pkt_dev id:%d @ smd_write_start\n",
+		pr_err_ratelimited("%s: Error:%d in smd_pkt_dev id:%d @ smd_write_start\n",
 			__func__, r, smd_pkt_devp->i);
+		kfree(buf);
 		return r;
 	}
 
@@ -623,19 +628,21 @@ ssize_t smd_pkt_write(struct file *file,
 		if (smd_pkt_devp->has_reset) {
 			mutex_unlock(&smd_pkt_devp->tx_lock);
 			E_SMD_PKT_SSR(smd_pkt_devp);
+			kfree(buf);
 			return notify_reset(smd_pkt_devp);
 		} else {
 			r = smd_write_segment(smd_pkt_devp->ch,
 					      (void *)(buf + bytes_written),
-					      (count - bytes_written), 1);
+					      (count - bytes_written));
 			if (r < 0) {
 				mutex_unlock(&smd_pkt_devp->tx_lock);
 				if (smd_pkt_devp->has_reset) {
 					E_SMD_PKT_SSR(smd_pkt_devp);
 					return notify_reset(smd_pkt_devp);
 				}
-				pr_err("%s on smd_pkt_dev id:%d failed r:%d\n",
+				pr_err_ratelimited("%s on smd_pkt_dev id:%d failed r:%d\n",
 					__func__, smd_pkt_devp->i, r);
+				kfree(buf);
 				return r;
 			}
 			bytes_written += r;
@@ -643,11 +650,10 @@ ssize_t smd_pkt_write(struct file *file,
 	} while (bytes_written != count);
 	smd_write_end(smd_pkt_devp->ch);
 	mutex_unlock(&smd_pkt_devp->tx_lock);
-	D_WRITE_DUMP_BUFFER("Write: ",
-			    (bytes_written > 16 ? 16 : bytes_written), buf);
 	D_WRITE("Finished %s on smd_pkt_dev id:%d %zu bytes\n",
 		__func__, smd_pkt_devp->i, count);
 
+	kfree(buf);
 	return count;
 }
 
@@ -658,7 +664,7 @@ static unsigned int smd_pkt_poll(struct file *file, poll_table *wait)
 
 	smd_pkt_devp = file->private_data;
 	if (!smd_pkt_devp) {
-		pr_err("%s on a NULL device\n", __func__);
+		pr_err_ratelimited("%s on a NULL device\n", __func__);
 		return POLLERR;
 	}
 
@@ -1014,6 +1020,7 @@ exit:
 static void smd_pkt_remove_driver(struct smd_pkt_dev *smd_pkt_devp)
 {
 	struct smd_pkt_driver *smd_pkt_driverp;
+	bool found_item = false;
 
 	if (!smd_pkt_devp) {
 		pr_err("%s on a NULL device\n", __func__);
@@ -1026,6 +1033,7 @@ static void smd_pkt_remove_driver(struct smd_pkt_dev *smd_pkt_devp)
 	list_for_each_entry(smd_pkt_driverp, &smd_pkt_driver_list, list) {
 		if (!strcmp(smd_pkt_driverp->pdriver_name,
 					smd_pkt_devp->ch_name)) {
+			found_item = true;
 			D_STATUS("%s:%s Platform driver cnt:%d\n",
 				__func__, smd_pkt_devp->ch_name,
 				smd_pkt_driverp->ref_cnt);
@@ -1036,8 +1044,11 @@ static void smd_pkt_remove_driver(struct smd_pkt_dev *smd_pkt_devp)
 			break;
 		}
 	}
+	if (!found_item)
+		pr_err("%s:%s No item found in list.\n",
+				__func__, smd_pkt_devp->ch_name);
 
-	if (smd_pkt_driverp->ref_cnt == 0) {
+	if (found_item && smd_pkt_driverp->ref_cnt == 0) {
 		platform_driver_unregister(&smd_pkt_driverp->driver);
 		smd_pkt_driverp->driver.probe = NULL;
 		list_del(&smd_pkt_driverp->list);
@@ -1056,7 +1067,7 @@ int smd_pkt_open(struct inode *inode, struct file *file)
 	smd_pkt_devp = container_of(inode->i_cdev, struct smd_pkt_dev, cdev);
 
 	if (!smd_pkt_devp) {
-		pr_err("%s on a NULL device\n", __func__);
+		pr_err_ratelimited("%s on a NULL device\n", __func__);
 		return -EINVAL;
 	}
 	D_STATUS("Begin %s on smd_pkt_dev id:%d\n", __func__, smd_pkt_devp->i);
@@ -1065,15 +1076,13 @@ int smd_pkt_open(struct inode *inode, struct file *file)
 
 	mutex_lock(&smd_pkt_devp->ch_lock);
 	if (smd_pkt_devp->ch == 0) {
-		wakeup_source_init(&smd_pkt_devp->pa_ws,
-							smd_pkt_devp->dev_name);
-		INIT_WORK(&smd_pkt_devp->packet_arrival_work,
-				packet_arrival_worker);
-		init_completion(&smd_pkt_devp->ch_allocated);
+		unsigned open_wait_rem = smd_pkt_devp->open_modem_wait * 1000;
+
+		INIT_COMPLETION(smd_pkt_devp->ch_allocated);
 
 		r = smd_pkt_add_driver(smd_pkt_devp);
 		if (r) {
-			pr_err("%s: %s Platform driver reg. failed\n",
+			pr_err_ratelimited("%s: %s Platform driver reg. failed\n",
 				__func__, smd_pkt_devp->ch_name);
 			goto out;
 		}
@@ -1083,14 +1092,14 @@ int smd_pkt_open(struct inode *inode, struct file *file)
 			smd_pkt_devp->pil = subsystem_get(peripheral);
 			if (IS_ERR(smd_pkt_devp->pil)) {
 				r = PTR_ERR(smd_pkt_devp->pil);
-				pr_err("%s failed on smd_pkt_dev id:%d - subsystem_get failed for %s\n",
+				pr_err_ratelimited("%s failed on smd_pkt_dev id:%d - subsystem_get failed for %s\n",
 					__func__, smd_pkt_devp->i, peripheral);
 				/*
 				 * Sleep inorder to reduce the frequency of
 				 * retry by user-space modules and to avoid
 				 * possible watchdog bite.
 				 */
-				msleep((smd_pkt_devp->open_modem_wait * 1000));
+				msleep(open_wait_rem);
 				goto release_pd;
 			}
 		}
@@ -1111,16 +1120,21 @@ int smd_pkt_open(struct inode *inode, struct file *file)
 		 * Wait for a packet channel to be allocated so we know
 		 * the modem is ready enough.
 		 */
-		if (smd_pkt_devp->open_modem_wait) {
+		if (open_wait_rem) {
 			r = wait_for_completion_interruptible_timeout(
 				&smd_pkt_devp->ch_allocated,
-				msecs_to_jiffies(
-					smd_pkt_devp->open_modem_wait
-						 * 1000));
+				msecs_to_jiffies(open_wait_rem));
+			if (r >= 0)
+				open_wait_rem = jiffies_to_msecs(r);
 			if (r == 0)
 				r = -ETIMEDOUT;
+			if (r == -ERESTARTSYS) {
+				pr_info_ratelimited("%s: wait on smd_pkt_dev id:%d allocation interrupted\n",
+					__func__, smd_pkt_devp->i);
+				goto release_pil;
+			}
 			if (r < 0) {
-				pr_err("%s: wait on smd_pkt_dev id:%d allocation failed rc:%d\n",
+				pr_err_ratelimited("%s: wait on smd_pkt_dev id:%d allocation failed rc:%d\n",
 					__func__, smd_pkt_devp->i, r);
 				goto release_pil;
 			}
@@ -1132,14 +1146,16 @@ int smd_pkt_open(struct inode *inode, struct file *file)
 					   smd_pkt_devp,
 					   ch_notify);
 		if (r < 0) {
-			pr_err("%s: %s open failed %d\n", __func__,
+			pr_err_ratelimited("%s: %s open failed %d\n", __func__,
 			       smd_pkt_devp->ch_name, r);
 			goto release_pil;
 		}
 
+		open_wait_rem = max_t(unsigned, 2000, open_wait_rem);
 		r = wait_event_interruptible_timeout(
 				smd_pkt_devp->ch_opened_wait_queue,
-				smd_pkt_devp->is_open, (2 * HZ));
+				smd_pkt_devp->is_open,
+				msecs_to_jiffies(open_wait_rem));
 		if (r == 0) {
 			r = -ETIMEDOUT;
 			/* close the ch to sync smd's state with smd_pkt */
@@ -1147,11 +1163,14 @@ int smd_pkt_open(struct inode *inode, struct file *file)
 			smd_pkt_devp->ch = NULL;
 		}
 
-		if (r < 0) {
-			pr_err("%s: wait on smd_pkt_dev id:%d OPEN event failed rc:%d\n",
+		if (r == -ERESTARTSYS) {
+			pr_info_ratelimited("%s: wait on smd_pkt_dev id:%d OPEN interrupted\n",
+				__func__, smd_pkt_devp->i);
+		} else if (r < 0) {
+			pr_err_ratelimited("%s: wait on smd_pkt_dev id:%d OPEN event failed rc:%d\n",
 				__func__, smd_pkt_devp->i, r);
 		} else if (!smd_pkt_devp->is_open) {
-			pr_err("%s: Invalid OPEN event on smd_pkt_dev id:%d\n",
+			pr_err_ratelimited("%s: Invalid OPEN event on smd_pkt_dev id:%d\n",
 				__func__, smd_pkt_devp->i);
 			r = -ENODEV;
 		} else {
@@ -1174,9 +1193,6 @@ release_pd:
 	if (r < 0)
 		smd_pkt_remove_driver(smd_pkt_devp);
 out:
-	if (!smd_pkt_devp->ch)
-		wakeup_source_trash(&smd_pkt_devp->pa_ws);
-
 	mutex_unlock(&smd_pkt_devp->ch_lock);
 
 
@@ -1189,7 +1205,7 @@ int smd_pkt_release(struct inode *inode, struct file *file)
 	struct smd_pkt_dev *smd_pkt_devp = file->private_data;
 
 	if (!smd_pkt_devp) {
-		pr_err("%s on a NULL device\n", __func__);
+		pr_err_ratelimited("%s on a NULL device\n", __func__);
 		return -EINVAL;
 	}
 	D_STATUS("Begin %s on smd_pkt_dev id:%d\n",
@@ -1213,11 +1229,14 @@ int smd_pkt_release(struct inode *inode, struct file *file)
 		smd_pkt_devp->has_reset = 0;
 		smd_pkt_devp->do_reset_notification = 0;
 		smd_pkt_devp->ws_locked = 0;
-		wakeup_source_trash(&smd_pkt_devp->pa_ws);
 	}
 	mutex_unlock(&smd_pkt_devp->tx_lock);
 	mutex_unlock(&smd_pkt_devp->rx_lock);
 	mutex_unlock(&smd_pkt_devp->ch_lock);
+
+	if (flush_work(&smd_pkt_devp->packet_arrival_work))
+		D_STATUS("%s: Flushed work for smd_pkt_dev id:%d\n", __func__,
+				smd_pkt_devp->i);
 
 	D_STATUS("Finished %s on smd_pkt_dev id:%d\n",
 		 __func__, smd_pkt_devp->i);
@@ -1233,6 +1252,7 @@ static const struct file_operations smd_pkt_fops = {
 	.write = smd_pkt_write,
 	.poll = smd_pkt_poll,
 	.unlocked_ioctl = smd_pkt_ioctl,
+	.compat_ioctl = smd_pkt_ioctl,
 };
 
 static int smd_pkt_init_add_device(struct smd_pkt_dev *smd_pkt_devp, int i)
@@ -1252,6 +1272,9 @@ static int smd_pkt_init_add_device(struct smd_pkt_dev *smd_pkt_devp, int i)
 	mutex_init(&smd_pkt_devp->ch_lock);
 	mutex_init(&smd_pkt_devp->rx_lock);
 	mutex_init(&smd_pkt_devp->tx_lock);
+	wakeup_source_init(&smd_pkt_devp->pa_ws, smd_pkt_devp->dev_name);
+	INIT_WORK(&smd_pkt_devp->packet_arrival_work, packet_arrival_worker);
+	init_completion(&smd_pkt_devp->ch_allocated);
 
 	cdev_init(&smd_pkt_devp->cdev, &smd_pkt_fops);
 	smd_pkt_devp->cdev.owner = THIS_MODULE;
@@ -1275,6 +1298,7 @@ static int smd_pkt_init_add_device(struct smd_pkt_dev *smd_pkt_devp, int i)
 			__func__, i);
 		r = -ENOMEM;
 		cdev_del(&smd_pkt_devp->cdev);
+		wakeup_source_trash(&smd_pkt_devp->pa_ws);
 		return r;
 	}
 	if (device_create_file(smd_pkt_devp->devicep,
@@ -1577,7 +1601,7 @@ static int __init smd_pkt_init(void)
 				msecs_to_jiffies(SMD_PKT_PROBE_WAIT_TIMEOUT));
 
 	smd_pkt_ilctxt = ipc_log_context_create(SMD_PKT_IPC_LOG_PAGE_CNT,
-						"smd_pkt");
+						"smd_pkt", 0);
 	return 0;
 }
 

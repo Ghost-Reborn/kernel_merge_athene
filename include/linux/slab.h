@@ -94,6 +94,8 @@
 #define ZERO_OR_NULL_PTR(x) ((unsigned long)(x) <= \
 				(unsigned long)ZERO_SIZE_PTR)
 
+#include <linux/kmemleak.h>
+#include <linux/kasan.h>
 
 struct mem_cgroup;
 /*
@@ -222,7 +224,7 @@ struct kmem_cache {
 #endif
 
 extern struct kmem_cache *kmalloc_caches[KMALLOC_SHIFT_HIGH + 1];
-#ifdef CONFIG_ZONE_DMA
+#if defined(CONFIG_ZONE_DMA) && !defined(CONFIG_FORCE_KMALLOC_FROM_DMA_ZONE)
 extern struct kmem_cache *kmalloc_dma_caches[KMALLOC_SHIFT_HIGH + 1];
 #endif
 

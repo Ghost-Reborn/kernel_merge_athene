@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -25,18 +25,19 @@
 #define MSM_SEC_MI2S  1
 #define MSM_TERT_MI2S 2
 #define MSM_QUAT_MI2S  3
+#define MSM_SEC_MI2S_SD1  4
+#define MSM_QUIN_MI2S  5
+#define MSM_SENARY_MI2S  6
 
 struct msm_dai_auxpcm_config {
 	u16 mode;
 	u16 sync;
 	u16 frame;
 	u16 quant;
-	/* modify slot to arr[4] to specify
-	* the slot number for each channel
-	* in multichannel scenario */
-	u16 slot;
+	u16 num_slots;
+	u16 *slot_mapping;
 	u16 data;
-	int pcm_clk_rate;
+	u32 pcm_clk_rate;
 };
 
 struct msm_dai_auxpcm_pdata {
@@ -47,6 +48,7 @@ struct msm_dai_auxpcm_pdata {
 struct msm_mi2s_pdata {
 	u16 rx_sd_lines;
 	u16 tx_sd_lines;
+	u16 intf_id;
 };
 
 struct msm_i2s_data {

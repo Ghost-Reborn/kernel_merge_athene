@@ -1520,6 +1520,22 @@ static int soc_check_aux_dev(struct snd_soc_card *card, int num)
 	return -EPROBE_DEFER;
 }
 
+int soc_check_aux_dev_byname(struct snd_soc_card *card, const char *codec_name)
+{
+	struct snd_soc_codec *codec;
+
+	/* find CODEC from registered CODECs*/
+	list_for_each_entry(codec, &codec_list, list) {
+		if (!strcmp(codec->name, codec_name))
+			return 0;
+	}
+
+	dev_err(card->dev, "ASoC: %s not registered\n", codec_name);
+
+	return -EPROBE_DEFER;
+}
+EXPORT_SYMBOL(soc_check_aux_dev_byname);
+
 static int soc_probe_aux_dev(struct snd_soc_card *card, int num)
 {
 	struct snd_soc_aux_dev *aux_dev = &card->aux_dev[num];
@@ -2103,14 +2119,13 @@ unsigned int snd_soc_read(struct snd_soc_codec *codec, unsigned int reg)
 {
 	unsigned int ret;
 
-	if (unlikely(!snd_card_is_online_state(codec->card->snd_card))) {
-		dev_err(codec->dev, "read 0x%02x while offline\n", reg);
-		return -ENODEV;
+	if (codec->read) {
+		ret = codec->read(codec, reg);
+		dev_dbg(codec->dev, "read %x => %x\n", reg, ret);
+		trace_snd_soc_reg_read(codec, reg, ret);
+	} else {
+		ret = -EIO;
 	}
-	ret = codec->read(codec, reg);
-	dev_dbg(codec->dev, "read %x => %x\n", reg, ret);
-	trace_snd_soc_reg_read(codec, reg, ret);
-
 	return ret;
 }
 EXPORT_SYMBOL_GPL(snd_soc_read);
@@ -2118,13 +2133,13 @@ EXPORT_SYMBOL_GPL(snd_soc_read);
 unsigned int snd_soc_write(struct snd_soc_codec *codec,
 			   unsigned int reg, unsigned int val)
 {
-	if (unlikely(!snd_card_is_online_state(codec->card->snd_card))) {
-		dev_err(codec->dev, "write 0x%02x while offline\n", reg);
-		return -ENODEV;
+	if (codec->write) {
+		dev_dbg(codec->dev, "write %x = %x\n", reg, val);
+		trace_snd_soc_reg_write(codec, reg, val);
+		return codec->write(codec, reg, val);
+	} else {
+		return -EIO;
 	}
-	dev_dbg(codec->dev, "write %x = %x\n", reg, val);
-	trace_snd_soc_reg_write(codec, reg, val);
-	return codec->write(codec, reg, val);
 }
 EXPORT_SYMBOL_GPL(snd_soc_write);
 
@@ -2647,6 +2662,34 @@ int snd_soc_info_volsw(struct snd_kcontrol *kcontrol,
 	return 0;
 }
 EXPORT_SYMBOL_GPL(snd_soc_info_volsw);
+
+/*
+ * snd_soc_info_volsw_sx - Mixer info callback for SX TLV controls
+ * @kcontrol: mixer control
+ * @uinfo: control element information
+ *
+ * Callback to provide information about a single mixer control, or a double
+ * mixer control that spans 2 registers of the SX TLV type. SX TLV controls
+ * have a range that represents both positive and negative values either side
+ * of zero but without a sign bit.
+ *
+ * Returns 0 for success.
+ */
+int snd_soc_info_volsw_sx(struct snd_kcontrol *kcontrol,
+			  struct snd_ctl_elem_info *uinfo)
+{
+	struct soc_mixer_control *mc =
+		(struct soc_mixer_control *)kcontrol->private_value;
+
+	snd_soc_info_volsw(kcontrol, uinfo);
+	/* Max represents the number of levels in an SX control not the
+	 * maximum value, so add the minimum value back on
+	 */
+	uinfo->value.integer.max += mc->min;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(snd_soc_info_volsw_sx);
 
 /**
  * snd_soc_get_volsw - single mixer get callback
@@ -3570,8 +3613,7 @@ int snd_soc_dai_digital_mute(struct snd_soc_dai *dai, int mute,
 
 	if (dai->driver->ops->mute_stream)
 		return dai->driver->ops->mute_stream(dai, mute, direction);
-	else if (direction == SNDRV_PCM_STREAM_PLAYBACK &&
-		 dai->driver->ops->digital_mute)
+	else if (dai->driver->ops->digital_mute)
 		return dai->driver->ops->digital_mute(dai, mute);
 	else
 		return -ENOTSUPP;

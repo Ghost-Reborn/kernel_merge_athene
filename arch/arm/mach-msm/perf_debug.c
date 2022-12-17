@@ -38,6 +38,23 @@ static char *descriptions =
 	"13 Perf: Fix PID for tracepoints\n"
 	"14 Perf: preserve registers across hotplug\n"
 	"15 msm: perf: Fix cpu id logic in tracectr notifier\n"
+	"16 msm: perf: tracectr: Initialize cnts after hotplug\n"
+	"17 Perf: Reset pmu after hotplug\n"
+	"18 ARM: dts: msm: add perf-events support for msm8916\n"
+	"19 Perf: Enable pmuv3 on 32 bit kernel\n"
+	"20 msm: perf: set filter bits for cycle counter on krait\n"
+	"21 Perf: Fix hrtimer operation across hotplug\n"
+	"22 Perf: add perf user-mode permissions\n"
+	"23 Perf: Add event type check in hrtimer hotplug fix\n"
+	"24 Perf: Add debugfs node to clear PMU\n"
+	"25 msm: perf: reset perf cycle counter on krait\n"
+	"26 Perf: interrupt disable without bringing cpus up\n"
+	"27 Perf: stop counters when going into hotplug\n"
+	"28 ARM: dts: msm: add perf-events support for msm8909\n"
+	"29 msm: perf: Refine disable/enable in tracecounters\n"
+	"30 Perf: reset pmu enables when starting perf\n"
+	"31 Perf: make debug dir handle exportable\n"
+	"32 msm: perf: add perf trace user\n"
 ;
 
 static ssize_t desc_read(struct file *fp, char __user *buf,

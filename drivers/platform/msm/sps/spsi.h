@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2011-2017, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -22,12 +22,13 @@
 #include <linux/kernel.h>	/* pr_info() */
 #include <linux/compiler.h>
 #include <linux/ratelimit.h>
+#include <linux/ipc_logging.h>
 
-#include <mach/sps.h>
+#include <linux/msm-sps.h>
 
 #include "sps_map.h"
 
-#ifdef CONFIG_ARM_LPAE
+#if defined(CONFIG_PHYS_ADDR_T_64BIT) || defined(CONFIG_ARM_LPAE)
 #define SPS_LPAE (true)
 #else
 #define SPS_LPAE (false)
@@ -41,16 +42,72 @@
 #define SPS_ERROR -1
 
 /* BAM identifier used in log messages */
-#define BAM_ID(dev)       ((dev)->props.phys_addr)
+#define BAM_ID(dev)       (&(dev)->props.phys_addr)
 
 /* "Clear" value for the connection parameter struct */
-#define SPSRM_CLEAR     0xcccccccc
+#define SPSRM_CLEAR     0xccccccccUL
+#define SPSRM_ADDR_CLR \
+	((sizeof(int) == sizeof(long)) ? 0 : (SPSRM_CLEAR << 32))
 
 #define MAX_MSG_LEN 80
+#define SPS_IPC_LOGPAGES 10
+#define SPS_IPC_REG_DUMP_FACTOR 3
 
+/* Connection mapping control struct */
+struct sps_rm {
+	struct list_head connections_q;
+	struct mutex lock;
+};
+
+/* SPS driver state struct */
+struct sps_drv {
+	struct class *dev_class;
+	dev_t dev_num;
+	struct device *dev;
+	struct clk *pmem_clk;
+	struct clk *bamdma_clk;
+	struct clk *dfab_clk;
+
+	int is_ready;
+
+	/* Platform data */
+	phys_addr_t pipemem_phys_base;
+	u32 pipemem_size;
+	phys_addr_t bamdma_bam_phys_base;
+	u32 bamdma_bam_size;
+	phys_addr_t bamdma_dma_phys_base;
+	u32 bamdma_dma_size;
+	u32 bamdma_irq;
+	u32 bamdma_restricted_pipes;
+
+	/* Driver options bitflags (see SPS_OPT_*) */
+	u32 options;
+
+	/* Mutex to protect BAM and connection queues */
+	struct mutex lock;
+
+	/* BAM devices */
+	struct list_head bams_q;
+
+	char *hal_bam_version;
+
+	/* Connection control state */
+	struct sps_rm connection_ctrl;
+
+	void *ipc_log0;
+	void *ipc_log1;
+	void *ipc_log2;
+	void *ipc_log3;
+	void *ipc_log4;
+
+	u32 ipc_loglevel;
+};
+
+extern struct sps_drv *sps;
 extern u32 d_type;
 extern bool enhd_pipe;
 extern bool imem;
+extern enum sps_bam_type bam_type;
 
 #ifdef CONFIG_DEBUG_FS
 extern u8 debugfs_record_enabled;
@@ -58,32 +115,53 @@ extern u8 logging_option;
 extern u8 debug_level_option;
 extern u8 print_limit_option;
 
-#define SPS_DEBUGFS(msg, args...) do {					\
-		char buf[MAX_MSG_LEN];		\
-		snprintf(buf, MAX_MSG_LEN, msg"\n", ##args);	\
-		sps_debugfs_record(buf);	\
+#define SPS_IPC(idx, dev, msg, args...) do { \
+		if (dev) { \
+			if ((idx == 0) && (dev)->ipc_log0) \
+				ipc_log_string((dev)->ipc_log0, \
+					"%s: " msg, __func__, args); \
+			else if ((idx == 1) && (dev)->ipc_log1) \
+				ipc_log_string((dev)->ipc_log1, \
+					"%s: " msg, __func__, args); \
+			else if ((idx == 2) && (dev)->ipc_log2) \
+				ipc_log_string((dev)->ipc_log2, \
+					"%s: " msg, __func__, args); \
+			else if ((idx == 3) && (dev)->ipc_log3) \
+				ipc_log_string((dev)->ipc_log3, \
+					"%s: " msg, __func__, args); \
+			else if ((idx == 4) && (dev)->ipc_log4) \
+				ipc_log_string((dev)->ipc_log4, \
+					"%s: " msg, __func__, args); \
+			else \
+				pr_err("sps: no such IPC logging index!\n"); \
+		} \
 	} while (0)
-#define SPS_ERR(msg, args...) do {					\
+#define SPS_DUMP(msg, args...) do {					\
+		SPS_IPC(4, sps, msg, args); \
+		if (sps) { \
+			if (sps->ipc_log4 == NULL) \
+				pr_info(msg, ##args);	\
+		} \
+	} while (0)
+#define SPS_ERR(dev, msg, args...) do {					\
 		if (logging_option != 1) {	\
 			if (unlikely(print_limit_option > 2))	\
 				pr_err_ratelimited(msg, ##args);	\
 			else	\
 				pr_err(msg, ##args);	\
 		}	\
-		if (unlikely(debugfs_record_enabled))	\
-			SPS_DEBUGFS(msg, ##args);	\
+		SPS_IPC(3, dev, msg, args); \
 	} while (0)
-#define SPS_INFO(msg, args...) do {					\
+#define SPS_INFO(dev, msg, args...) do {				\
 		if (logging_option != 1) {	\
 			if (unlikely(print_limit_option > 1))	\
 				pr_info_ratelimited(msg, ##args);	\
 			else	\
 				pr_info(msg, ##args);	\
 		}	\
-		if (unlikely(debugfs_record_enabled))	\
-			SPS_DEBUGFS(msg, ##args);	\
+		SPS_IPC(3, dev, msg, args); \
 	} while (0)
-#define SPS_DBG(msg, args...) do {					\
+#define SPS_DBG(dev, msg, args...) do {					\
 		if ((unlikely(logging_option > 1))	\
 			&& (unlikely(debug_level_option > 3))) {\
 			if (unlikely(print_limit_option > 0))	\
@@ -92,10 +170,12 @@ extern u8 print_limit_option;
 				pr_info(msg, ##args);	\
 		} else	\
 			pr_debug(msg, ##args);	\
-		if (unlikely(debugfs_record_enabled))	\
-			SPS_DEBUGFS(msg, ##args);	\
+		if (dev) { \
+			if ((dev)->ipc_loglevel <= 0)	\
+				SPS_IPC(0, dev, msg, args); \
+		}	\
 	} while (0)
-#define SPS_DBG1(msg, args...) do {					\
+#define SPS_DBG1(dev, msg, args...) do {				\
 		if ((unlikely(logging_option > 1))	\
 			&& (unlikely(debug_level_option > 2))) {\
 			if (unlikely(print_limit_option > 0))	\
@@ -104,10 +184,12 @@ extern u8 print_limit_option;
 				pr_info(msg, ##args);	\
 		} else	\
 			pr_debug(msg, ##args);	\
-		if (unlikely(debugfs_record_enabled))	\
-			SPS_DEBUGFS(msg, ##args);	\
+		if (dev) { \
+			if ((dev)->ipc_loglevel <= 1)	\
+				SPS_IPC(1, dev, msg, args);	\
+		}	\
 	} while (0)
-#define SPS_DBG2(msg, args...) do {					\
+#define SPS_DBG2(dev, msg, args...) do {				\
 		if ((unlikely(logging_option > 1))	\
 			&& (unlikely(debug_level_option > 1))) {\
 			if (unlikely(print_limit_option > 0))	\
@@ -116,10 +198,12 @@ extern u8 print_limit_option;
 				pr_info(msg, ##args);	\
 		} else	\
 			pr_debug(msg, ##args);	\
-		if (unlikely(debugfs_record_enabled))	\
-			SPS_DEBUGFS(msg, ##args);	\
+		if (dev) { \
+			if ((dev)->ipc_loglevel <= 2)	\
+				SPS_IPC(2, dev, msg, args); \
+		}	\
 	} while (0)
-#define SPS_DBG3(msg, args...) do {					\
+#define SPS_DBG3(dev, msg, args...) do {				\
 		if ((unlikely(logging_option > 1))	\
 			&& (unlikely(debug_level_option > 0))) {\
 			if (unlikely(print_limit_option > 0))	\
@@ -128,8 +212,10 @@ extern u8 print_limit_option;
 				pr_info(msg, ##args);	\
 		} else	\
 			pr_debug(msg, ##args);	\
-		if (unlikely(debugfs_record_enabled))	\
-			SPS_DEBUGFS(msg, ##args);	\
+		if (dev) { \
+			if ((dev)->ipc_loglevel <= 3)	\
+				SPS_IPC(3, dev, msg, args); \
+		}	\
 	} while (0)
 #else
 #define	SPS_DBG3(x...)		pr_debug(x)
@@ -138,12 +224,13 @@ extern u8 print_limit_option;
 #define	SPS_DBG(x...)		pr_debug(x)
 #define	SPS_INFO(x...)		pr_info(x)
 #define	SPS_ERR(x...)		pr_err(x)
+#define	SPS_DUMP(x...)		pr_info(x)
 #endif
 
 /* End point parameters */
 struct sps_conn_end_pt {
-	u32 dev;		/* Device handle of BAM */
-	u32 bam_phys;		/* Physical address of BAM. */
+	unsigned long dev;		/* Device handle of BAM */
+	phys_addr_t bam_phys;		/* Physical address of BAM. */
 	u32 pipe_index;		/* Pipe index */
 	u32 event_threshold;	/* Pipe event threshold */
 	u32 lock_group;	/* The lock group this pipe belongs to */
@@ -194,6 +281,12 @@ struct sps_mem_stats {
 	u32 max_bytes_used;
 };
 
+enum sps_bam_type {
+	SPS_BAM_LEGACY,
+	SPS_BAM_NDP,
+	SPS_BAM_NDP_4K
+};
+
 #ifdef CONFIG_DEBUG_FS
 /* record debug info for debugfs */
 void sps_debugfs_record(const char *);
@@ -216,6 +309,9 @@ void print_bam_pipe_desc_fifo(void *, u32, u32);
 
 /* output BAM_TEST_BUS_REG */
 void print_bam_test_bus_reg(void *, u32);
+
+/* halt and un-halt a pipe */
+void bam_pipe_halt(void *, u32, bool);
 
 /**
  * Translate physical to virtual address
@@ -375,7 +471,7 @@ void sps_dma_de_init(void);
  * @return 0 on success, negative value on error
  *
  */
-int sps_dma_device_init(u32 h);
+int sps_dma_device_init(unsigned long h);
 
 /**
  * De-initialize BAM DMA device
@@ -387,7 +483,7 @@ int sps_dma_device_init(u32 h);
  * @return 0 on success, negative value on error
  *
  */
-int sps_dma_device_de_init(u32 h);
+int sps_dma_device_de_init(unsigned long h);
 
 /**
  * Initialize connection mapping module
@@ -412,4 +508,21 @@ int sps_map_init(const struct sps_map *map_props, u32 options);
  */
 void sps_map_de_init(void);
 
+/*
+ * bam_pipe_reset - reset a BAM pipe.
+ * @base:	BAM virtual address
+ * @pipe:	pipe index
+ *
+ * This function resets a BAM pipe.
+ */
+void bam_pipe_reset(void *base, u32 pipe);
+
+/*
+ * bam_disable_pipe - disable a BAM pipe.
+ * @base:	BAM virtual address
+ * @pipe:	pipe index
+ *
+ * This function disables a BAM pipe.
+ */
+void bam_disable_pipe(void *base, u32 pipe);
 #endif	/* _SPSI_H_ */

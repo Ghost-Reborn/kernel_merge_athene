@@ -1,4 +1,4 @@
-/* Copyright (c) 2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2013-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -58,6 +58,17 @@ struct msm_pinctrl_dd {
 	struct device *dev;
 };
 
+/**
+ * struct msm_irq_of_info: represents of init data for tlmm interrupt
+ * controllers
+ * @compat: compat string for tlmm interrup controller instance.
+ * @irq_init: irq chip initialization callback.
+ */
+struct msm_irq_of_info {
+	const char *compat;
+	int (*irq_init)(struct device_node *np, struct irq_chip *ic);
+};
+
 static int msm_pmx_functions_count(struct pinctrl_dev *pctldev)
 {
 	struct msm_pinctrl_dd *dd;
@@ -109,7 +120,7 @@ static void msm_pmx_prg_fn(struct pinctrl_dev *pctldev, unsigned selector,
 		pinfo = pindesc[pin].pin_info;
 		pin = pin - pinfo->pin_start;
 		func = dd->pin_grps[group].func;
-		pinfo->prg_func(pin, func, pinfo->reg_base, enable);
+		pinfo->prg_func(pin, func, enable, pinfo);
 	}
 }
 
@@ -139,7 +150,7 @@ static int msm_pmx_gpio_request(struct pinctrl_dev *pctldev,
 	pindesc = dd->msm_pindesc;
 	pinfo = pindesc[pin].pin_info;
 	/* All TLMM versions use function 0 for gpio function */
-	pinfo->prg_func(pin, 0, pinfo->reg_base, true);
+	pinfo->prg_func(pin, 0, true, pinfo);
 	return 0;
 }
 
@@ -163,7 +174,7 @@ static int msm_pconf_prg(struct pinctrl_dev *pctldev, unsigned int pin,
 	pindesc = dd->msm_pindesc;
 	pinfo = pindesc[pin].pin_info;
 	pin = pin - pinfo->pin_start;
-	return pinfo->prg_cfg(pin, config, pinfo->reg_base, rw);
+	return pinfo->prg_cfg(pin, config, rw, pinfo);
 }
 
 static int msm_pconf_set(struct pinctrl_dev *pctldev, unsigned int pin,
@@ -275,6 +286,7 @@ static int msm_dt_node_to_map(struct pinctrl_dev *pctldev,
 	char *fn_name;
 	u32 val;
 	unsigned long *cfg;
+	unsigned int fn_name_len = 0;
 	int cfg_cnt = 0, map_cnt = 0, func_cnt = 0, ret = 0;
 
 	dd = pinctrl_dev_get_drvdata(pctldev);
@@ -320,14 +332,14 @@ static int msm_dt_node_to_map(struct pinctrl_dev *pctldev,
 	}
 	/* Get function mapping */
 	of_property_read_u32(parent, "qcom,pin-func", &val);
-	fn_name = kzalloc(strlen(grp_name) + strlen("-func"),
-						GFP_KERNEL);
+
+	fn_name_len = strlen(grp_name) + strlen("-func") + 1;
+	fn_name = kzalloc(fn_name_len, GFP_KERNEL);
 	if (!fn_name) {
 		ret = -ENOMEM;
 		goto func_err;
 	}
-	snprintf(fn_name, strlen(grp_name) + strlen("-func") + 1, "%s%s",
-						grp_name, "-func");
+	snprintf(fn_name, fn_name_len, "%s-func", grp_name);
 	map[*nmaps].data.mux.group = grp_name;
 	map[*nmaps].data.mux.function = fn_name;
 	map[*nmaps].type = PIN_MAP_TYPE_MUX_GROUP;
@@ -353,7 +365,7 @@ static void msm_dt_free_map(struct pinctrl_dev *pctldev,
 	for (idx = 0; idx < num_maps; idx++) {
 		if (map[idx].type == PIN_MAP_TYPE_CONFIGS_GROUP)
 			kfree(map[idx].data.configs.configs);
-		else if (map->type == PIN_MAP_TYPE_MUX_GROUP)
+		else if (map[idx].type == PIN_MAP_TYPE_MUX_GROUP)
 			kfree(map[idx].data.mux.function);
 	};
 
@@ -560,8 +572,9 @@ static bool msm_pintype_supports_irq(struct msm_pintype_info *pinfo)
 {
 	struct device_node *pt_node;
 
-	if (!pinfo->init_irq)
+	if (!pinfo->node)
 		return false;
+
 	for_each_child_of_node(pinfo->node, pt_node) {
 		if (of_find_property(pt_node, "interrupt-controller", NULL)) {
 			pinfo->irq_chip->node = pt_node;
@@ -577,7 +590,6 @@ static int msm_pinctrl_dt_parse_pintype(struct device_node *dev_node,
 	struct device_node *pt_node;
 	struct msm_pindesc *msm_pindesc;
 	struct msm_pintype_info *pintype, *pinfo;
-	void __iomem **ptype_base;
 	u32 num_pins, pinfo_entries, curr_pins;
 	int i, ret;
 	uint total_pins = 0;
@@ -589,9 +601,7 @@ static int msm_pinctrl_dt_parse_pintype(struct device_node *dev_node,
 	for_each_child_of_node(dev_node, pt_node) {
 		for (i = 0; i < pinfo_entries; i++) {
 			pintype = &pinfo[i];
-			/* Check if node is pintype node */
-			if (!of_find_property(pt_node, pintype->prop_name,
-									NULL))
+			if (strcmp(pt_node->name, pintype->name))
 				continue;
 			of_node_get(pt_node);
 			pintype->node = pt_node;
@@ -600,14 +610,13 @@ static int msm_pinctrl_dt_parse_pintype(struct device_node *dev_node,
 								&num_pins);
 			if (ret) {
 				dev_err(dd->dev, "num pins not specified\n");
-				return ret;
+				goto fail;
 			}
 			/* determine pin number range for given pin type */
 			pintype->num_pins = num_pins;
 			pintype->pin_start = curr_pins;
 			pintype->pin_end = curr_pins + num_pins;
-			ptype_base = &pintype->reg_base;
-			pintype->set_reg_base(ptype_base, dd->base);
+			pintype->set_reg_base(dd->base, pintype);
 			total_pins += num_pins;
 			curr_pins += num_pins;
 		}
@@ -617,7 +626,7 @@ static int msm_pinctrl_dt_parse_pintype(struct device_node *dev_node,
 						total_pins, GFP_KERNEL);
 	if (!dd->msm_pindesc) {
 		dev_err(dd->dev, "Unable to allocate msm pindesc");
-		goto alloc_fail;
+		goto fail;
 	}
 
 	dd->num_pins = total_pins;
@@ -634,7 +643,7 @@ static int msm_pinctrl_dt_parse_pintype(struct device_node *dev_node,
 		msm_populate_pindesc(pintype, msm_pindesc);
 	}
 	return 0;
-alloc_fail:
+fail:
 	for (i = 0; i < pinfo_entries; i++) {
 		pintype = &pinfo[i];
 		if (pintype->node)
@@ -796,3 +805,45 @@ int msm_pinctrl_probe(struct platform_device *pdev,
 	return 0;
 }
 EXPORT_SYMBOL(msm_pinctrl_probe);
+
+#ifdef CONFIG_USE_PINCTRL_IRQ
+struct irq_chip mpm_tlmm_irq_extn = {
+	.irq_eoi	= NULL,
+	.irq_mask	= NULL,
+	.irq_unmask	= NULL,
+	.irq_retrigger	= NULL,
+	.irq_set_type	= NULL,
+	.irq_set_wake	= NULL,
+	.irq_disable	= NULL,
+};
+
+struct msm_irq_of_info msm_tlmm_irq[] = {
+#ifdef CONFIG_PINCTRL_MSM_TLMM
+	{
+		.compat = "qcom,msm-tlmm-gp",
+		.irq_init = msm_tlmm_of_gp_irq_init,
+	},
+#endif
+};
+
+int __init msm_tlmm_of_irq_init(struct device_node *controller,
+						struct device_node *parent)
+{
+	int rc, i;
+	const char *compat;
+
+	rc = of_property_read_string(controller, "compatible", &compat);
+	if (rc)
+		return rc;
+
+	for (i = 0; i < ARRAY_SIZE(msm_tlmm_irq); i++) {
+		struct msm_irq_of_info *tlmm_info = &msm_tlmm_irq[i];
+
+		if (!of_compat_cmp(tlmm_info->compat, compat, strlen(compat)))
+				return tlmm_info->irq_init(controller,
+							&mpm_tlmm_irq_extn);
+
+	}
+	return -EIO;
+}
+#endif

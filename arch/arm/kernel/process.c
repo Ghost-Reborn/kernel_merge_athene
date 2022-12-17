@@ -14,6 +14,7 @@
 #include <linux/sched.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
+#include <linux/vmalloc.h>
 #include <linux/stddef.h>
 #include <linux/unistd.h>
 #include <linux/user.h>
@@ -151,7 +152,7 @@ void soft_restart(unsigned long addr)
 	BUG();
 }
 
-static void null_restart(char mode, const char *cmd)
+static void null_restart(enum reboot_mode reboot_mode, const char *cmd)
 {
 }
 
@@ -161,22 +162,23 @@ static void null_restart(char mode, const char *cmd)
 void (*pm_power_off)(void);
 EXPORT_SYMBOL(pm_power_off);
 
-void (*arm_pm_restart)(char str, const char *cmd) = null_restart;
+void (*arm_pm_restart)(enum reboot_mode reboot_mode, const char *cmd) = null_restart;
 EXPORT_SYMBOL_GPL(arm_pm_restart);
 
 /*
  * This is our default idle handler.
  */
 
-extern void arch_idle(void);
-void (*arm_pm_idle)(void) = arch_idle;
+void (*arm_pm_idle)(void);
 
 static void default_idle(void)
 {
-	if (arm_pm_idle)
-		arm_pm_idle();
-	else
-		cpu_do_idle();
+	if (!need_resched()) {
+		if (arm_pm_idle)
+			arm_pm_idle();
+		else
+			cpu_do_idle();
+	}
 	local_irq_enable();
 }
 
@@ -216,14 +218,14 @@ void arch_cpu_idle(void)
 		default_idle();
 }
 
-static char reboot_mode = 'h';
+enum reboot_mode reboot_mode = REBOOT_HARD;
 
-int __init reboot_setup(char *str)
+static int __init reboot_setup(char *str)
 {
-	reboot_mode = str[0];
+	if ('s' == str[0])
+		reboot_mode = REBOOT_SOFT;
 	return 1;
 }
-
 __setup("reboot=", reboot_setup);
 
 /*
@@ -345,23 +347,24 @@ static void show_data(unsigned long addr, int nbytes, const char *name)
 		printk("%04lx ", (unsigned long)p & 0xffff);
 		for (j = 0; j < 8; j++) {
 			u32	data;
-			if (probe_kernel_address(p, data)) {
+			/*
+			 * vmalloc addresses may point to
+			 * memory-mapped peripherals
+			 */
+			if (!virt_addr_valid(p) ||
+			    probe_kernel_address(p, data)) {
 				printk(" ********");
 			} else {
-				printk(" %08x", data);
+				printk(KERN_CONT " %08x", data);
 			}
 			++p;
 		}
-		printk("\n");
+		printk(KERN_CONT "\n");
 	}
 }
 
 static void show_extra_register_data(struct pt_regs *regs, int nbytes)
 {
-	mm_segment_t fs;
-
-	fs = get_fs();
-	set_fs(KERNEL_DS);
 	show_data(regs->ARM_pc - nbytes, nbytes * 2, "PC");
 	show_data(regs->ARM_lr - nbytes, nbytes * 2, "LR");
 	show_data(regs->ARM_sp - nbytes, nbytes * 2, "SP");
@@ -378,7 +381,6 @@ static void show_extra_register_data(struct pt_regs *regs, int nbytes)
 	show_data(regs->ARM_r8 - nbytes, nbytes * 2, "R8");
 	show_data(regs->ARM_r9 - nbytes, nbytes * 2, "R9");
 	show_data(regs->ARM_r10 - nbytes, nbytes * 2, "R10");
-	set_fs(fs);
 }
 
 void __show_regs(struct pt_regs *regs)
@@ -437,7 +439,6 @@ void __show_regs(struct pt_regs *regs)
 		printk("Control: %08x%s\n", ctrl, buf);
 	}
 #endif
-
 	show_extra_register_data(regs, 128);
 }
 
@@ -541,6 +542,7 @@ EXPORT_SYMBOL(dump_fpu);
 unsigned long get_wchan(struct task_struct *p)
 {
 	struct stackframe frame;
+	unsigned long stack_page;
 	int count = 0;
 	if (!p || p == current || p->state == TASK_RUNNING)
 		return 0;
@@ -549,9 +551,11 @@ unsigned long get_wchan(struct task_struct *p)
 	frame.sp = thread_saved_sp(p);
 	frame.lr = 0;			/* recovered from the stack */
 	frame.pc = thread_saved_pc(p);
+	stack_page = (unsigned long)task_stack_page(p);
 	do {
-		int ret = unwind_frame(&frame);
-		if (ret < 0)
+		if (frame.sp < stack_page ||
+		    frame.sp >= stack_page + THREAD_SIZE ||
+		    unwind_frame(&frame) < 0)
 			return 0;
 		if (!in_sched_functions(frame.pc))
 			return frame.pc;

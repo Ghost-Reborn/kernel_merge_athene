@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2007 Google, Inc.
- * Copyright (c) 2007-2013, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2007-2015, The Linux Foundation. All rights reserved.
  *
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and
@@ -23,6 +23,7 @@
 #include <linux/of.h>
 #include <linux/device.h>
 #include <linux/spinlock.h>
+#include <linux/platform_device.h>
 #include <linux/mutex.h>
 #include <linux/regulator/consumer.h>
 #include <linux/seq_file.h>
@@ -56,7 +57,7 @@ static inline void clk_debug_print_hw(struct clk *clk, struct seq_file *f) {}
 
 #define CLK_WARN(clk, cond, fmt, ...) do {				\
 	clk_debug_print_hw(clk, NULL);					\
-	WARN(cond, "%s: " fmt, (clk)->dbg_name, ##__VA_ARGS__);		\
+	WARN(cond, "%s: " fmt, clk_name(clk), ##__VA_ARGS__);		\
 } while (0)
 
 /**
@@ -72,6 +73,9 @@ static inline void clk_debug_print_hw(struct clk *clk, struct seq_file *f) {}
 		regulator. Optional parameter.
  * @level_votes: array of votes for each level.
  * @num_levels: specifies the size of level_votes array.
+ * @skip_handoff: do not vote for the max possible voltage during init
+ * @use_max_uV: use INT_MAX for max_uV when calling regulator_set_voltage
+ *           This is useful when different vdd_class share same regulator.
  * @cur_level: the currently set voltage level
  * @lock: lock to protect this struct
  */
@@ -84,6 +88,8 @@ struct clk_vdd_class {
 	int *vdd_ua;
 	int *level_votes;
 	int num_levels;
+	bool skip_handoff;
+	bool use_max_uV;
 	unsigned long cur_level;
 	struct mutex lock;
 };
@@ -151,6 +157,20 @@ struct clk_ops {
 				struct clk_register_data **regs, u32 *size);
 };
 
+struct clk_rate_stats_entry {
+	unsigned long rate;
+	unsigned long time;
+};
+
+#define CLOCK_RATE_STATE_SIZE_MAX 16
+
+struct clk_rate_stats {
+	spinlock_t lock;
+	struct timespec last_updated;
+	size_t size;
+	struct clk_rate_stats_entry entries[CLOCK_RATE_STATE_SIZE_MAX];
+};
+
 /**
  * struct clk
  * @prepare_count: prepare refcount
@@ -172,24 +192,34 @@ struct clk {
 	int num_fmax;
 	unsigned long rate;
 	struct clk *parent;
+	struct clk_src *parents;
+	unsigned int num_parents;
 
 	struct list_head children;
 	struct list_head siblings;
+	struct list_head list;
 
 	unsigned count;
+	unsigned notifier_count;
 	spinlock_t lock;
 	unsigned prepare_count;
 	struct mutex prepare_lock;
 
+	unsigned long init_rate;
+	bool always_on;
+
 	struct dentry *clk_dir;
+	struct clk_rate_stats *rate_stats;
 };
 
 #define CLK_INIT(name) \
 	.lock = __SPIN_LOCK_UNLOCKED((name).lock), \
 	.prepare_lock = __MUTEX_INITIALIZER((name).prepare_lock), \
 	.children = LIST_HEAD_INIT((name).children), \
-	.siblings = LIST_HEAD_INIT((name).siblings)
+	.siblings = LIST_HEAD_INIT((name).siblings), \
+	.list = LIST_HEAD_INIT((name).list)
 
+bool is_rate_valid(struct clk *clk, unsigned long rate);
 int vote_vdd_level(struct clk_vdd_class *vdd_class, int level);
 int unvote_vdd_level(struct clk_vdd_class *vdd_class, int level);
 int __clk_pre_reparent(struct clk *c, struct clk *new, unsigned long *flags);
@@ -199,6 +229,9 @@ void __clk_post_reparent(struct clk *c, struct clk *old, unsigned long *flags);
 int msm_clock_register(struct clk_lookup *table, size_t size);
 int of_msm_clock_register(struct device_node *np, struct clk_lookup *table,
 				size_t size);
+
+int clock_rcgwr_init(struct platform_device *pdev);
+int clock_rcgwr_disable(struct platform_device *pdev);
 
 extern struct clk dummy_clk;
 extern struct clk_ops clk_ops_dummy;
@@ -239,4 +272,10 @@ extern int of_clk_add_provider(struct device_node *np,
 			void *data);
 extern void of_clk_del_provider(struct device_node *np);
 
+static inline const char *clk_name(struct clk *c)
+{
+	if (IS_ERR_OR_NULL(c))
+		return "(null)";
+	return c->dbg_name;
+};
 #endif

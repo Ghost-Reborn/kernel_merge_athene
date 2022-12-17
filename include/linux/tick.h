@@ -72,6 +72,8 @@ struct tick_sched {
 
 extern void __init tick_init(void);
 extern int tick_is_oneshot_available(void);
+extern u64 jiffy_to_sched_clock(u64 *now, u64 *jiffy_sched_clock);
+extern u64 jiffy_to_ktime_ns(u64 *now, u64 *jiffy_ktime_ns);
 extern struct tick_device *tick_get_device(int cpu);
 
 # ifdef CONFIG_HIGH_RES_TIMERS
@@ -109,7 +111,7 @@ static inline struct cpumask *tick_get_broadcast_mask(void)
 extern void tick_clock_notify(void);
 extern int tick_check_oneshot_change(int allow_nohz);
 extern struct tick_sched *tick_get_tick_sched(int cpu);
-extern void tick_check_idle(int cpu);
+extern void tick_check_idle(void);
 extern int tick_oneshot_mode_active(void);
 #  ifndef arch_needs_cpu
 #   define arch_needs_cpu(cpu) (0)
@@ -117,7 +119,7 @@ extern int tick_oneshot_mode_active(void);
 # else
 static inline void tick_clock_notify(void) { }
 static inline int tick_check_oneshot_change(int allow_nohz) { return 0; }
-static inline void tick_check_idle(int cpu) { }
+static inline void tick_check_idle(void) { }
 static inline int tick_oneshot_mode_active(void) { return 0; }
 static inline struct cpumask *tick_get_broadcast_oneshot_mask(void)
 {
@@ -130,7 +132,7 @@ static inline void tick_init(void) { }
 static inline void tick_cancel_sched_timer(int cpu) { }
 static inline void tick_clock_notify(void) { }
 static inline int tick_check_oneshot_change(int allow_nohz) { return 0; }
-static inline void tick_check_idle(int cpu) { }
+static inline void tick_check_idle(void) { }
 static inline int tick_oneshot_mode_active(void) { return 0; }
 #endif /* !CONFIG_GENERIC_CLOCKEVENTS */
 
@@ -184,11 +186,5 @@ static inline void tick_nohz_full_kick_all(void) { }
 static inline void tick_nohz_task_switch(struct task_struct *tsk) { }
 #endif
 
-
-# ifdef CONFIG_CPU_IDLE_GOV_MENU
-extern void menu_hrtimer_cancel(void);
-# else
-static inline void menu_hrtimer_cancel(void) {}
-# endif /* CONFIG_CPU_IDLE_GOV_MENU */
 
 #endif

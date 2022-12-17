@@ -1,4 +1,4 @@
-/* Copyright (c) 2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2013-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -21,6 +21,7 @@
 static struct qseecom_handle *sdmx_qseecom_handles[SDMX_MAX_SESSIONS];
 static struct mutex sdmx_lock[SDMX_MAX_SESSIONS];
 
+#define QSEECOM_SBUFF_SIZE	SZ_128K
 #define QSEECOM_ALIGN_SIZE	0x40
 #define QSEECOM_ALIGN_MASK	(QSEECOM_ALIGN_SIZE - 1)
 #define QSEECOM_ALIGN(x)	\
@@ -43,11 +44,29 @@ enum sdmx_cmd_id {
 	SDMX_SET_LOG_LEVEL_CMD
 };
 
+#pragma pack(push, sdmx, 1)
+
+struct __sdmx_buff_descr {
+	/* 32bit Physical address where buffer starts */
+	u32 base_addr;
+
+	/* Size of buffer */
+	u32 size;
+};
+
+struct __sdmx_data_buff_descr {
+	/* 32bit Physical chunks of the buffer */
+	struct __sdmx_buff_descr buff_chunks[SDMX_MAX_PHYSICAL_CHUNKS];
+
+	/* Length of buffer */
+	u32 length;
+};
+
 struct sdmx_proc_req {
 	enum sdmx_cmd_id cmd_id;
 	u32 session_handle;
 	u8 flags;
-	struct sdmx_buff_descr in_buf_descr;
+	struct __sdmx_buff_descr in_buf_descr;
 	u32 inp_fill_cnt;
 	u32 in_rd_offset;
 	u32 num_filters;
@@ -110,12 +129,12 @@ struct sdmx_add_filt_req {
 	u32 session_handle;
 	u32 pid;
 	enum sdmx_filter filter_type;
-	struct sdmx_buff_descr meta_data_buf;
+	struct __sdmx_buff_descr meta_data_buf;
 	enum sdmx_buf_mode buffer_mode;
 	enum sdmx_raw_out_format ts_out_format;
 	u32 flags;
 	u32 num_data_bufs;
-	struct sdmx_data_buff_descr data_bufs[];
+	struct __sdmx_data_buff_descr data_bufs[];
 };
 
 struct sdmx_add_filt_rsp {
@@ -195,22 +214,30 @@ struct sdmx_set_log_level_req {
 struct sdmx_set_log_level_rsp {
 	enum sdmx_status ret;
 };
-static void get_cmd_rsp_buffers(int handle_index,
+
+#pragma pack(pop, sdmx)
+
+static int get_cmd_rsp_buffers(int handle_index,
 	void **cmd,
 	int *cmd_len,
 	void **rsp,
 	int *rsp_len)
 {
-	*cmd = sdmx_qseecom_handles[handle_index]->sbuf;
-
 	if (*cmd_len & QSEECOM_ALIGN_MASK)
 		*cmd_len = QSEECOM_ALIGN(*cmd_len);
-
-	*rsp = sdmx_qseecom_handles[handle_index]->sbuf + *cmd_len;
 
 	if (*rsp_len & QSEECOM_ALIGN_MASK)
 		*rsp_len = QSEECOM_ALIGN(*rsp_len);
 
+	if ((*rsp_len + *cmd_len) > QSEECOM_SBUFF_SIZE) {
+		pr_err("%s: shared buffer too small to hold cmd=%d and rsp=%d\n",
+			__func__, *cmd_len, *rsp_len);
+		return SDMX_STATUS_OUT_OF_MEM;
+	}
+
+	*cmd = sdmx_qseecom_handles[handle_index]->sbuf;
+	*rsp = sdmx_qseecom_handles[handle_index]->sbuf + *cmd_len;
+	return SDMX_SUCCESS;
 }
 
 /*
@@ -237,8 +264,10 @@ int sdmx_get_version(int session_handle, int32_t *version)
 	mutex_lock(&sdmx_lock[session_handle]);
 
 	/* Get command and response buffers */
-	get_cmd_rsp_buffers(session_handle, (void **)&cmd, &cmd_len,
+	ret = get_cmd_rsp_buffers(session_handle, (void **)&cmd, &cmd_len,
 		(void **)&rsp, &rsp_len);
+	if (ret)
+		goto out;
 
 	/* Populate command struct */
 	cmd->cmd_id = SDMX_GET_VERSION_CMD;
@@ -254,7 +283,7 @@ int sdmx_get_version(int session_handle, int32_t *version)
 
 	ret = rsp->ret;
 	*version = rsp->version;
-
+out:
 	mutex_unlock(&sdmx_lock[session_handle]);
 
 	return ret;
@@ -282,7 +311,8 @@ int sdmx_open_session(int *session_handle)
 		return SDMX_STATUS_GENERAL_FAILURE;
 
 	/* Start the TZ app */
-	res = qseecom_start_app(&qseecom_handle, "securemm", 4096);
+	res = qseecom_start_app(&qseecom_handle, "securemm",
+		QSEECOM_SBUFF_SIZE);
 
 	if (res < 0)
 		return SDMX_STATUS_GENERAL_FAILURE;
@@ -359,8 +389,10 @@ int sdmx_close_session(int session_handle)
 	mutex_lock(&sdmx_lock[session_handle]);
 
 	/* Get command and response buffers */
-	get_cmd_rsp_buffers(session_handle, (void **)&cmd, &cmd_len,
+	ret = get_cmd_rsp_buffers(session_handle, (void **)&cmd, &cmd_len,
 		(void **)&rsp, &rsp_len);
+	if (ret)
+		goto out;
 
 	/* Populate command struct */
 	cmd->cmd_id = SDMX_CLOSE_SESSION_CMD;
@@ -385,7 +417,7 @@ int sdmx_close_session(int session_handle)
 	}
 
 	sdmx_qseecom_handles[session_handle] = NULL;
-
+out:
 	mutex_unlock(&sdmx_lock[session_handle]);
 
 	return ret;
@@ -426,8 +458,10 @@ int sdmx_set_session_cfg(int session_handle,
 	mutex_lock(&sdmx_lock[session_handle]);
 
 	/* Get command and response buffers */
-	get_cmd_rsp_buffers(session_handle, (void **)&cmd, &cmd_len,
+	ret = get_cmd_rsp_buffers(session_handle, (void **)&cmd, &cmd_len,
 		(void **)&rsp, &rsp_len);
+	if (ret)
+		goto out;
 
 	/* Populate command struct */
 	cmd->cmd_id = SDMX_SET_SESSION_CFG_CMD;
@@ -448,7 +482,7 @@ int sdmx_set_session_cfg(int session_handle,
 	}
 
 	ret = rsp->ret;
-
+out:
 	mutex_unlock(&sdmx_lock[session_handle]);
 
 	return ret;
@@ -483,7 +517,7 @@ int sdmx_add_filter(int session_handle,
 	enum sdmx_raw_out_format ts_out_format,
 	u32 flags)
 {
-	int res, cmd_len, rsp_len;
+	int res, cmd_len, rsp_len, i, j;
 	struct sdmx_add_filt_req *cmd;
 	struct sdmx_add_filt_rsp *rsp;
 	enum sdmx_status ret;
@@ -493,7 +527,7 @@ int sdmx_add_filter(int session_handle,
 		return SDMX_STATUS_INVALID_INPUT_PARAMS;
 
 	cmd_len = sizeof(struct sdmx_add_filt_req)
-		+ num_data_bufs * sizeof(struct sdmx_data_buff_descr);
+		+ num_data_bufs * sizeof(struct __sdmx_data_buff_descr);
 	rsp_len = sizeof(struct sdmx_add_filt_rsp);
 
 	/* Will be later overridden by SDMX response */
@@ -503,8 +537,10 @@ int sdmx_add_filter(int session_handle,
 	mutex_lock(&sdmx_lock[session_handle]);
 
 	/* Get command and response buffers */
-	get_cmd_rsp_buffers(session_handle, (void **)&cmd, &cmd_len,
+	ret = get_cmd_rsp_buffers(session_handle, (void **)&cmd, &cmd_len,
 		(void **)&rsp, &rsp_len);
+	if (ret)
+		goto out;
 
 	/* Populate command struct */
 	cmd->cmd_id = SDMX_ADD_FILTER_CMD;
@@ -513,17 +549,24 @@ int sdmx_add_filter(int session_handle,
 	cmd->filter_type = filterype;
 	cmd->ts_out_format = ts_out_format;
 	cmd->flags = flags;
-	if (meta_data_buf != NULL)
-		memcpy(&(cmd->meta_data_buf), meta_data_buf,
-			sizeof(struct sdmx_buff_descr));
-	else
-		memset(&(cmd->meta_data_buf), 0,
-			sizeof(struct sdmx_buff_descr));
+	if (meta_data_buf != NULL) {
+		cmd->meta_data_buf.base_addr = (u32)meta_data_buf->base_addr;
+		cmd->meta_data_buf.size = meta_data_buf->size;
+	} else {
+		memset(&(cmd->meta_data_buf), 0, sizeof(cmd->meta_data_buf));
+	}
 
 	cmd->buffer_mode = d_buf_mode;
 	cmd->num_data_bufs = num_data_bufs;
-	memcpy(cmd->data_bufs, data_bufs,
-		num_data_bufs * sizeof(struct sdmx_data_buff_descr));
+	for (i = 0; i < num_data_bufs; i++) {
+		for (j = 0; j < SDMX_MAX_PHYSICAL_CHUNKS; j++) {
+			cmd->data_bufs[i].buff_chunks[j].base_addr =
+				(u32)data_bufs[i].buff_chunks[j].base_addr;
+			cmd->data_bufs[i].buff_chunks[j].size =
+				data_bufs[i].buff_chunks[j].size;
+		}
+		cmd->data_bufs[i].length = data_bufs[i].length;
+	}
 
 	/* Issue QSEECom command */
 	res = qseecom_send_command(sdmx_qseecom_handles[session_handle],
@@ -537,7 +580,7 @@ int sdmx_add_filter(int session_handle,
 	/* Parse response struct */
 	*filter_handle = rsp->filter_handle;
 	ret = rsp->ret;
-
+out:
 	mutex_unlock(&sdmx_lock[session_handle]);
 
 	return ret;
@@ -569,8 +612,10 @@ int sdmx_remove_filter(int session_handle, int filter_handle)
 	mutex_lock(&sdmx_lock[session_handle]);
 
 	/* Get command and response buffers */
-	get_cmd_rsp_buffers(session_handle, (void **)&cmd, &cmd_len,
+	ret = get_cmd_rsp_buffers(session_handle, (void **)&cmd, &cmd_len,
 		(void **)&rsp, &rsp_len);
+	if (ret)
+		goto out;
 
 	/* Populate command struct */
 	cmd->cmd_id = SDMX_REMOVE_FILTER_CMD;
@@ -587,7 +632,7 @@ int sdmx_remove_filter(int session_handle, int filter_handle)
 	}
 
 	ret = rsp->ret;
-
+out:
 	mutex_unlock(&sdmx_lock[session_handle]);
 
 	return ret;
@@ -623,8 +668,10 @@ int sdmx_set_kl_ind(int session_handle, u16 pid, u32 key_ladder_index)
 	mutex_lock(&sdmx_lock[session_handle]);
 
 	/* Get command and response buffers */
-	get_cmd_rsp_buffers(session_handle, (void **)&cmd, &cmd_len,
+	ret = get_cmd_rsp_buffers(session_handle, (void **)&cmd, &cmd_len,
 		(void **)&rsp, &rsp_len);
+	if (ret)
+		goto out;
 
 	/* Populate command struct */
 	cmd->cmd_id = SDMX_SET_KL_IDX_CMD;
@@ -642,7 +689,7 @@ int sdmx_set_kl_ind(int session_handle, u16 pid, u32 key_ladder_index)
 	}
 
 	ret = rsp->ret;
-
+out:
 	mutex_unlock(&sdmx_lock[session_handle]);
 
 	return ret;
@@ -675,8 +722,10 @@ int sdmx_add_raw_pid(int session_handle, int filter_handle, u16 pid)
 	mutex_lock(&sdmx_lock[session_handle]);
 
 	/* Get command and response buffers */
-	get_cmd_rsp_buffers(session_handle, (void **)&cmd, &cmd_len,
+	ret = get_cmd_rsp_buffers(session_handle, (void **)&cmd, &cmd_len,
 		(void **)&rsp, &rsp_len);
+	if (ret)
+		goto out;
 
 	/* Populate command struct */
 	cmd->cmd_id = SDMX_ADD_RAW_PID_CMD;
@@ -694,7 +743,7 @@ int sdmx_add_raw_pid(int session_handle, int filter_handle, u16 pid)
 	}
 
 	ret = rsp->ret;
-
+out:
 	mutex_unlock(&sdmx_lock[session_handle]);
 
 	return ret;
@@ -727,8 +776,10 @@ int sdmx_remove_raw_pid(int session_handle, int filter_handle, u16 pid)
 	mutex_lock(&sdmx_lock[session_handle]);
 
 	/* Get command and response buffers */
-	get_cmd_rsp_buffers(session_handle, (void **)&cmd, &cmd_len,
+	ret = get_cmd_rsp_buffers(session_handle, (void **)&cmd, &cmd_len,
 		(void **)&rsp, &rsp_len);
+	if (ret)
+		goto out;
 
 	/* Populate command struct */
 	cmd->cmd_id = SDMX_REMOVE_RAW_PID_CMD;
@@ -746,7 +797,7 @@ int sdmx_remove_raw_pid(int session_handle, int filter_handle, u16 pid)
 	}
 
 	ret = rsp->ret;
-
+out:
 	mutex_unlock(&sdmx_lock[session_handle]);
 
 	return ret;
@@ -797,14 +848,16 @@ int sdmx_process(int session_handle, u8 flags,
 	mutex_lock(&sdmx_lock[session_handle]);
 
 	/* Get command and response buffers */
-	get_cmd_rsp_buffers(session_handle, (void **)&cmd, &cmd_len,
+	ret = get_cmd_rsp_buffers(session_handle, (void **)&cmd, &cmd_len,
 		(void **)&rsp, &rsp_len);
+	if (ret)
+		goto out;
 
 	/* Populate command struct */
 	cmd->cmd_id = SDMX_PROCESS_CMD;
 	cmd->session_handle = session_handle;
 	cmd->flags = flags;
-	cmd->in_buf_descr.base_addr = input_buf_desc->base_addr;
+	cmd->in_buf_descr.base_addr = (u32)input_buf_desc->base_addr;
 	cmd->in_buf_descr.size = input_buf_desc->size;
 	cmd->inp_fill_cnt = *input_fill_count;
 	cmd->in_rd_offset = *input_read_offset;
@@ -829,7 +882,7 @@ int sdmx_process(int session_handle, u8 flags,
 	memcpy(filter_status, cmd->filters_status,
 		num_filters * sizeof(struct sdmx_filter_status));
 	ret = rsp->ret;
-
+out:
 	mutex_unlock(&sdmx_lock[session_handle]);
 
 	return ret;
@@ -869,8 +922,10 @@ int sdmx_get_dbg_counters(int session_handle,
 	mutex_lock(&sdmx_lock[session_handle]);
 
 	/* Get command and response buffers */
-	get_cmd_rsp_buffers(session_handle, (void **)&cmd, &cmd_len,
+	ret = get_cmd_rsp_buffers(session_handle, (void **)&cmd, &cmd_len,
 		(void **)&rsp, &rsp_len);
+	if (ret)
+		goto out;
 
 	/* Populate command struct */
 	cmd->cmd_id = SDMX_GET_DBG_COUNTERS_CMD;
@@ -892,7 +947,7 @@ int sdmx_get_dbg_counters(int session_handle,
 	memcpy(filter_counters, rsp->filter_counters,
 		*num_filters * sizeof(struct sdmx_filter_dbg_counters));
 	ret = rsp->ret;
-
+out:
 	mutex_unlock(&sdmx_lock[session_handle]);
 
 	return ret;
@@ -923,8 +978,10 @@ int sdmx_reset_dbg_counters(int session_handle)
 	mutex_lock(&sdmx_lock[session_handle]);
 
 	/* Get command and response buffers */
-	get_cmd_rsp_buffers(session_handle, (void **)&cmd, &cmd_len,
+	ret = get_cmd_rsp_buffers(session_handle, (void **)&cmd, &cmd_len,
 		(void **)&rsp, &rsp_len);
+	if (ret)
+		goto out;
 
 	/* Populate command struct */
 	cmd->cmd_id = SDMX_RESET_DBG_COUNTERS_CMD;
@@ -940,7 +997,7 @@ int sdmx_reset_dbg_counters(int session_handle)
 	}
 
 	ret = rsp->ret;
-
+out:
 	mutex_unlock(&sdmx_lock[session_handle]);
 
 	return ret;
@@ -965,12 +1022,14 @@ int sdmx_set_log_level(int session_handle, enum sdmx_log_level level)
 	cmd_len = sizeof(struct sdmx_set_log_level_req);
 	rsp_len = sizeof(struct sdmx_set_log_level_rsp);
 
-	/* Get command and response buffers */
-	get_cmd_rsp_buffers(session_handle, (void **)&cmd, &cmd_len,
-		(void **)&rsp, &rsp_len);
-
 	/* Lock shared memory */
 	mutex_lock(&sdmx_lock[session_handle]);
+
+	/* Get command and response buffers */
+	ret = get_cmd_rsp_buffers(session_handle, (void **)&cmd, &cmd_len,
+		(void **)&rsp, &rsp_len);
+	if (ret)
+		goto out;
 
 	/* Populate command struct */
 	cmd->cmd_id = SDMX_SET_LOG_LEVEL_CMD;
@@ -985,7 +1044,7 @@ int sdmx_set_log_level(int session_handle, enum sdmx_log_level level)
 		return SDMX_STATUS_GENERAL_FAILURE;
 	}
 	ret = rsp->ret;
-
+out:
 	/* Unlock */
 	mutex_unlock(&sdmx_lock[session_handle]);
 	return ret;

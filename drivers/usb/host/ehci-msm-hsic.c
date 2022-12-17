@@ -1,6 +1,6 @@
 /* ehci-msm-hsic.c - HSUSB Host Controller Driver Implementation
  *
- * Copyright (c) 2011-2014, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2011-2015, The Linux Foundation. All rights reserved.
  *
  * Partly derived from ehci-fsl.c and ehci-hcd.c
  * Copyright (c) 2000-2004 by David Brownell
@@ -31,6 +31,7 @@
 #include <linux/seq_file.h>
 #include <linux/wakelock.h>
 #include <linux/pm_runtime.h>
+#include <linux/pinctrl/consumer.h>
 #include <linux/regulator/consumer.h>
 #include <linux/usb.h>
 #include <linux/usb/hcd.h>
@@ -48,7 +49,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/clk/msm-clk.h>
 
-#include <mach/msm_bus.h>
+#include <linux/msm-bus.h>
 #include <mach/msm_iomap.h>
 #include <mach/msm_xo.h>
 #include <mach/rpm-regulator.h>
@@ -114,6 +115,8 @@ struct msm_hsic_hcd {
 
 	struct pm_qos_request pm_qos_req_dma;
 	unsigned		enable_hbm:1;
+
+	struct pinctrl		*hsic_pinctrl;
 };
 
 struct msm_hsic_hcd *__mehci;
@@ -271,7 +274,7 @@ static void dbg_log_event(struct urb *urb, char * event, unsigned extra)
 		if (!str_to_event(event)) {
 			write_lock_irqsave(&dbg_hsic_ctrl.lck, flags);
 			scnprintf(dbg_hsic_ctrl.buf[dbg_hsic_ctrl.idx],
-				DBG_MSG_LEN, "%s: [%s : %p]:[%s] "
+				DBG_MSG_LEN, "%s: [%s : %pK]:[%s] "
 				  "%02x %02x %04x %04x %04x  %u %d %s",
 				  get_timestamp(tbuf), event, urb,
 				  usb_urb_dir_in(urb) ? "in" : "out",
@@ -291,7 +294,7 @@ static void dbg_log_event(struct urb *urb, char * event, unsigned extra)
 		} else {
 			write_lock_irqsave(&dbg_hsic_ctrl.lck, flags);
 			scnprintf(dbg_hsic_ctrl.buf[dbg_hsic_ctrl.idx],
-				DBG_MSG_LEN, "%s: [%s : %p]:[%s] %u %d %s",
+				DBG_MSG_LEN, "%s: [%s : %pK]:[%s] %u %d %s",
 				  get_timestamp(tbuf), event, urb,
 				  usb_urb_dir_in(urb) ? "in" : "out",
 				  urb->actual_length, extra,
@@ -304,7 +307,7 @@ static void dbg_log_event(struct urb *urb, char * event, unsigned extra)
 	} else {
 		write_lock_irqsave(&dbg_hsic_data.lck, flags);
 		scnprintf(dbg_hsic_data.buf[dbg_hsic_data.idx], DBG_MSG_LEN,
-			  "%s: [%s : %p]:ep%d[%s]  %u %d %s",
+			  "%s: [%s : %pK]:ep%d[%s]  %u %d %s",
 			  get_timestamp(tbuf), event, urb, ep_addr & 0x0f,
 			  usb_urb_dir_in(urb) ? "in" : "out",
 			  str_to_event(event) ? urb->actual_length :
@@ -336,7 +339,7 @@ static void dump_hsic_regs(struct usb_hcd *hcd)
 		return;
 
 	for (i = USB_REG_START_OFFSET; i <= USB_REG_END_OFFSET; i += 0x10)
-		pr_info("%p: %08x\t%08x\t%08x\t%08x\n", hcd->regs + i,
+		pr_info("%pK: %08x\t%08x\t%08x\t%08x\n", hcd->regs + i,
 				readl_relaxed(hcd->regs + i),
 				readl_relaxed(hcd->regs + i + 4),
 				readl_relaxed(hcd->regs + i + 8),
@@ -533,6 +536,31 @@ static int ulpi_write(struct msm_hsic_hcd *mehci, u32 val, u32 reg)
 	return 0;
 }
 
+static int msm_hsic_config_pinctrl(struct msm_hsic_hcd *mehci, int state)
+{
+	struct pinctrl_state *set_state;
+	int rc = 0;
+	if (state) {
+		set_state = pinctrl_lookup_state(mehci->hsic_pinctrl,
+				"hsic_ehci_active");
+		if (IS_ERR(set_state)) {
+			pr_err("cannot get hsic pinctrl active state\n");
+			return PTR_ERR(set_state);
+		}
+		rc = pinctrl_select_state(mehci->hsic_pinctrl, set_state);
+	} else {
+		set_state = pinctrl_lookup_state(mehci->hsic_pinctrl,
+				"hsic_ehci_sleep");
+		if (IS_ERR(set_state)) {
+			pr_err("cannot get hsic pinctrl sleep state\n");
+			return PTR_ERR(set_state);
+		}
+		rc = pinctrl_select_state(mehci->hsic_pinctrl, set_state);
+	}
+
+	return rc;
+}
+
 static int msm_hsic_config_gpios(struct msm_hsic_hcd *mehci, int gpio_en)
 {
 	int rc = 0;
@@ -541,36 +569,35 @@ static int msm_hsic_config_gpios(struct msm_hsic_hcd *mehci, int gpio_en)
 
 	pdata = mehci->dev->platform_data;
 
-	if (!pdata || !pdata->strobe || !pdata->data)
-		return rc;
+	if (!pdata)
+		return -ENODEV;
 
-	if (gpio_status == gpio_en)
+	if (gpio_status == gpio_en || mehci->hsic_pinctrl)
 		return 0;
 
+	if (!pdata->strobe || !pdata->data)
+		return -ENODEV;
+
+	if (gpio_en) {
+		rc = gpio_request(pdata->strobe, "HSIC_STROBE_GPIO");
+		if (rc < 0) {
+			dev_err(mehci->dev, "gpio request failed for HSIC STROBE\n");
+			goto out;
+		}
+
+		rc = gpio_request(pdata->data, "HSIC_DATA_GPIO");
+		if (rc < 0) {
+			dev_err(mehci->dev, "gpio request failed for HSIC DATA\n");
+			gpio_free(pdata->strobe);
+			goto out;
+		}
+	} else {
+		gpio_free(pdata->data);
+		gpio_free(pdata->strobe);
+	}
+
 	gpio_status = gpio_en;
-
-	if (!gpio_en)
-		goto free_gpio;
-
-	rc = gpio_request(pdata->strobe, "HSIC_STROBE_GPIO");
-	if (rc < 0) {
-		dev_err(mehci->dev, "gpio request failed for HSIC STROBE\n");
-		return rc;
-	}
-
-	rc = gpio_request(pdata->data, "HSIC_DATA_GPIO");
-	if (rc < 0) {
-		dev_err(mehci->dev, "gpio request failed for HSIC DATA\n");
-		goto free_strobe;
-	}
-
-	return 0;
-
-free_gpio:
-	gpio_free(pdata->data);
-free_strobe:
-	gpio_free(pdata->strobe);
-
+out:
 	return rc;
 }
 
@@ -656,6 +683,14 @@ static int msm_hsic_start(struct msm_hsic_hcd *mehci)
 	int ret;
 	void __iomem *reg;
 
+	if (mehci->hsic_pinctrl) {
+		ret = msm_hsic_config_pinctrl(mehci, 1);
+		if (ret) {
+			dev_err(mehci->dev, "pinctrl configuarion failed:%d\n",
+					ret);
+			return ret;
+		}
+	}
 	if (pdata && pdata->resume_gpio) {
 		ret = gpio_request(pdata->resume_gpio, "HSIC_RESUME_GPIO");
 		if (ret < 0) {
@@ -667,7 +702,7 @@ static int msm_hsic_start(struct msm_hsic_hcd *mehci)
 
 	/* HSIC init sequence when HSIC signals (Strobe/Data) are
 	routed via GPIOs */
-	if (pdata && pdata->strobe && pdata->data) {
+	if (pdata && ((pdata->strobe && pdata->data) || mehci->hsic_pinctrl)) {
 
 		if (!pdata->ignore_cal_pad_config) {
 			/* Enable LV_MODE in HSIC_CAL_PAD_CTL register */
@@ -739,7 +774,8 @@ static int msm_hsic_start(struct msm_hsic_hcd *mehci)
 free_resume_gpio:
 	if (pdata && pdata->resume_gpio)
 		gpio_free(pdata->resume_gpio);
-
+	if (mehci->hsic_pinctrl)
+		msm_hsic_config_pinctrl(mehci, 0);
 	return ret;
 }
 
@@ -773,7 +809,8 @@ static int msm_hsic_suspend(struct msm_hsic_hcd *mehci)
 
 	/* make sure we don't race against a remote wakeup */
 	if (test_bit(HCD_FLAG_WAKEUP_PENDING, &hcd->flags) ||
-	    readl_relaxed(USB_PORTSC) & PORT_RESUME) {
+	    readl_relaxed(USB_PORTSC) & PORT_RESUME ||
+	    readl_relaxed(USB_USBSTS) & STS_PCD) {
 		dev_dbg(mehci->dev, "wakeup pending, aborting suspend\n");
 		enable_irq(hcd->irq);
 		return -EBUSY;
@@ -792,6 +829,22 @@ static int msm_hsic_suspend(struct msm_hsic_hcd *mehci)
 			__func__);
 	}
 
+	/* make sure we don't race against a remote wakeup */
+	if (readl_relaxed(USB_PORTSC) & PORT_RESUME ||
+	    readl_relaxed(USB_USBSTS) & STS_PCD) {
+		dev_err(mehci->dev, "RWakeup pending, ABORT suspend: PSC:%x STS:%x\n!!!\n",
+			 readl_relaxed(USB_PORTSC), readl_relaxed(USB_USBSTS));
+		enable_irq(hcd->irq);
+		if (pdata->consider_ipa_handshake) {
+			dev_dbg(mehci->dev, "%s:Wait for producer resource\n",
+					__func__);
+			msm_bam_wait_for_hsic_host_prod_granted();
+			dev_dbg(mehci->dev, "%s:Producer resource obtained\n",
+					__func__);
+			msm_bam_hsic_host_notify_on_resume();
+		}
+		return -EBUSY;
+	}
 	/*
 	 * PHY may take some time or even fail to enter into low power
 	 * mode (LPM). Hence poll for 500 msec and reset the PHY and link
@@ -965,6 +1018,14 @@ static int msm_hsic_resume(struct msm_hsic_hcd *mehci)
 
 skip_phy_resume:
 
+	/* Check HSIC host pipe state before resume.  Pipe should be empty. */
+	if (pdata->consider_ipa_handshake) {
+		if (!msm_bam_hsic_host_pipe_empty()) {
+			dev_err(mehci->dev, "Data pending without resumed.\n");
+			BUG_ON(1);
+		}
+	}
+
 	usb_hcd_resume_root_hub(hcd);
 
 	atomic_set(&mehci->in_lpm, 0);
@@ -1096,6 +1157,10 @@ static int ehci_hsic_reset(struct usb_hcd *hcd)
 	mehci->timer = USB_HS_GPTIMER_BASE;
 	ehci->caps = USB_CAPLENGTH;
 	hcd->has_tt = 1;
+
+
+	/* Disable streaming mode and select host mode */
+	writel_relaxed(0x13, USB_USBMODE);
 
 	retval = ehci_setup(hcd);
 	if (retval)
@@ -1540,7 +1605,9 @@ static int msm_hsic_init_clocks(struct msm_hsic_hcd *mehci, u32 init)
 		mehci->phy_clk = NULL;
 		if (ret != -EPROBE_DEFER)
 			dev_err(mehci->dev, "failed to get phy_clk\n");
-		return ret;
+		else
+			dev_err(mehci->dev, "Deferring phy_clk\n");
+		goto put_core_clk;
 	}
 
 	/* 10MHz cal_clk is required for calibration of I/O pads */
@@ -1550,7 +1617,9 @@ static int msm_hsic_init_clocks(struct msm_hsic_hcd *mehci, u32 init)
 		mehci->cal_clk = NULL;
 		if (ret != -EPROBE_DEFER)
 			dev_err(mehci->dev, "failed to get cal_clk\n");
-		return ret;
+		else
+			dev_err(mehci->dev, "Deferring cal_clk\n");
+		goto put_phy_clk;
 	}
 
 	/* ahb_clk is required for data transfers */
@@ -1560,7 +1629,9 @@ static int msm_hsic_init_clocks(struct msm_hsic_hcd *mehci, u32 init)
 		mehci->ahb_clk = NULL;
 		if (ret != -EPROBE_DEFER)
 			dev_err(mehci->dev, "failed to get iface_clk\n");
-		return ret;
+		else
+			dev_err(mehci->dev, "Deferring iface_clk\n");
+		goto put_cal_clk;
 	}
 
 	/*
@@ -1581,12 +1652,46 @@ static int msm_hsic_init_clocks(struct msm_hsic_hcd *mehci, u32 init)
 	if (IS_ERR(mehci->alt_core_clk))
 		dev_dbg(mehci->dev, "failed to get alt_core_clk\n");
 
-	clk_prepare_enable(mehci->core_clk);
-	clk_prepare_enable(mehci->phy_clk);
-	clk_prepare_enable(mehci->cal_clk);
-	clk_prepare_enable(mehci->ahb_clk);
-	if (!IS_ERR(mehci->inactivity_clk))
-		clk_prepare_enable(mehci->inactivity_clk);
+	ret = clk_set_rate(mehci->core_clk,
+			clk_round_rate(mehci->core_clk, LONG_MAX));
+	if (ret)
+		dev_err(mehci->dev, "failed to set core_clk rate\n");
+
+	ret = clk_set_rate(mehci->phy_clk,
+			clk_round_rate(mehci->phy_clk, LONG_MAX));
+	if (ret)
+		dev_err(mehci->dev, "failed to set phy_clk rate\n");
+
+	if (!IS_ERR(mehci->alt_core_clk)) {
+		ret = clk_set_rate(mehci->alt_core_clk,
+			clk_round_rate(mehci->alt_core_clk, LONG_MAX));
+		if (ret)
+			dev_err(mehci->dev, "failed to set_rate alt_core_clk\n");
+	}
+
+	ret = clk_set_rate(mehci->cal_clk,
+			clk_round_rate(mehci->cal_clk, LONG_MAX));
+	if (ret)
+		dev_err(mehci->dev, "failed to set cal_clk rate\n");
+
+	ret = clk_prepare_enable(mehci->core_clk);
+	if (ret)
+		dev_err(mehci->dev, "failed to enable core_clk\n");
+	ret = clk_prepare_enable(mehci->phy_clk);
+	if (ret)
+		dev_err(mehci->dev, "failed to enable phy_clk\n");
+	ret = clk_prepare_enable(mehci->cal_clk);
+	if (ret)
+		dev_err(mehci->dev, "failed to enable cal_clk\n");
+	ret = clk_prepare_enable(mehci->ahb_clk);
+	if (ret)
+		dev_err(mehci->dev, "failed to enable ahb_clk\n");
+
+	if (!IS_ERR(mehci->inactivity_clk)) {
+		ret = clk_prepare_enable(mehci->inactivity_clk);
+		if (ret)
+			dev_err(mehci->dev, "failed to enable inactvty_clk\n");
+	}
 
 	return 0;
 
@@ -1600,14 +1705,23 @@ put_clocks:
 			clk_disable_unprepare(mehci->inactivity_clk);
 	}
 
-	return 0;
+	clk_put(mehci->alt_core_clk);
+	clk_put(mehci->ahb_clk);
+put_cal_clk:
+	clk_put(mehci->cal_clk);
+put_phy_clk:
+	clk_put(mehci->phy_clk);
+put_core_clk:
+	clk_put(mehci->core_clk);
+
+	return ret;
 }
 
 static irqreturn_t hsic_peripheral_status_change(int irq, void *dev_id)
 {
 	struct msm_hsic_hcd *mehci = dev_id;
 
-	pr_debug("%s: mehci:%p dev_id:%p\n", __func__, mehci, dev_id);
+	pr_debug("%s: mehci:%pK dev_id:%pK\n", __func__, mehci, dev_id);
 
 	if (mehci)
 		msm_hsic_config_gpios(mehci, 0);
@@ -2073,6 +2187,18 @@ static int ehci_hsic_msm_probe(struct platform_device *pdev)
 		goto destroy_wq;
 	}
 
+	/* Check whether target uses pinctrl */
+	mehci->hsic_pinctrl = devm_pinctrl_get(&pdev->dev);
+	if (IS_ERR(mehci->hsic_pinctrl)) {
+		if (of_property_read_bool(pdev->dev.of_node, "pinctrl-names")) {
+			dev_err(&pdev->dev, "Error encountered while getting pinctrl");
+			ret = PTR_ERR(mehci->hsic_pinctrl);
+			goto destroy_wq;
+		}
+		dev_dbg(&pdev->dev, "Target does not use pinctrl\n");
+		mehci->hsic_pinctrl = NULL;
+	}
+
 	ret = msm_hsic_start(mehci);
 	if (ret) {
 		dev_err(&pdev->dev, "unable to initialize PHY\n");
@@ -2251,6 +2377,8 @@ static int ehci_hsic_msm_remove(struct platform_device *pdev)
 
 	if (pdata && pdata->resume_gpio)
 		gpio_free(pdata->resume_gpio);
+	if (mehci->hsic_pinctrl)
+		msm_hsic_config_pinctrl(mehci, 0);
 
 	msm_hsic_init_vddcx(mehci, 0);
 	msm_hsic_init_gdsc(mehci, 0);

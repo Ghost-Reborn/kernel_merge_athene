@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -18,13 +18,14 @@
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
 #include <linux/spinlock.h>
-#include <mach/ocmem.h>
 #include <linux/msm_iommu_domains.h>
+#include <soc/qcom/ocmem.h>
 #include "vidc_hfi_api.h"
 #include "vidc_hfi_helper.h"
 #include "vidc_hfi_api.h"
 #include "vidc_hfi.h"
 #include "msm_vidc_resources.h"
+#include "hfi_packetization.h"
 
 #define HFI_MASK_QHDR_TX_TYPE			0xFF000000
 #define HFI_MASK_QHDR_RX_TYPE			0x00FF0000
@@ -75,12 +76,12 @@ struct hfi_queue_header {
 
 struct hfi_mem_map_table {
 	u32 mem_map_num_entries;
-	u32 *mem_map_table_base_addr;
+	u32 mem_map_table_base_addr;
 };
 
 struct hfi_mem_map {
-	dma_addr_t virtual_addr;
-	phys_addr_t physical_addr;
+	u32 virtual_addr;
+	u32 physical_addr;
 	u32 size;
 	u32 attr;
 };
@@ -92,7 +93,7 @@ struct hfi_mem_map {
 	VIDC_IFACEQ_MAX_BUF_COUNT * VIDC_IFACE_MAX_PARALLEL_CLNTS)
 
 #define VIDC_IFACEQ_GET_QHDR_START_ADDR(ptr, i)     \
-	(void *)((((u32)ptr) + sizeof(struct hfi_queue_table_header)) + \
+	(void *)((ptr + sizeof(struct hfi_queue_table_header)) + \
 		(i * sizeof(struct hfi_queue_header)))
 
 #define QDSS_SIZE 4096
@@ -122,8 +123,13 @@ enum bus_index {
 	BUS_IDX_MAX
 };
 
+enum clock_state {
+	DISABLED_UNPREPARED,
+	ENABLED_PREPARED,
+};
+
 struct vidc_mem_addr {
-	u8 *align_device_addr;
+	ion_phys_addr_t align_device_addr;
 	u8 *align_virtual_addr;
 	u32 mem_size;
 	struct msm_smem *mem_data;
@@ -138,8 +144,9 @@ struct vidc_iface_q_info {
 
 struct hal_data {
 	u32 irq;
-	u32 device_base_addr;
-	u8 *register_base_addr;
+	phys_addr_t firmware_base;
+	u8 __iomem *register_base;
+	u32 register_size;
 };
 
 struct venus_bus_info {
@@ -155,8 +162,12 @@ struct on_chip_mem {
 
 struct venus_resources {
 	struct msm_vidc_fw fw;
-	struct venus_bus_info bus_info;
 	struct on_chip_mem ocmem;
+};
+
+enum venus_hfi_state {
+	VENUS_STATE_DEINIT = 1,
+	VENUS_STATE_INIT,
 };
 
 struct venus_hfi_device {
@@ -164,14 +175,19 @@ struct venus_hfi_device {
 	struct list_head sess_head;
 	u32 intr_status;
 	u32 device_id;
-	u32 clk_load;
-	u32 bus_load[MSM_VIDC_MAX_DEVICES];
-	u32 clocks_enabled;
-	u32 power_enabled;
+	unsigned long clk_freq;
+	u32 last_packet_type;
+	struct {
+		struct vidc_bus_vote_data *vote_data;
+		u32 vote_data_count;
+	} bus_load;
+	enum clock_state clk_state;
+	bool power_enabled;
 	struct mutex read_lock;
 	struct mutex write_lock;
-	struct mutex clk_pwr_lock;
+	struct mutex resource_lock;
 	struct mutex session_lock;
+	struct mutex clock_lock;
 	msm_vidc_callback callback;
 	struct vidc_mem_addr iface_q_table;
 	struct vidc_mem_addr qdss;
@@ -184,12 +200,11 @@ struct venus_hfi_device {
 	struct workqueue_struct *venus_pm_workq;
 	int spur_count;
 	int reg_count;
-	u32 base_addr;
-	u32 register_base;
-	u32 register_size;
-	u32 irq;
 	struct venus_resources resources;
 	struct msm_vidc_platform_resources *res;
+	enum venus_hfi_state state;
+	struct hfi_packetization_ops *pkt_ops;
+	enum hfi_packetization_type packetization_type;
 };
 
 void venus_hfi_delete_device(void *device);

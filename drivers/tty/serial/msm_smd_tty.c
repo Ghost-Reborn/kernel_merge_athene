@@ -27,19 +27,21 @@
 #include <linux/slab.h>
 #include <linux/ipc_logging.h>
 #include <linux/of.h>
-#include <soc/qcom/subsystem_restart.h>
+#include <linux/suspend.h>
 
 #include <linux/tty.h>
 #include <linux/tty_driver.h>
 #include <linux/tty_flip.h>
 
-#include <mach/msm_smd.h>
-#include <mach/msm_smsm.h>
+#include <soc/qcom/smd.h>
+#include <soc/qcom/smsm.h>
+#include <soc/qcom/subsystem_restart.h>
 
 #define MODULE_NAME "msm_smdtty"
 #define MAX_SMD_TTYS 37
 #define MAX_TTY_BUF_SIZE 2048
 #define TTY_PUSH_WS_DELAY 500
+#define TTY_PUSH_WS_POST_SUSPEND_DELAY 100
 #define MAX_RA_WAKE_LOCK_NAME_LEN 32
 #define SMD_TTY_PROBE_WAIT_TIMEOUT 3000
 #define SMD_TTY_LOG_PAGES 2
@@ -62,6 +64,10 @@ static void *smd_tty_log_ctx;
 
 static struct delayed_work smd_tty_probe_work;
 static int smd_tty_probe_done;
+
+static bool smd_tty_in_suspend;
+static bool smd_tty_read_in_suspend;
+static struct wakeup_source read_in_suspend_ws;
 
 /**
  * struct smd_tty_info - context for an individual SMD TTY device
@@ -312,6 +318,9 @@ static void smd_tty_read(unsigned long param)
 		 */
 		__pm_wakeup_event(&info->pending_ws, TTY_PUSH_WS_DELAY);
 
+		if (smd_tty_in_suspend)
+			smd_tty_read_in_suspend = true;
+
 		tty_flip_buffer_push(tty->port);
 	}
 
@@ -445,7 +454,7 @@ static int smd_tty_add_driver(struct smd_tty_info *info)
 
 	mutex_lock(&smd_tty_pfdriver_lock_lha1);
 	list_for_each_entry(item, &smd_tty_pfdriver_list, list) {
-		if (!strcmp(item->driver.driver.name, info->ch_name)) {
+		if (!strcmp(item->driver.driver.name, info->dev_name)) {
 			SMD_TTY_INFO("%s:%s Driver Already reg. cnt:%d\n",
 				__func__, info->ch_name, item->ref_cnt);
 			++item->ref_cnt;
@@ -492,6 +501,7 @@ exit:
 static void smd_tty_remove_driver(struct smd_tty_info *info)
 {
 	struct smd_tty_pfdriver *smd_tty_pfdriverp;
+	bool found_item = false;
 
 	if (!info) {
 		pr_err("%s on a NULL device\n", __func__);
@@ -503,7 +513,8 @@ static void smd_tty_remove_driver(struct smd_tty_info *info)
 	mutex_lock(&smd_tty_pfdriver_lock_lha1);
 	list_for_each_entry(smd_tty_pfdriverp, &smd_tty_pfdriver_list, list) {
 		if (!strcmp(smd_tty_pfdriverp->driver.driver.name,
-					info->ch_name)) {
+					info->dev_name)) {
+			found_item = true;
 			SMD_TTY_INFO("%s:%s Platform driver cnt:%d\n",
 				__func__, info->ch_name,
 				smd_tty_pfdriverp->ref_cnt);
@@ -514,8 +525,11 @@ static void smd_tty_remove_driver(struct smd_tty_info *info)
 			break;
 		}
 	}
+	if (!found_item)
+		SMD_TTY_ERR("%s:%s No item found in list.\n",
+			__func__, info->ch_name);
 
-	if (smd_tty_pfdriverp->ref_cnt == 0) {
+	if (found_item && smd_tty_pfdriverp->ref_cnt == 0) {
 		platform_driver_unregister(&smd_tty_pfdriverp->driver);
 		smd_tty_pfdriverp->driver.probe = NULL;
 		list_del(&smd_tty_pfdriverp->list);
@@ -703,7 +717,7 @@ static int smd_tty_open(struct tty_struct *tty, struct file *f)
 
 static void smd_tty_close(struct tty_struct *tty, struct file *f)
 {
-	struct smd_tty_info *info = tty->driver_data;
+	struct smd_tty_info *info = smd_tty + tty->index;
 
 	tty_port_close(&info->port, tty, f);
 }
@@ -746,6 +760,9 @@ static int smd_tty_write_room(struct tty_struct *tty)
 static int smd_tty_chars_in_buffer(struct tty_struct *tty)
 {
 	struct smd_tty_info *info = tty->driver_data;
+
+	if (!info)
+		return -EINVAL;
 	return smd_read_avail(info->ch);
 }
 
@@ -829,6 +846,31 @@ static const struct tty_operations smd_tty_ops = {
 	.tiocmset = smd_tty_tiocmset,
 };
 
+static int smd_tty_pm_notifier(struct notifier_block *nb,
+				unsigned long event, void *unused)
+{
+	switch (event) {
+	case PM_SUSPEND_PREPARE:
+		smd_tty_read_in_suspend = false;
+		smd_tty_in_suspend = true;
+		break;
+
+	case PM_POST_SUSPEND:
+		smd_tty_in_suspend = false;
+		if (smd_tty_read_in_suspend) {
+			smd_tty_read_in_suspend = false;
+			__pm_wakeup_event(&read_in_suspend_ws,
+					TTY_PUSH_WS_POST_SUSPEND_DELAY);
+		}
+		break;
+	}
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block smd_tty_pm_nb = {
+	.notifier_call = smd_tty_pm_notifier,
+	.priority = 0,
+};
 
 /**
  * smd_tty_log_init()- Init function for IPC logging
@@ -839,7 +881,7 @@ static const struct tty_operations smd_tty_ops = {
 static void smd_tty_log_init(void)
 {
 	smd_tty_log_ctx = ipc_log_context_create(SMD_TTY_LOG_PAGES,
-						"smd_tty");
+						"smd_tty", 0);
 	if (!smd_tty_log_ctx)
 		pr_err("%s: Unable to create IPC log", __func__);
 }
@@ -933,6 +975,11 @@ static int smd_tty_core_init(void)
 		smd_tty_device_init(idx);
 	}
 	INIT_DELAYED_WORK(&loopback_work, loopback_probe_worker);
+
+	ret = register_pm_notifier(&smd_tty_pm_nb);
+	if (ret)
+		pr_err("%s: power state notif error %d\n", __func__, ret);
+
 	return 0;
 }
 
@@ -994,6 +1041,10 @@ static int smd_tty_devicetree_init(struct platform_device *pdev)
 	}
 	INIT_DELAYED_WORK(&loopback_work, loopback_probe_worker);
 
+	ret = register_pm_notifier(&smd_tty_pm_nb);
+	if (ret)
+		pr_err("%s: power state notif error %d\n", __func__, ret);
+
 	return 0;
 
 error:
@@ -1001,12 +1052,18 @@ error:
 	/* Unregister tty platform devices */
 	for_each_child_of_node(pdev->dev.of_node, node) {
 
-		key = "qcom,smdtty-dev-idx";
-		ret = of_property_read_u32(node, key, &idx);
-		if (ret || idx >= MAX_SMD_TTYS)
+		ret = of_alias_get_id(node, "smd");
+		SMD_TTY_INFO("%s:Removing smd%d\n", __func__, ret);
+
+		if (ret < 0 || ret >= MAX_SMD_TTYS)
 			goto out;
-		if (smd_tty[idx].device_ptr)
+		idx = ret;
+
+		if (smd_tty[idx].device_ptr) {
+			device_remove_file(smd_tty[idx].device_ptr,
+						&dev_attr_open_timeout);
 			tty_unregister_device(smd_tty_driver, idx);
+		}
 	}
 out:
 	tty_unregister_driver(smd_tty_driver);
@@ -1075,6 +1132,7 @@ static int __init smd_tty_init(void)
 	schedule_delayed_work(&smd_tty_probe_work,
 				msecs_to_jiffies(SMD_TTY_PROBE_WAIT_TIMEOUT));
 
+	wakeup_source_init(&read_in_suspend_ws, "SMDTTY_READ_IN_SUSPEND");
 	return 0;
 }
 

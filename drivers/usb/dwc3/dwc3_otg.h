@@ -1,7 +1,7 @@
 /**
  * dwc3_otg.h - DesignWare USB3 DRD Controller OTG
  *
- * Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -23,13 +23,19 @@
 #include "power.h"
 
 #define DWC3_IDEV_CHG_MAX 1500
+#define DWC3_HVDCP_CHG_MAX 1800
+
+/*
+ * Module param to override current drawn for DCP charger
+ * Declared in dwc3-msm module
+ */
+extern int dcp_max_current;
 
 struct dwc3_charger;
 
 /**
  * struct dwc3_otg: OTG driver data. Shared by HCD and DCD.
  * @otg: USB OTG Transceiver structure.
- * @irq: IRQ number assigned for HSUSB controller.
  * @regs: ioremapped register base address.
  * @sm_work: OTG state machine work.
  * @charger: DWC3 external charger detector
@@ -37,15 +43,16 @@ struct dwc3_charger;
  */
 struct dwc3_otg {
 	struct usb_otg		otg;
-	int			irq;
 	struct dwc3		*dwc;
 	void __iomem		*regs;
 	struct regulator	*vbus_otg;
+	int			cpe_gpio;
 	struct delayed_work	sm_work;
 	struct dwc3_charger	*charger;
 	struct dwc3_ext_xceiv	*ext_xceiv;
-#define ID		0
-#define B_SESS_VLD	1
+#define ID		 0
+#define B_SESS_VLD	 1
+#define B_SUSPEND	2
 	unsigned long inputs;
 	struct power_supply	*psy;
 	struct completion	dwc3_xcvr_vbus_init;
@@ -93,12 +100,6 @@ struct dwc3_charger {
 /* for external charger driver */
 extern int dwc3_set_charger(struct usb_otg *otg, struct dwc3_charger *charger);
 
-enum dwc3_ext_events {
-	DWC3_EVENT_NONE = 0,		/* no change event */
-	DWC3_EVENT_PHY_RESUME,		/* PHY has come out of LPM */
-	DWC3_EVENT_XCEIV_STATE,		/* XCEIV state (id/bsv) has changed */
-};
-
 enum dwc3_id_state {
 	DWC3_ID_GROUND = 0,
 	DWC3_ID_FLOAT,
@@ -108,11 +109,10 @@ enum dwc3_id_state {
 struct dwc3_ext_xceiv {
 	enum dwc3_id_state	id;
 	bool			bsv;
-	bool			otg_capability;
+	bool			suspend;
 
 	/* to notify OTG about LPM exit event, provided by OTG */
-	void	(*notify_ext_events)(struct usb_otg *otg,
-					enum dwc3_ext_events ext_event);
+	void	(*notify_ext_events)(struct usb_otg *otg);
 	/* for block reset USB core */
 	void	(*ext_block_reset)(struct dwc3_ext_xceiv *ext_xceiv,
 					bool core_reset);
@@ -121,5 +121,4 @@ struct dwc3_ext_xceiv {
 /* for external transceiver driver */
 extern int dwc3_set_ext_xceiv(struct usb_otg *otg,
 				struct dwc3_ext_xceiv *ext_xceiv);
-
 #endif /* __LINUX_USB_DWC3_OTG_H */

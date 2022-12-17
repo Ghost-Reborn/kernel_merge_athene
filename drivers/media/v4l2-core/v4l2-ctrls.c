@@ -364,6 +364,7 @@ const char * const *v4l2_ctrl_get_menu(u32 id)
 		"Scalable Baseline",
 		"Scalable High",
 		"Scalable High Intra",
+		"Stereo High",
 		"Multiview High",
 		"Constrained High",
 		NULL,
@@ -750,6 +751,9 @@ const char *v4l2_ctrl_get_name(u32 id)
 		return "Deinterlace for encoder";
 	case V4L2_CID_MPEG_VIDC_VIDEO_MPEG4_TIME_RESOLUTION:
 		return "Vop time increment resolution";
+	case V4L2_CID_MPEG_VIDC_VIDEO_HEVC_PROFILE:	return "HEVC Profile";
+	case V4L2_CID_MPEG_VIDC_VIDEO_HEVC_TIER_LEVEL:
+		return "HEVC Tier and Level";
 
 	/* CAMERA controls */
 	/* Keep the order of the 'case's the same as in videodev2.h! */

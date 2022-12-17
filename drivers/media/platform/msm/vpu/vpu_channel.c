@@ -27,7 +27,7 @@
 #include <linux/gfp.h>
 #include <linux/regulator/consumer.h>
 #include <soc/qcom/scm.h>
-#include <mach/rpm-smd.h>
+#include <soc/qcom/rpm-smd.h>
 
 #include <uapi/media/msm_vpu.h>
 #include "vpu_hfi.h"
@@ -38,6 +38,13 @@
 #include "vpu_channel.h"
 #include "vpu_translate.h"
 #include "vpu_debug.h"
+
+#define VPU_SHUTDOWN_DEFAULT_DELAY_MS	1000
+#define VPU_IPC_DEFAULT_TIMEOUT_MS	1000
+#define VPU_LONG_TIMEOUT_MS		10000000
+
+u32 vpu_shutdown_delay = VPU_SHUTDOWN_DEFAULT_DELAY_MS;
+u32 vpu_ipc_timeout = VPU_IPC_DEFAULT_TIMEOUT_MS;
 
 #define MAX_CHANNELS		VPU_CHANNEL_ID_MAX
 #define SYSTEM_SESSION_ID	((u32)-1)
@@ -134,6 +141,9 @@ struct vpu_channel_hal {
 	void *clk_handle;
 	struct regulator *vdd;
 	bool vdd_enabled; /* if VDD is enabled */
+	bool rpm_vote; /* If VPU high power vote was sent to RPM */
+	/* internally cached value for current fw logging level */
+	int fw_log_level;
 };
 
 static struct vpu_channel_hal g_vpu_ch_hal;
@@ -419,12 +429,17 @@ static void on_buffer_done(struct vpu_channel_hal *phal,
 				if ((i < packet->num_out_buf) &&
 						(phdr->status == 0)) {
 
-					/* store EOS info if present */
+					/* store buffer flags info */
 					if (pinfo->flag & BUFFER_PKT_FLAG_EOS) {
 						pr_debug("out EOS buf #%d\n",
 							vb->vb.v4l2_buf.index);
 						vb->vb.v4l2_buf.flags |=
 							V4L2_QCOM_BUF_FLAG_EOS;
+					}
+					if (pinfo->flag &
+						BUFFER_PKT_FLAG_CDS_ENABLE) {
+						vb->vb.v4l2_buf.flags |=
+						V4L2_BUF_FLAG_CDS_ENABLE;
 					}
 
 					vb->vb.v4l2_buf.timestamp.tv_sec =
@@ -810,13 +825,19 @@ static int ipc_cmd_sync_wait(struct vpu_sync_transact *ptrans, u32 timeout_ms,
 		} else {
 			/* local error */
 			rc = ptrans->status;
+			pr_err("Local IPC err %d\n", rc);
 		}
 	} else if (rc == 0) {
 		/* timeout */
 		char dbg_buf[320];
 		size_t dbg_buf_size = 320;
+
 		pr_err("Timeout for transact 0x%08x\n",
-				ptrans->seq << TRANS_SEQ_SHIFT | ptrans->id);
+			ptrans->seq << TRANS_SEQ_SHIFT | ptrans->id);
+
+		/* service log queue on timeout */
+		vpu_wakeup_fw_logging_wq();
+
 		strlcpy(dbg_buf, "", dbg_buf_size);
 		/* cid represents Tx & Rx queues index) */
 		vpu_hfi_dump_queue_headers(cid, dbg_buf, dbg_buf_size);
@@ -963,7 +984,7 @@ void vpu_hw_session_close(u32 sid)
  * sid must be valid
  */
 static int ipc_cmd_set_session_prop(u32 sid, u32 prop_id,
-				void *extra, u32 extra_size)
+		u32 port_id, void *extra, u32 extra_size)
 {
 	struct vpu_ipc_cmd_session_set_property_packet packet;
 	int cid = SID2CID(sid);
@@ -975,6 +996,7 @@ static int ipc_cmd_set_session_prop(u32 sid, u32 prop_id,
 	packet.hdr.flags = 0; /* no ack */
 	packet.hdr.trans_id = 0; /* no sync */
 	packet.hdr.sid = sid;
+	packet.hdr.port_id = port_id;
 
 	packet.prop_id = prop_id;
 	packet.data_offset = sizeof(packet);
@@ -1001,7 +1023,7 @@ static int ipc_cmd_set_session_prop(u32 sid, u32 prop_id,
  * Return: 0 on success, -ve on failure
  */
 static int ipc_cmd_sync_get_session_prop(u32 sid, u32 prop_id,
-		u8 *rxd, u32 rxd_size)
+		u32 port_id, u8 *rxd, u32 rxd_size)
 {
 	struct vpu_ipc_cmd_session_get_property_packet packet;
 	struct vpu_sync_transact *ptrans;
@@ -1012,6 +1034,7 @@ static int ipc_cmd_sync_get_session_prop(u32 sid, u32 prop_id,
 	packet.hdr.size = sizeof(packet);
 	packet.hdr.cmd_id = VPU_IPC_CMD_SESSION_GET_PROPERTY;
 	packet.hdr.sid = sid;
+	packet.hdr.port_id = port_id;
 
 	packet.prop_id = prop_id;
 	packet.data_offset = 0;
@@ -1148,7 +1171,7 @@ int vpu_hw_session_pause(u32 sid)
 	packet.hdr.sid = sid;
 
 	pr_debug("IPC Tx%d: CMD_SESSION_PAUSE\n", cid);
-	rc = ipc_cmd_simple(cid, &packet.hdr, false, vpu_ipc_timeout/2);
+	rc = ipc_cmd_simple(cid, &packet.hdr, false, vpu_ipc_timeout);
 
 	return rc;
 }
@@ -1170,12 +1193,12 @@ int vpu_hw_session_resume(u32 sid)
 	packet.hdr.sid = sid;
 
 	pr_debug("IPC Tx%d: CMD_SESSION_START\n", cid);
-	rc = ipc_cmd_simple(cid, &packet.hdr, false, vpu_ipc_timeout/2);
+	rc = ipc_cmd_simple(cid, &packet.hdr, false, vpu_ipc_timeout);
 
 	return rc;
 }
 
-int vpu_hw_session_flush(u32 sid, enum flush_buf_type type)
+int vpu_hw_session_flush(u32 sid, u32 port_id, enum flush_buf_type type)
 {
 	int rc;
 	struct vpu_ipc_cmd_session_flush_packet packet;
@@ -1190,6 +1213,7 @@ int vpu_hw_session_flush(u32 sid, enum flush_buf_type type)
 	packet.hdr.size = sizeof(packet);
 	packet.hdr.cmd_id = VPU_IPC_CMD_SESSION_FLUSH;
 	packet.hdr.sid = sid;
+	packet.hdr.port_id = port_id;
 
 	packet.flush_type = type;
 
@@ -1199,7 +1223,8 @@ int vpu_hw_session_flush(u32 sid, enum flush_buf_type type)
 	return rc;
 }
 
-int vpu_hw_session_release_buffers(u32 sid, enum release_buf_type release_type)
+int vpu_hw_session_release_buffers(u32 sid, u32 port_id,
+		enum release_buf_type release_type)
 {
 	int rc;
 	struct vpu_ipc_cmd_session_release_buffers_packet packet;
@@ -1215,6 +1240,7 @@ int vpu_hw_session_release_buffers(u32 sid, enum release_buf_type release_type)
 	packet.hdr.size = sizeof(packet);
 	packet.hdr.cmd_id = VPU_IPC_CMD_SESSION_RELEASE_BUFFERS;
 	packet.hdr.sid = sid;
+	packet.hdr.port_id = port_id;
 
 	switch (release_type) {
 	case CH_RELEASE_IN_BUF:
@@ -1291,6 +1317,13 @@ static void vpu_buf_to_ipc_buf_info(struct vpu_buffer *vb, bool input,
 			pr_debug("in EOS buf #%d\n", vb->vb.v4l2_buf.index);
 			flag |= BUFFER_PKT_FLAG_EOS;
 		}
+
+		/* set chroma downsample bit if present */
+		if (vb->vb.v4l2_buf.flags & V4L2_BUF_FLAG_CDS_ENABLE) {
+			pr_debug("in CDS enable buf #%d\n",
+					vb->vb.v4l2_buf.index);
+			flag |= BUFFER_PKT_FLAG_CDS_ENABLE;
+		}
 	}
 
 	/* VPU address must always be present, callers of this func to check */
@@ -1343,8 +1376,8 @@ static void vpu_buf_to_ipc_buf_info(struct vpu_buffer *vb, bool input,
 		*pktflag = flag;
 }
 
-int vpu_hw_session_register_buffers(u32 sid, bool input,
-				struct vpu_buffer *vb, u32 num)
+int vpu_hw_session_register_buffers(u32 sid, u32 port_id,
+		struct vpu_buffer *vb, u32 num)
 {
 	int rc;
 	int i;
@@ -1353,6 +1386,7 @@ int vpu_hw_session_register_buffers(u32 sid, bool input,
 	u8 extra_info[MAX_BUFFER_NUM * sizeof(struct _ipc_buffer_info_ext)];
 	struct _ipc_buffer_info_ext *pbuf_info_ext;
 	int cid = SID2CID(sid);
+	bool input = (port_id == VPU_IPC_PORT_INPUT) ? true : false;
 
 	if (unlikely(!vb)) {
 		pr_err("Null pointer vb\n");
@@ -1386,6 +1420,7 @@ int vpu_hw_session_register_buffers(u32 sid, bool input,
 	buffer_packet.hdr.flags = 0; /* no ack */
 	buffer_packet.hdr.trans_id = 0; /* no sync */
 	buffer_packet.hdr.sid = sid;
+	buffer_packet.hdr.port_id = port_id;
 
 	if (input) {
 		buffer_packet.num_in_buf = num;
@@ -1429,7 +1464,7 @@ int vpu_hw_session_register_buffers(u32 sid, bool input,
  * vpu_hw_session_fill_buffer
  * to queue an empty output buffer
  */
-int vpu_hw_session_fill_buffer(u32 sid, struct vpu_buffer *vb)
+int vpu_hw_session_fill_buffer(u32 sid, u32 port_id, struct vpu_buffer *vb)
 {
 	int rc;
 	struct vpu_ipc_cmd_session_buffers_packet buffer_packet;
@@ -1459,6 +1494,7 @@ int vpu_hw_session_fill_buffer(u32 sid, struct vpu_buffer *vb)
 	buffer_packet.hdr.flags = 0; /* no ack */
 	buffer_packet.hdr.trans_id = 0; /* no sync */
 	buffer_packet.hdr.sid = sid;
+	buffer_packet.hdr.port_id = port_id;
 
 	buffer_packet.num_out_buf = 1;
 	buffer_packet.num_in_buf = 0;
@@ -1482,7 +1518,7 @@ int vpu_hw_session_fill_buffer(u32 sid, struct vpu_buffer *vb)
 	return rc;
 }
 
-int vpu_hw_session_empty_buffer(u32 sid, struct vpu_buffer *vb)
+int vpu_hw_session_empty_buffer(u32 sid, u32 port_id, struct vpu_buffer *vb)
 {
 	int rc;
 	struct vpu_ipc_cmd_session_buffers_packet buffer_packet;
@@ -1512,6 +1548,7 @@ int vpu_hw_session_empty_buffer(u32 sid, struct vpu_buffer *vb)
 	buffer_packet.hdr.flags = 0; /* no ack */
 	buffer_packet.hdr.trans_id = 0; /* no sync */
 	buffer_packet.hdr.sid = sid;
+	buffer_packet.hdr.port_id = port_id;
 
 	buffer_packet.num_out_buf = 0;
 	buffer_packet.num_in_buf = 1;
@@ -1536,7 +1573,10 @@ int vpu_hw_session_empty_buffer(u32 sid, struct vpu_buffer *vb)
 	return rc;
 }
 
-int vpu_hw_session_commit(u32 sid, enum commit_type ct, u32 load)
+static void inform_rpm_vpu_state(u32 on);
+
+int vpu_hw_session_commit(u32 sid, enum commit_type ct,
+			  u32 load_kbps, u32 pwr_mode)
 {
 	int rc;
 	u32 ipc_ct;
@@ -1559,10 +1599,22 @@ int vpu_hw_session_commit(u32 sid, enum commit_type ct, u32 load)
 	}
 
 	mutex_lock(&hal->pw_lock);
-	rc = vpu_clock_scale(hal->clk_handle, load);
-	mutex_unlock(&hal->pw_lock);
-	if (rc)
+
+	if (pwr_mode == VPU_POWER_SVS && hal->rpm_vote) {
+		inform_rpm_vpu_state(0);
+		hal->rpm_vote = false;
+	} else if (pwr_mode > VPU_POWER_SVS && !hal->rpm_vote) {
+		inform_rpm_vpu_state(1);
+		hal->rpm_vote = true;
+	}
+
+	if (vpu_clock_scale(hal->clk_handle, pwr_mode))
 		pr_err("clock scale failed\n");
+
+	if (vpu_bus_scale(load_kbps))
+		pr_err("bus scale failed\n");
+
+	mutex_unlock(&hal->pw_lock);
 
 	/* send the configuration commit through IPC */
 	rc = ipc_cmd_config_session_commit(sid, ipc_ct);
@@ -1571,7 +1623,7 @@ int vpu_hw_session_commit(u32 sid, enum commit_type ct, u32 load)
 	return rc;
 }
 
-int vpu_hw_session_s_input_params(u32 sid,
+int vpu_hw_session_s_input_params(u32 sid, u32 port_id,
 		const struct vpu_prop_session_input *inparam)
 {
 	int cid = SID2CID(sid);
@@ -1581,11 +1633,11 @@ int vpu_hw_session_s_input_params(u32 sid,
 		return -EINVAL;
 	}
 
-	return ipc_cmd_set_session_prop(sid, VPU_PROP_SESSION_INPUT,
+	return ipc_cmd_set_session_prop(sid, VPU_PROP_SESSION_INPUT, port_id,
 				(void *)inparam, sizeof(*inparam));
 }
 
-int vpu_hw_session_s_output_params(u32 sid,
+int vpu_hw_session_s_output_params(u32 sid, u32 port_id,
 		const struct vpu_prop_session_output *outparam)
 {
 	int cid = SID2CID(sid);
@@ -1595,11 +1647,12 @@ int vpu_hw_session_s_output_params(u32 sid,
 		return -EINVAL;
 	}
 
-	return ipc_cmd_set_session_prop(sid, VPU_PROP_SESSION_OUTPUT,
+	return ipc_cmd_set_session_prop(sid, VPU_PROP_SESSION_OUTPUT, port_id,
 				(void *)outparam, sizeof(*outparam));
 }
 
-int vpu_hw_session_g_input_params(u32 sid, struct vpu_prop_session_input *inp)
+int vpu_hw_session_g_input_params(u32 sid, u32 port_id,
+		struct vpu_prop_session_input *inp)
 {
 	int rc;
 	int cid = SID2CID(sid);
@@ -1611,7 +1664,7 @@ int vpu_hw_session_g_input_params(u32 sid, struct vpu_prop_session_input *inp)
 
 	/* send the synchronous command (blocking call) */
 	rc = ipc_cmd_sync_get_session_prop(sid, VPU_PROP_SESSION_INPUT,
-			(u8 *)inp, sizeof(*inp));
+			port_id, (u8 *)inp, sizeof(*inp));
 	if (unlikely(rc))
 		pr_err("Error while getting input param property\n");
 
@@ -1619,8 +1672,8 @@ int vpu_hw_session_g_input_params(u32 sid, struct vpu_prop_session_input *inp)
 	return rc;
 }
 
-int vpu_hw_session_g_output_params(u32 sid,
-			struct vpu_prop_session_output *outp)
+int vpu_hw_session_g_output_params(u32 sid, u32 port_id,
+		struct vpu_prop_session_output *outp)
 {
 	int rc;
 	int cid = SID2CID(sid);
@@ -1632,7 +1685,7 @@ int vpu_hw_session_g_output_params(u32 sid,
 
 	/* send the synchronous command (blocking call) */
 	rc = ipc_cmd_sync_get_session_prop(sid, VPU_PROP_SESSION_OUTPUT,
-			(u8 *)outp, sizeof(*outp));
+			port_id, (u8 *)outp, sizeof(*outp));
 	if (unlikely(rc))
 		pr_err("Error while getting output param property\n");
 
@@ -1656,8 +1709,8 @@ int vpu_hw_session_nr_buffer_config(u32 sid, u32 in_addr, u32 out_addr)
 	nr_conf_pkt.release_flag = false;
 
 	return ipc_cmd_set_session_prop(sid,
-			VPU_PROP_SESSION_NOISE_REDUCTION_CONFIG,
-			(void *)&nr_conf_pkt, sizeof(nr_conf_pkt));
+		VPU_PROP_SESSION_NOISE_REDUCTION_CONFIG, VPU_IPC_PORT_UNUSED,
+		(void *)&nr_conf_pkt, sizeof(nr_conf_pkt));
 }
 
 int vpu_hw_session_nr_buffer_release(u32 sid)
@@ -1676,8 +1729,8 @@ int vpu_hw_session_nr_buffer_release(u32 sid)
 	nr_conf_pkt.release_flag = true;
 
 	return ipc_cmd_set_session_prop(sid,
-			VPU_PROP_SESSION_NOISE_REDUCTION_CONFIG,
-			(void *)&nr_conf_pkt, sizeof(nr_conf_pkt));
+		VPU_PROP_SESSION_NOISE_REDUCTION_CONFIG, VPU_IPC_PORT_UNUSED,
+		(void *)&nr_conf_pkt, sizeof(nr_conf_pkt));
 }
 
 int vpu_hw_session_s_property(u32 sid, u32 prop_id, void *data, u32 data_size)
@@ -1691,7 +1744,8 @@ int vpu_hw_session_s_property(u32 sid, u32 prop_id, void *data, u32 data_size)
 	}
 
 	/* Send the command for the current property, asynchronously */
-	return ipc_cmd_set_session_prop(sid, prop_id, data, data_size);
+	return ipc_cmd_set_session_prop(sid, prop_id, VPU_IPC_PORT_UNUSED,
+			data, data_size);
 }
 
 int vpu_hw_session_g_property(u32 sid, u32 prop_id, void *data, u32 data_size)
@@ -1704,7 +1758,8 @@ int vpu_hw_session_g_property(u32 sid, u32 prop_id, void *data, u32 data_size)
 		return -EINVAL;
 	}
 
-	return ipc_cmd_sync_get_session_prop(sid, prop_id, data, data_size);
+	return ipc_cmd_sync_get_session_prop(sid, prop_id, VPU_IPC_PORT_UNUSED,
+			data, data_size);
 }
 
 int vpu_hw_session_s_property_ext(u32 sid,
@@ -1795,19 +1850,6 @@ int vpu_hw_session_cmd_ext(u32 sid, u32 cmd,
 	return rc;
 }
 
-int vpu_hw_dump_csr_regs(char *buf, size_t buf_size)
-{
-	int rc = 0;
-	struct vpu_channel_hal *ch_hal = &g_vpu_ch_hal;
-
-	mutex_lock(&ch_hal->pw_lock);
-	if (VPU_IS_UP(ch_hal->mode))
-		rc = vpu_hfi_dump_csr_regs(buf, buf_size);
-	mutex_unlock(&ch_hal->pw_lock);
-
-	return rc;
-}
-
 static inline void raw_init_channel(struct vpu_channel *ch, u32 cid)
 {
 	mutex_init(&ch->chlock);
@@ -1833,6 +1875,9 @@ int vpu_hw_sys_init(struct vpu_platform_resources *res)
 
 	/* powered off initially */
 	ch_hal->mode = VPU_OFF;
+
+	/* fw logging off initially */
+	ch_hal->fw_log_level = VPU_LOGGING_ERROR;
 
 	/* init each channel (system, sessions, logging) */
 	for (i = 0; i < MAX_CHANNELS; i++)
@@ -1927,9 +1972,6 @@ static int vpu_hw_power_on(struct vpu_channel_hal *hal)
 {
 	int rc;
 
-	/* inform RPM VPU state is ON */
-	inform_rpm_vpu_state(1);
-
 	/* enable the power */
 	if (!hal->vdd_enabled) {
 		rc = regulator_enable(hal->vdd);
@@ -1961,7 +2003,6 @@ err_bus:
 	regulator_disable(hal->vdd);
 	hal->vdd_enabled = false;
 err_power:
-	inform_rpm_vpu_state(0);
 	return rc;
 }
 
@@ -1978,7 +2019,10 @@ static void vpu_hw_power_off(struct vpu_channel_hal *hal)
 		hal->vdd_enabled = false;
 	}
 
-	inform_rpm_vpu_state(0);
+	if (hal->rpm_vote) {
+		inform_rpm_vpu_state(0);
+		hal->rpm_vote = false;
+	}
 }
 
 int vpu_hw_sys_suspend(void)
@@ -2051,6 +2095,12 @@ static void vpu_boot_work_handler(struct work_struct *work)
 		goto powerup_fail;
 	}
 
+	rc = attach_vpu_iommus(ch_hal->res_orig);
+	if (rc) {
+		pr_err("could not attach VPU IOMMUs\n");
+		goto err_iommu_attach;
+	}
+
 	/* boot up VPU and set callback */
 	rc = vpu_hfi_start(chan_handle_msg, chan_handle_event);
 	if (unlikely(rc)) {
@@ -2059,12 +2109,19 @@ static void vpu_boot_work_handler(struct work_struct *work)
 	}
 
 	ch_hal->mode = VPU_ON;
+
+	/* configure firmware logging level on boot up
+	 * in order to avoid missing any logs while starting up.
+	 */
+	vpu_hw_sys_set_log_level(ch_hal->fw_log_level);
+
 	mutex_unlock(&ch_hal->pw_lock);
 	return;
 
 err_hfi_start:
+	detach_vpu_iommus(ch_hal->res_orig);
+err_iommu_attach:
 	vpu_hw_power_off(ch_hal);
-
 powerup_fail:
 	mutex_unlock(&ch_hal->pw_lock);
 
@@ -2142,6 +2199,7 @@ static void vpu_shutdown_work_handler(struct work_struct *work)
 	mutex_lock(&ch_hal->pw_lock);
 
 	vpu_hfi_stop();
+	detach_vpu_iommus(ch_hal->res_orig);
 	vpu_hw_power_off(ch_hal);
 
 	/* disable HFI system and logging channels */
@@ -2398,6 +2456,73 @@ int vpu_hw_sys_g_property_ext(void __user *data, u32 data_size,
 	return rc;
 }
 
+#ifdef CONFIG_DEBUG_FS
+
+void vpu_hw_debug_on(void)
+{
+	/* make the timeout very long */
+	vpu_ipc_timeout = VPU_LONG_TIMEOUT_MS;
+	vpu_hfi_set_pil_timeout(VPU_LONG_TIMEOUT_MS);
+	vpu_hfi_set_watchdog(0);
+}
+
+void vpu_hw_debug_off(void)
+{
+	/* enable timeouts */
+	vpu_ipc_timeout = VPU_IPC_DEFAULT_TIMEOUT_MS;
+	vpu_hfi_set_pil_timeout(VPU_PIL_DEFAULT_TIMEOUT_MS);
+	vpu_hfi_set_watchdog(1);
+}
+
+size_t vpu_hw_print_queues(char *buf, size_t buf_size)
+{
+	return vpu_hfi_print_queues(buf, buf_size);
+}
+
+int vpu_hw_write_csr_reg(u32 off, u32 val)
+{
+	int rc;
+	struct vpu_channel_hal *ch_hal = &g_vpu_ch_hal;
+
+	if (VPU_IS_UP(ch_hal->mode))
+		rc = vpu_hfi_write_csr_reg(off, val);
+	else
+		rc = -EIO; /* firmware down */
+
+	return rc;
+}
+
+int vpu_hw_dump_csr_regs(char *buf, size_t buf_size)
+{
+	int rc = 0;
+	struct vpu_channel_hal *ch_hal = &g_vpu_ch_hal;
+
+	mutex_lock(&ch_hal->pw_lock);
+
+	if (VPU_IS_UP(ch_hal->mode))
+		rc = vpu_hfi_dump_csr_regs(buf, buf_size);
+
+	mutex_unlock(&ch_hal->pw_lock);
+
+	return rc;
+}
+
+int vpu_hw_dump_csr_regs_no_lock(char *buf, size_t buf_size)
+{
+	int rc = 0;
+	struct vpu_channel_hal *ch_hal = &g_vpu_ch_hal;
+
+	if (VPU_IS_UP(ch_hal->mode))
+		rc = vpu_hfi_dump_csr_regs(buf, buf_size);
+
+	return rc;
+}
+
+int vpu_hw_dump_smem_line(char *buf, size_t size, u32 offset)
+{
+	return vpu_hfi_dump_smem_line(buf, size, offset);
+}
+
 int vpu_hw_sys_print_log(char __user *user_buf, char *fmt_buf,
 		int buf_size)
 {
@@ -2459,6 +2584,36 @@ int vpu_hw_sys_print_log(char __user *user_buf, char *fmt_buf,
 	return total_size;
 }
 
+int vpu_hw_sys_set_log_level(int log_level)
+{
+	int ret = 0;
+	struct vpu_prop_sys_log_ctrl log_ctrl;
+	struct vpu_channel_hal *ch_hal = &g_vpu_ch_hal;
+
+	if (VPU_IS_UP(ch_hal->mode)) {
+		log_ctrl.component = LOG_COMPONENT_FW;
+		log_ctrl.log_level = log_level;
+		ret = vpu_hw_sys_s_property(VPU_PROP_SYS_LOG_CTRL, &log_ctrl,
+				sizeof(log_ctrl));
+		if (ret) {
+			pr_err("Error setting fw log level (err=%d)\n", ret);
+			return ret;
+		}
+	}
+	/* If firmware not up yet,
+	 * cached value for log level will be sent on boot up.
+	 */
+	ch_hal->fw_log_level = log_level;
+	return ret;
+}
+
+int vpu_hw_sys_get_log_level(void)
+{
+	struct vpu_channel_hal *ch_hal = &g_vpu_ch_hal;
+
+	return ch_hal->fw_log_level;
+}
+
 void vpu_hw_sys_set_power_mode(u32 mode)
 {
 	struct vpu_channel_hal *ch_hal = &g_vpu_ch_hal;
@@ -2482,3 +2637,4 @@ u32 vpu_hw_sys_get_power_mode(void)
 	return mode;
 }
 
+#endif /* CONFIG_DEBUG_FS */

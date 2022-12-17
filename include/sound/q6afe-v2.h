@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2016, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -12,6 +12,7 @@
 #ifndef __Q6AFE_V2_H__
 #define __Q6AFE_V2_H__
 #include <sound/apr_audio-v2.h>
+#include <linux/qdsp6v2/rtac.h>
 
 #define IN			0x000
 #define OUT			0x001
@@ -37,7 +38,6 @@
 #define RT_PROXY_DAI_002_RX	0xF1
 #define RT_PROXY_DAI_002_TX	0xE1
 #define VIRTUAL_ID_TO_PORTID(val) ((val & 0xF) | 0x2000)
-
 enum {
 	IDX_PRIMARY_I2S_RX = 0,
 	IDX_PRIMARY_I2S_TX = 1,
@@ -89,6 +89,10 @@ enum {
 	IDX_SPDIF_RX = 47,
 	IDX_GLOBAL_CFG,
 	IDX_AUDIO_PORT_ID_I2S_RX,
+	IDX_AFE_PORT_ID_SECONDARY_MI2S_RX_SD1,
+	IDX_AFE_PORT_ID_QUINARY_MI2S_RX = 51,
+	IDX_AFE_PORT_ID_QUINARY_MI2S_TX = 52,
+	IDX_AFE_PORT_ID_SENARY_MI2S_TX = 53,
 	AFE_MAX_PORTS
 };
 
@@ -96,7 +100,13 @@ enum afe_mad_type {
 	MAD_HW_NONE = 0x00,
 	MAD_HW_AUDIO = 0x01,
 	MAD_HW_BEACON = 0x02,
-	MAD_HW_ULTRASOUND = 0x04
+	MAD_HW_ULTRASOUND = 0x04,
+	MAD_SW_AUDIO = 0x05,
+};
+
+enum afe_cal_mode {
+	AFE_CAL_MODE_DEFAULT = 0x00,
+	AFE_CAL_MODE_NONE,
 };
 
 struct afe_audio_buffer {
@@ -152,10 +162,11 @@ int afe_get_port_index(u16 port_id);
 int afe_start_pseudo_port(u16 port_id);
 int afe_stop_pseudo_port(u16 port_id);
 uint32_t afe_req_mmap_handle(struct afe_audio_client *ac);
-int afe_unmap_cal_blocks(void);
-int afe_memory_map(u32 dma_addr_p, u32 dma_buf_sz, struct afe_audio_client *ac);
-int afe_cmd_memory_map(u32 dma_addr_p, u32 dma_buf_sz);
-int afe_cmd_memory_map_nowait(int port_id, u32 dma_addr_p, u32 dma_buf_sz);
+int afe_memory_map(phys_addr_t dma_addr_p, u32 dma_buf_sz,
+		struct afe_audio_client *ac);
+int afe_cmd_memory_map(phys_addr_t dma_addr_p, u32 dma_buf_sz);
+int afe_cmd_memory_map_nowait(int port_id, phys_addr_t dma_addr_p,
+			u32 dma_buf_sz);
 int afe_cmd_memory_unmap(u32 dma_addr_p);
 int afe_cmd_memory_unmap_nowait(u32 dma_addr_p);
 void afe_set_dtmf_gen_rx_portid(u16 rx_port_id, int set);
@@ -167,8 +178,11 @@ int afe_register_get_events(u16 port_id,
 		uint32_t token, uint32_t *payload, void *priv),
 		void *private_data);
 int afe_unregister_get_events(u16 port_id);
-int afe_rt_proxy_port_write(u32 buf_addr_p, u32 mem_map_handle, int bytes);
-int afe_rt_proxy_port_read(u32 buf_addr_p, u32 mem_map_handle, int bytes);
+int afe_rt_proxy_port_write(phys_addr_t buf_addr_p,
+			u32 mem_map_handle, int bytes);
+int afe_rt_proxy_port_read(phys_addr_t buf_addr_p,
+			u32 mem_map_handle, int bytes);
+void afe_set_cal_mode(u16 port_id, enum afe_cal_mode afe_cal_mode);
 int afe_port_start(u16 port_id, union afe_port_config *afe_config,
 	u32 rate);
 int afe_spk_prot_feed_back_cfg(int src_port, int dst_port,
@@ -194,8 +208,13 @@ int afe_convert_virtual_to_portid(u16 port_id);
 int afe_pseudo_port_start_nowait(u16 port_id);
 int afe_pseudo_port_stop_nowait(u16 port_id);
 int afe_set_lpass_clock(u16 port_id, struct afe_clk_cfg *cfg);
+int afe_set_lpass_clock_v2(u16 port_id, struct afe_clk_set *cfg);
+int afe_set_digital_codec_core_clock(u16 port_id,
+			struct afe_digital_clk_cfg *cfg);
 int afe_set_lpass_internal_digital_codec_clock(u16 port_id,
 				struct afe_digital_clk_cfg *cfg);
+int afe_enable_lpass_core_shared_clock(u16 port_id, u32 enable);
+
 int q6afe_check_osr_clk_freq(u32 freq);
 
 int afe_send_spdif_clk_cfg(struct afe_param_id_spdif_clk_cfg *cfg,
@@ -215,4 +234,14 @@ void afe_clear_config(enum afe_config_type config);
 bool afe_has_config(enum afe_config_type config);
 
 void afe_set_aanc_info(struct aanc_data *aanc_info);
+int afe_port_group_set_param(u16 *port_id, int channel_count);
+int afe_port_group_enable(u16 enable);
+int afe_unmap_rtac_block(uint32_t *mem_map_handle);
+int afe_map_rtac_block(struct rtac_cal_block_data *cal_block);
+
+#ifdef CONFIG_SND_SOC_OPALUM
+int ospl2xx_afe_set_callback(int32_t (*ospl2xx_callback_func)
+				(struct apr_client_data *data));
+int ospl2xx_afe_apr_send_pkt(void *data, int index);
+#endif
 #endif /* __Q6AFE_V2_H__ */

@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2011-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -25,12 +25,16 @@
 #include <linux/of_irq.h>
 #include <linux/slab.h>
 #include <linux/ratelimit.h>
-#include <mach/cpuidle.h>
+#include <soc/qcom/pm.h>
 
 #define BYTE_BIT_MASK(nr)		(1UL << ((nr) % BITS_PER_BYTE))
 #define BIT_BYTE(nr)			((nr) / BITS_PER_BYTE)
 
 #define WCD9XXX_SYSTEM_RESUME_TIMEOUT_MS 100
+
+#ifndef NO_IRQ
+#define NO_IRQ	(-1)
+#endif
 
 #ifdef CONFIG_OF
 struct wcd9xxx_irq_drv_data {
@@ -86,8 +90,8 @@ static void wcd9xxx_irq_sync_unlock(struct irq_data *data)
 			wcd9xxx_res->irq_masks_cache[i] =
 					wcd9xxx_res->irq_masks_cur[i];
 			wcd9xxx_res->codec_reg_write(wcd9xxx_res,
-					  WCD9XXX_A_INTR_MASK0 + i,
-					  wcd9xxx_res->irq_masks_cur[i]);
+			wcd9xxx_res->intr_reg[WCD9XXX_INTR_MASK_BASE] + i,
+			wcd9xxx_res->irq_masks_cur[i]);
 		}
 	}
 
@@ -99,8 +103,15 @@ static void wcd9xxx_irq_enable(struct irq_data *data)
 	struct wcd9xxx_core_resource *wcd9xxx_res =
 			irq_data_get_irq_chip_data(data);
 	int wcd9xxx_irq = virq_to_phyirq(wcd9xxx_res, data->irq);
-	wcd9xxx_res->irq_masks_cur[BIT_BYTE(wcd9xxx_irq)] &=
-		~(BYTE_BIT_MASK(wcd9xxx_irq));
+	int byte = BIT_BYTE(wcd9xxx_irq);
+	int size = ARRAY_SIZE(wcd9xxx_res->irq_masks_cur);
+	if ((byte < size) && (byte >= 0)) {
+		wcd9xxx_res->irq_masks_cur[byte] &=
+			~(BYTE_BIT_MASK(wcd9xxx_irq));
+	} else {
+		pr_err("%s: Array size is %d but index is %d: Out of range\n",
+			__func__, size, byte);
+	}
 }
 
 static void wcd9xxx_irq_disable(struct irq_data *data)
@@ -108,8 +119,30 @@ static void wcd9xxx_irq_disable(struct irq_data *data)
 	struct wcd9xxx_core_resource *wcd9xxx_res =
 			irq_data_get_irq_chip_data(data);
 	int wcd9xxx_irq = virq_to_phyirq(wcd9xxx_res, data->irq);
-	wcd9xxx_res->irq_masks_cur[BIT_BYTE(wcd9xxx_irq)]
-		|= BYTE_BIT_MASK(wcd9xxx_irq);
+	int byte = BIT_BYTE(wcd9xxx_irq);
+	int size = ARRAY_SIZE(wcd9xxx_res->irq_masks_cur);
+	if ((byte < size) && (byte >= 0)) {
+		wcd9xxx_res->irq_masks_cur[byte]
+			|= BYTE_BIT_MASK(wcd9xxx_irq);
+	} else {
+		pr_err("%s: Array size is %d but index is %d: Out of range\n",
+			__func__, size, byte);
+	}
+}
+
+static void wcd9xxx_irq_ack(struct irq_data *data)
+{
+	int wcd9xxx_irq = 0;
+	struct wcd9xxx_core_resource *wcd9xxx_res =
+			irq_data_get_irq_chip_data(data);
+
+	if (wcd9xxx_res == NULL) {
+		pr_err("%s: wcd9xxx_res is NULL\n", __func__);
+		return;
+	}
+	wcd9xxx_irq = virq_to_phyirq(wcd9xxx_res, data->irq);
+	pr_debug("%s: IRQ_ACK called for WCD9XXX IRQ: %d\n",
+				__func__, wcd9xxx_irq);
 }
 
 static void wcd9xxx_irq_mask(struct irq_data *d)
@@ -124,6 +157,7 @@ static struct irq_chip wcd9xxx_irq_chip = {
 	.irq_disable = wcd9xxx_irq_disable,
 	.irq_enable = wcd9xxx_irq_enable,
 	.irq_mask = wcd9xxx_irq_mask,
+	.irq_ack = wcd9xxx_irq_ack,
 };
 
 bool wcd9xxx_lock_sleep(
@@ -148,6 +182,7 @@ bool wcd9xxx_lock_sleep(
 		pr_debug("%s: holding wake lock\n", __func__);
 		pm_qos_update_request(&wcd9xxx_res->pm_qos_req,
 				      msm_cpuidle_get_deep_idle_latency());
+		pm_stay_awake(wcd9xxx_res->dev);
 	}
 	mutex_unlock(&wcd9xxx_res->pm_lock);
 
@@ -186,6 +221,7 @@ void wcd9xxx_unlock_sleep(
 			wcd9xxx_res->pm_state = WCD9XXX_PM_SLEEPABLE;
 		pm_qos_update_request(&wcd9xxx_res->pm_qos_req,
 				PM_QOS_DEFAULT_VALUE);
+		pm_relax(wcd9xxx_res->dev);
 	}
 	mutex_unlock(&wcd9xxx_res->pm_lock);
 	wake_up_all(&wcd9xxx_res->pm_wq);
@@ -216,23 +252,27 @@ static void wcd9xxx_irq_dispatch(struct wcd9xxx_core_resource *wcd9xxx_res,
 	if (irqdata->clear_first) {
 		wcd9xxx_nested_irq_lock(wcd9xxx_res);
 		wcd9xxx_res->codec_reg_write(wcd9xxx_res,
-				WCD9XXX_A_INTR_CLEAR0 + BIT_BYTE(irqbit),
-				BYTE_BIT_MASK(irqbit));
+			wcd9xxx_res->intr_reg[WCD9XXX_INTR_CLEAR_BASE] +
+					      BIT_BYTE(irqbit),
+			BYTE_BIT_MASK(irqbit));
 
 		if (wcd9xxx_get_intf_type() == WCD9XXX_INTERFACE_TYPE_I2C)
 			wcd9xxx_res->codec_reg_write(wcd9xxx_res,
-						WCD9XXX_A_INTR_MODE, 0x02);
+				wcd9xxx_res->intr_reg[WCD9XXX_INTR_CLR_COMMIT],
+				0x02);
 		handle_nested_irq(phyirq_to_virq(wcd9xxx_res, irqbit));
 		wcd9xxx_nested_irq_unlock(wcd9xxx_res);
 	} else {
 		wcd9xxx_nested_irq_lock(wcd9xxx_res);
 		handle_nested_irq(phyirq_to_virq(wcd9xxx_res, irqbit));
 		wcd9xxx_res->codec_reg_write(wcd9xxx_res,
-				WCD9XXX_A_INTR_CLEAR0 + BIT_BYTE(irqbit),
-				BYTE_BIT_MASK(irqbit));
+			wcd9xxx_res->intr_reg[WCD9XXX_INTR_CLEAR_BASE] +
+					      BIT_BYTE(irqbit),
+			BYTE_BIT_MASK(irqbit));
 		if (wcd9xxx_get_intf_type() == WCD9XXX_INTERFACE_TYPE_I2C)
 			wcd9xxx_res->codec_reg_write(wcd9xxx_res,
-						WCD9XXX_A_INTR_MODE, 0x02);
+				wcd9xxx_res->intr_reg[WCD9XXX_INTR_CLR_COMMIT],
+				0x02);
 
 		wcd9xxx_nested_irq_unlock(wcd9xxx_res);
 	}
@@ -262,8 +302,8 @@ static irqreturn_t wcd9xxx_irq_thread(int irq, void *data)
 	}
 
 	ret = wcd9xxx_res->codec_bulk_read(wcd9xxx_res,
-				WCD9XXX_A_INTR_STATUS0,
-				num_irq_regs, status);
+		wcd9xxx_res->intr_reg[WCD9XXX_INTR_STATUS_BASE],
+		num_irq_regs, status);
 
 	if (ret < 0) {
 		dev_err(wcd9xxx_res->dev,
@@ -318,11 +358,12 @@ static irqreturn_t wcd9xxx_irq_thread(int irq, void *data)
 		memset(status, 0xff, num_irq_regs);
 
 		ret = wcd9xxx_res->codec_bulk_write(wcd9xxx_res,
-				WCD9XXX_A_INTR_CLEAR0,
-				num_irq_regs, status);
+			wcd9xxx_res->intr_reg[WCD9XXX_INTR_CLEAR_BASE],
+			num_irq_regs, status);
 		if (wcd9xxx_get_intf_type() == WCD9XXX_INTERFACE_TYPE_I2C)
 			wcd9xxx_res->codec_reg_write(wcd9xxx_res,
-					WCD9XXX_A_INTR_MODE, 0x02);
+				wcd9xxx_res->intr_reg[WCD9XXX_INTR_CLR_COMMIT],
+				0x02);
 	}
 	wcd9xxx_unlock_sleep(wcd9xxx_res);
 
@@ -449,11 +490,11 @@ int wcd9xxx_irq_init(struct wcd9xxx_core_resource *wcd9xxx_res)
 	for (i = 0; i < wcd9xxx_res->num_irq_regs; i++) {
 		/* Initialize interrupt mask and level registers */
 		wcd9xxx_res->codec_reg_write(wcd9xxx_res,
-					WCD9XXX_A_INTR_LEVEL0 + i,
+			wcd9xxx_res->intr_reg[WCD9XXX_INTR_LEVEL_BASE] + i,
 					irq_level[i]);
 		wcd9xxx_res->codec_reg_write(wcd9xxx_res,
-					WCD9XXX_A_INTR_MASK0 + i,
-					wcd9xxx_res->irq_masks_cur[i]);
+			wcd9xxx_res->intr_reg[WCD9XXX_INTR_MASK_BASE] + i,
+			wcd9xxx_res->irq_masks_cur[i]);
 	}
 
 	ret = request_threaded_irq(wcd9xxx_res->irq, NULL, wcd9xxx_irq_thread,
@@ -498,7 +539,7 @@ int wcd9xxx_request_irq(struct wcd9xxx_core_resource *wcd9xxx_res,
 	 * ARM needs us to explicitly flag the IRQ as valid
 	 * and will set them noprobe when we do so.
 	 */
-#ifdef CONFIG_ARM
+#if defined(CONFIG_ARM) || defined(CONFIG_ARM64)
 	set_irq_flags(virq, IRQF_VALID);
 #else
 	set_irq_noprobe(virq);
@@ -596,6 +637,9 @@ wcd9xxx_get_irq_drv_d(const struct wcd9xxx_core_resource *wcd9xxx_res)
 		return NULL;
 
 	domain = irq_find_host(pnode);
+	if (unlikely(!domain))
+		return NULL;
+
 	return (struct wcd9xxx_irq_drv_data *)domain->host_data;
 }
 
@@ -615,6 +659,10 @@ static int phyirq_to_virq(struct wcd9xxx_core_resource *wcd9xxx_res, int offset)
 static int virq_to_phyirq(struct wcd9xxx_core_resource *wcd9xxx_res, int virq)
 {
 	struct irq_data *irq_data = irq_get_irq_data(virq);
+	if (unlikely(!irq_data)) {
+		pr_err("%s: irq_data is NULL", __func__);
+		return -EINVAL;
+	}
 	return irq_data->hwirq;
 }
 
@@ -664,6 +712,10 @@ static int wcd9xxx_irq_probe(struct platform_device *pdev)
 	} else {
 		dev_dbg(&pdev->dev, "%s: virq = %d\n", __func__, irq);
 		domain = irq_find_host(pdev->dev.of_node);
+		if (unlikely(!domain)) {
+			pr_err("%s: domain is NULL", __func__);
+			return -EINVAL;
+		}
 		data = (struct wcd9xxx_irq_drv_data *)domain->host_data;
 		data->irq = irq;
 		wmb();
@@ -679,6 +731,10 @@ static int wcd9xxx_irq_remove(struct platform_device *pdev)
 	struct wcd9xxx_irq_drv_data *data;
 
 	domain = irq_find_host(pdev->dev.of_node);
+	if (unlikely(!domain)) {
+		pr_err("%s: domain is NULL", __func__);
+		return -EINVAL;
+	}
 	data = (struct wcd9xxx_irq_drv_data *)domain->host_data;
 	data->irq = 0;
 	wmb();

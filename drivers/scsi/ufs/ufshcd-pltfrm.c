@@ -37,7 +37,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/of.h>
 
-#include "ufshcd.h"
+#include <linux/scsi/ufs/ufshcd.h>
 
 static const struct of_device_id ufs_of_match[];
 static struct ufs_hba_variant_ops *get_variant_ops(struct device *dev)
@@ -111,19 +111,19 @@ static int ufshcd_parse_clock_info(struct ufs_hba *hba)
 	if (ret && (ret != -EINVAL)) {
 		dev_err(dev, "%s: error reading array %d\n",
 				"freq-table-hz", ret);
-		goto free_clkfreq;
+		goto out;
 	}
 
 	for (i = 0; i < sz; i += 2) {
 		ret = of_property_read_string_index(np,
 				"clock-names", i/2, (const char **)&name);
 		if (ret)
-			goto free_clkfreq;
+			goto out;
 
 		clki = devm_kzalloc(dev, sizeof(*clki), GFP_KERNEL);
 		if (!clki) {
 			ret = -ENOMEM;
-			goto free_clkfreq;
+			goto out;
 		}
 
 		clki->min_freq = clkfreq[i];
@@ -133,8 +133,6 @@ static int ufshcd_parse_clock_info(struct ufs_hba *hba)
 				clki->min_freq, clki->max_freq, clki->name);
 		list_add_tail(&clki->list, &hba->clk_list_head);
 	}
-free_clkfreq:
-	kfree(clkfreq);
 out:
 	return ret;
 }
@@ -168,12 +166,17 @@ static int ufshcd_populate_vreg(struct device *dev, const char *name,
 
 	vreg->name = kstrdup(name, GFP_KERNEL);
 
+	/* if fixed regulator no need further initialization */
+	snprintf(prop_name, MAX_PROP_SIZE, "%s-fixed-regulator", name);
+	if (of_property_read_bool(np, prop_name))
+		goto out;
+
 	snprintf(prop_name, MAX_PROP_SIZE, "%s-max-microamp", name);
 	ret = of_property_read_u32(np, prop_name, &vreg->max_uA);
 	if (ret) {
 		dev_err(dev, "%s: unable to find %s err %d\n",
 				__func__, prop_name, ret);
-		goto out_free;
+		goto out;
 	}
 
 	vreg->min_uA = 0;
@@ -195,9 +198,6 @@ static int ufshcd_populate_vreg(struct device *dev, const char *name,
 
 	goto out;
 
-out_free:
-	devm_kfree(dev, vreg);
-	vreg = NULL;
 out:
 	if (!ret)
 		*out_vreg = vreg;
@@ -219,6 +219,10 @@ static int ufshcd_parse_regulator_info(struct ufs_hba *hba)
 	struct device *dev = hba->dev;
 	struct ufs_vreg_info *info = &hba->vreg_info;
 
+	err = ufshcd_populate_vreg(dev, "vdd-hba", &info->vdd_hba);
+	if (err)
+		goto out;
+
 	err = ufshcd_populate_vreg(dev, "vcc", &info->vcc);
 	if (err)
 		goto out;
@@ -232,7 +236,57 @@ out:
 	return err;
 }
 
-#ifdef CONFIG_PM
+static void ufshcd_parse_pm_levels(struct ufs_hba *hba)
+{
+	struct device *dev = hba->dev;
+	struct device_node *np = dev->of_node;
+
+	if (np) {
+		if (of_property_read_u32(np, "rpm-level", &hba->rpm_lvl))
+			hba->rpm_lvl = -1;
+		if (of_property_read_u32(np, "spm-level", &hba->spm_lvl))
+			hba->spm_lvl = -1;
+	}
+}
+
+#ifdef CONFIG_SMP
+static void ufshcd_parse_pm_qos(struct ufs_hba *hba, int irq)
+{
+	const char *cpu_affinity = NULL;
+	u32 cpu_mask;
+
+	hba->pm_qos.cpu_dma_latency_us = UFS_DEFAULT_CPU_DMA_LATENCY_US;
+	of_property_read_u32(hba->dev->of_node, "qcom,cpu-dma-latency-us",
+		&hba->pm_qos.cpu_dma_latency_us);
+	dev_dbg(hba->dev, "cpu_dma_latency_us = %u\n",
+		hba->pm_qos.cpu_dma_latency_us);
+
+	/* Default to affine irq in case parsing fails */
+	hba->pm_qos.req.type = PM_QOS_REQ_AFFINE_IRQ;
+	hba->pm_qos.req.irq = irq;
+	if (!of_property_read_string(hba->dev->of_node, "qcom,cpu-affinity",
+		&cpu_affinity)) {
+		if (!strcmp(cpu_affinity, "all_cores"))
+			hba->pm_qos.req.type = PM_QOS_REQ_ALL_CORES;
+		else if (!strcmp(cpu_affinity, "affine_cores"))
+			/*
+			 * PM_QOS_REQ_AFFINE_CORES request type is used for
+			 * targets that have little cluster and will apply
+			 * the vote to all the cores in the little cluster.
+			 */
+			if (!of_property_read_u32(hba->dev->of_node,
+				"qcom,cpu-affinity-mask", &cpu_mask)) {
+				hba->pm_qos.req.type = PM_QOS_REQ_AFFINE_CORES;
+				/* Convert u32 to cpu bit mask */
+				cpumask_bits(&hba->pm_qos.req.cpus_affine)[0] =
+					cpu_mask;
+			}
+	}
+
+	dev_dbg(hba->dev, "hba->pm_qos.pm_qos_req.type = %u, cpu_mask=0x%lx\n",
+		hba->pm_qos.req.type, hba->pm_qos.req.cpus_affine.bits[0]);
+}
+
 /**
  * ufshcd_pltfrm_suspend - suspend power management function
  * @dev: pointer to device handle
@@ -325,15 +379,17 @@ static int ufshcd_pltfrm_probe(struct platform_device *pdev)
 	if (err) {
 		dev_err(&pdev->dev, "%s: clock parse failed %d\n",
 				__func__, err);
-		goto out;
+		goto dealloc_host;
 	}
 	err = ufshcd_parse_regulator_info(hba);
 	if (err) {
 		dev_err(&pdev->dev, "%s: regulator init failed %d\n",
 				__func__, err);
-		goto out;
+		goto dealloc_host;
 	}
 
+	ufshcd_parse_pm_qos(hba, irq);
+	ufshcd_parse_pm_levels(hba);
 	pm_runtime_set_active(&pdev->dev);
 	pm_runtime_enable(&pdev->dev);
 
@@ -353,6 +409,8 @@ static int ufshcd_pltfrm_probe(struct platform_device *pdev)
 out_disable_rpm:
 	pm_runtime_disable(&pdev->dev);
 	pm_runtime_set_suspended(&pdev->dev);
+dealloc_host:
+	ufshcd_dealloc_host(hba);
 out:
 	return err;
 }
@@ -369,12 +427,13 @@ static int ufshcd_pltfrm_remove(struct platform_device *pdev)
 
 	pm_runtime_get_sync(&(pdev)->dev);
 	ufshcd_remove(hba);
+	ufshcd_dealloc_host(hba);
 	return 0;
 }
 
 static const struct of_device_id ufs_of_match[] = {
 	{ .compatible = "jedec,ufs-1.1"},
-	{ .compatible = "qcom,ufshc", .data = (void *)&ufs_hba_msm_vops, },
+	{ .compatible = "qcom,ufshc", .data = (void *)&ufs_hba_qcom_vops, },
 	{},
 };
 

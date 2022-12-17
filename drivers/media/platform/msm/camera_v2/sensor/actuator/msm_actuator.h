@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2011-2016, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -14,19 +14,27 @@
 
 #include <linux/i2c.h>
 #include <linux/gpio.h>
-#include <mach/camera2.h>
+#include <soc/qcom/camera2.h>
 #include <media/v4l2-subdev.h>
 #include <media/msmb_camera.h>
 #include "msm_camera_i2c.h"
+#include "msm_camera_dt_util.h"
+#include "msm_camera_io_util.h"
+
 
 #define DEFINE_MSM_MUTEX(mutexname) \
 	static struct mutex mutexname = __MUTEX_INITIALIZER(mutexname)
 
+#define	MSM_ACTUATOR_MAX_VREGS (10)
+#define	ACTUATOR_MAX_POLL_COUNT 10
+
 struct msm_actuator_ctrl_t;
 
 enum msm_actuator_state_t {
-	ACTUATOR_POWER_UP,
-	ACTUATOR_POWER_DOWN,
+	ACT_ENABLE_STATE,
+	ACT_OPS_ACTIVE,
+	ACT_OPS_INACTIVE,
+	ACT_DISABLE_STATE,
 };
 
 struct msm_actuator_func_tbl {
@@ -37,9 +45,9 @@ struct msm_actuator_func_tbl {
 		struct msm_actuator_set_info_t *);
 	int32_t (*actuator_init_focus)(struct msm_actuator_ctrl_t *,
 		uint16_t, struct reg_settings_t *);
-	int32_t (*actuator_set_default_focus) (struct msm_actuator_ctrl_t *,
+	int32_t (*actuator_set_default_focus)(struct msm_actuator_ctrl_t *,
 			struct msm_actuator_move_params_t *);
-	int32_t (*actuator_move_focus) (struct msm_actuator_ctrl_t *,
+	int32_t (*actuator_move_focus)(struct msm_actuator_ctrl_t *,
 			struct msm_actuator_move_params_t *);
 	void (*actuator_parse_i2c_params)(struct msm_actuator_ctrl_t *,
 			int16_t, uint32_t, uint16_t);
@@ -50,11 +58,18 @@ struct msm_actuator_func_tbl {
 			int16_t);
 	int32_t (*actuator_set_position)(struct msm_actuator_ctrl_t *,
 		struct msm_actuator_set_position_t *);
+	int32_t (*actuator_park_lens)(struct msm_actuator_ctrl_t *);
 };
 
 struct msm_actuator {
 	enum actuator_type act_type;
 	struct msm_actuator_func_tbl func_tbl;
+};
+
+struct msm_actuator_vreg {
+	struct camera_vreg_t *cam_vreg;
+	void *data[MSM_ACTUATOR_MAX_VREGS];
+	int num_vreg;
 };
 
 struct msm_actuator_ctrl_t {
@@ -67,7 +82,7 @@ struct msm_actuator_ctrl_t {
 	enum af_camera_name cam_name;
 	struct mutex *actuator_mutex;
 	struct msm_actuator_func_tbl *func_tbl;
-	enum msm_actuator_data_type i2c_data_type;
+	enum msm_camera_i2c_data_type i2c_data_type;
 	struct v4l2_subdev sdev;
 	struct v4l2_subdev_ops *act_v4l2_subdev_ops;
 
@@ -76,11 +91,9 @@ struct msm_actuator_ctrl_t {
 	uint16_t *step_position_table;
 	struct region_params_t region_params[MAX_ACTUATOR_REGION];
 	uint16_t reg_tbl_size;
-	struct msm_actuator_reg_params_t reg_tbl[MAX_ACTUATOR_REG_TBL_SIZE];
+	struct msm_actuator_reg_params_t reg_tbl[MAX_ACTUATOR_REG_TBL_SIZE2];
 	uint16_t region_size;
 	void *user_data;
-	uint32_t vcm_pwd;
-	uint32_t vcm_enable;
 	uint32_t total_steps;
 	uint16_t pwd_step;
 	uint16_t initial_code;
@@ -89,6 +102,17 @@ struct msm_actuator_ctrl_t {
 	enum cci_i2c_master_t cci_master;
 	uint32_t subdev_id;
 	enum msm_actuator_state_t actuator_state;
+	struct msm_actuator_vreg vreg_cfg;
+	struct park_lens_data_t park_lens;
+	uint32_t max_code_size;
+	struct msm_camera_gpio_conf *gconf;
+	struct msm_pinctrl_info pinctrl_info;
+	uint8_t cam_pinctrl_status;
+	uint8_t recovery_en;
+	uint16_t recovery_addr;
+	uint16_t slave_addr;
+	uint16_t power_off_setting_size;
+	struct reg_settings_t power_off_settings[MAX_ACTUATOR_REG_TBL_SIZE2];
 };
 
 #endif

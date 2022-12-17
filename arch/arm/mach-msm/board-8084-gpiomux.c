@@ -694,6 +694,12 @@ static struct msm_gpiomux_config apq8084_hsic_configs[] = {
 			[GPIOMUX_SUSPENDED] = &hsic_ap2mdm_chlrdy_sus_cfg,
 		}
 	},
+	{
+		.gpio = 108,     /* ap2mdm_wakeup is used as resume gpio */
+		.settings = {
+			[GPIOMUX_SUSPENDED] = &ap2mdm_wakeup,
+		}
+	},
 };
 
 static struct gpiomux_setting lcd_en_act_cfg = {
@@ -707,6 +713,20 @@ static struct gpiomux_setting lcd_en_sus_cfg = {
 	.func = GPIOMUX_FUNC_GPIO,
 	.drv = GPIOMUX_DRV_2MA,
 	.pull = GPIOMUX_PULL_DOWN,
+};
+
+static struct gpiomux_setting lcd_te_act_cfg = {
+	.func = GPIOMUX_FUNC_1,
+	.drv = GPIOMUX_DRV_2MA,
+	.pull = GPIOMUX_PULL_DOWN,
+	.dir = GPIOMUX_IN,
+};
+
+static struct gpiomux_setting lcd_te_sus_cfg = {
+	.func = GPIOMUX_FUNC_1,
+	.drv = GPIOMUX_DRV_2MA,
+	.pull = GPIOMUX_PULL_DOWN,
+	.dir = GPIOMUX_IN,
 };
 
 static struct msm_gpiomux_config msm_lcd_configs[] __initdata = {
@@ -729,6 +749,16 @@ static struct msm_gpiomux_config msm_lcd_configs[] __initdata = {
 		.settings = {
 			[GPIOMUX_ACTIVE]    = &lcd_en_act_cfg,
 			[GPIOMUX_SUSPENDED] = &lcd_en_sus_cfg,
+		},
+	},
+};
+
+static struct msm_gpiomux_config msm_lcd_te_configs[] __initdata = {
+	{
+		.gpio = 12,			/* TEAR ENABLE */
+		.settings = {
+			[GPIOMUX_ACTIVE]    = &lcd_te_act_cfg,
+			[GPIOMUX_SUSPENDED] = &lcd_te_sus_cfg,
 		},
 	},
 };
@@ -773,47 +803,6 @@ static struct msm_gpiomux_config apq8084_pri_ter_auxpcm_configs[] __initdata = {
 		.settings = {
 			[GPIOMUX_SUSPENDED] = &auxpcm_sus_cfg,
 			[GPIOMUX_ACTIVE] = &auxpcm_act_cfg,
-		},
-	},
-};
-
-static struct gpiomux_setting wlan_en_cfg = {
-	.func = GPIOMUX_FUNC_GPIO,
-	.drv = GPIOMUX_DRV_16MA,
-	.pull = GPIOMUX_PULL_UP,
-	.dir = GPIOMUX_OUT_HIGH,
-};
-
-static struct msm_gpiomux_config msm_wlan_configs[] __initdata = {
-	{
-		.gpio = 82,			/* WLAN ENABLE */
-		.settings = {
-			[GPIOMUX_ACTIVE]    = &wlan_en_cfg,
-			[GPIOMUX_SUSPENDED] = &wlan_en_cfg,
-		},
-	},
-};
-
-static struct gpiomux_setting sd_card_det_active_config = {
-	.func = GPIOMUX_FUNC_GPIO,
-	.drv = GPIOMUX_DRV_2MA,
-	.pull = GPIOMUX_PULL_NONE,
-	.dir = GPIOMUX_IN,
-};
-
-static struct gpiomux_setting sd_card_det_sleep_config = {
-	.func = GPIOMUX_FUNC_GPIO,
-	.drv = GPIOMUX_DRV_2MA,
-	.pull = GPIOMUX_PULL_UP,
-	.dir = GPIOMUX_IN,
-};
-
-static struct msm_gpiomux_config sd_card_det[] __initdata = {
-	{
-		.gpio = 122,
-		.settings = {
-			[GPIOMUX_ACTIVE]    = &sd_card_det_active_config,
-			[GPIOMUX_SUSPENDED] = &sd_card_det_sleep_config,
 		},
 	},
 };
@@ -940,14 +929,14 @@ static struct msm_gpiomux_config msm_sensor_configs[] __initdata = {
 	{
 		.gpio = 23, /* FLASH_LED_EN */
 		.settings = {
-			[GPIOMUX_ACTIVE]    = &cam_settings[0],
+			[GPIOMUX_ACTIVE]    = &cam_settings[3],
 			[GPIOMUX_SUSPENDED] = &gpio_suspend_config[1],
 		},
 	},
 	{
 		.gpio = 24, /* FLASH_LED_NOW */
 		.settings = {
-			[GPIOMUX_ACTIVE]    = &cam_settings[0],
+			[GPIOMUX_ACTIVE]    = &cam_settings[3],
 			[GPIOMUX_SUSPENDED] = &gpio_suspend_config[1],
 		},
 	},
@@ -1137,23 +1126,30 @@ static struct gpiomux_setting gpio_qca1530_config_mpp7 = {
 	.pull = GPIOMUX_PULL_UP,
 };
 
-static struct gpiomux_setting gpio_pcie_clkreq_config = {
-	.func = GPIOMUX_FUNC_2,
-	.drv  = GPIOMUX_DRV_2MA,
-	.pull = GPIOMUX_PULL_UP,
+static struct gpiomux_setting gpio_pcie_clkreq_config[] = {
+	{
+		.func = GPIOMUX_FUNC_2,
+		.drv = GPIOMUX_DRV_2MA,
+		.pull = GPIOMUX_PULL_UP,
+	},
+	{
+		.func = GPIOMUX_FUNC_1,
+		.drv = GPIOMUX_DRV_2MA,
+		.pull = GPIOMUX_PULL_UP,
+	},
 };
 
 static struct msm_gpiomux_config msm_pcie_configs[] __initdata = {
 	{
 		.gpio = 68,    /* PCIE0_CLKREQ_N */
 		.settings = {
-			[GPIOMUX_SUSPENDED] = &gpio_pcie_clkreq_config,
+			[GPIOMUX_SUSPENDED] = &gpio_pcie_clkreq_config[0],
 		},
 	},
 	{
 		.gpio = 141,    /* PCIE1_CLKREQ_N */
 		.settings = {
-			[GPIOMUX_SUSPENDED] = &gpio_pcie_clkreq_config,
+			[GPIOMUX_SUSPENDED] = &gpio_pcie_clkreq_config[1],
 		},
 	},
 };
@@ -1228,6 +1224,8 @@ void __init apq8084_init_gpiomux(void)
 	}
 	msm_gpiomux_install_nowrite(msm_lcd_configs,
 			ARRAY_SIZE(msm_lcd_configs));
+	msm_gpiomux_install(msm_lcd_te_configs,
+			ARRAY_SIZE(msm_lcd_te_configs));
 	msm_gpiomux_install(apq8084_pri_ter_auxpcm_configs,
 			ARRAY_SIZE(apq8084_pri_ter_auxpcm_configs));
 
@@ -1245,8 +1243,6 @@ void __init apq8084_init_gpiomux(void)
 			ARRAY_SIZE(hap_lvl_shft_config));
 	}
 
-	msm_gpiomux_install(msm_wlan_configs, ARRAY_SIZE(msm_wlan_configs));
-	msm_gpiomux_install(sd_card_det, ARRAY_SIZE(sd_card_det));
 	if (of_board_is_cdp() || of_board_is_sbc())
 		msm_gpiomux_install(eth_pwr, ARRAY_SIZE(eth_pwr));
 	if (of_board_is_sbc())
@@ -1256,7 +1252,9 @@ void __init apq8084_init_gpiomux(void)
 		msm_gpiomux_install(msm_sensor_configs,
 				ARRAY_SIZE(msm_sensor_configs));
 	msm_gpiomux_install(msm_pcie_configs, ARRAY_SIZE(msm_pcie_configs));
-	msm_gpiomux_install(msm_epm_configs, ARRAY_SIZE(msm_epm_configs));
+	if (of_board_is_liquid())
+		msm_gpiomux_install(msm_epm_configs,
+						ARRAY_SIZE(msm_epm_configs));
 
 #if defined(CONFIG_KS8851) || defined(CONFIG_KS8851_MODULE)
 	if (of_board_is_cdp())

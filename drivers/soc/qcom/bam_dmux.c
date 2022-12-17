@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2011-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -29,14 +29,12 @@
 #include <linux/of.h>
 #include <linux/ipc_logging.h>
 #include <linux/srcu.h>
+#include <linux/msm-sps.h>
+#include <linux/sizes.h>
+#include <soc/qcom/bam_dmux.h>
+#include <soc/qcom/smsm.h>
 #include <soc/qcom/subsystem_restart.h>
 #include <soc/qcom/subsystem_notif.h>
-#include <soc/qcom/socinfo.h>
-
-#include <mach/sps.h>
-#include <mach/msm_smsm.h>
-
-#include <soc/qcom/bam_dmux.h>
 
 #include "bam_dmux_private.h"
 
@@ -183,11 +181,11 @@ struct bam_ch_info {
 #define A2_BAM_IRQ -1
 #endif
 
-static void *a2_phys_base;
+static phys_addr_t a2_phys_base;
 static uint32_t a2_phys_size;
 static int a2_bam_irq;
 static struct sps_bam_props a2_props;
-static u32 a2_device_handle;
+static unsigned long a2_device_handle;
 static struct sps_pipe *bam_tx_pipe;
 static struct sps_pipe *bam_rx_pipe;
 static struct sps_connect tx_connection;
@@ -199,6 +197,12 @@ static struct sps_register_event rx_register_event;
 static bool satellite_mode;
 static uint32_t num_buffers;
 static unsigned long long last_rx_pkt_timestamp;
+static struct device *dma_dev;
+static bool dynamic_mtu_enabled;
+static uint16_t ul_mtu = DEFAULT_BUFFER_SIZE;
+static uint16_t dl_mtu = DEFAULT_BUFFER_SIZE;
+static uint16_t buffer_size = DEFAULT_BUFFER_SIZE;
+static bool no_cpu_affinity;
 
 static struct bam_ch_info bam_ch[BAM_DMUX_NUM_CHANNELS];
 static int bam_mux_initialized;
@@ -218,6 +222,7 @@ static void bam_mux_write_done(struct work_struct *work);
 static void handle_bam_mux_cmd(struct work_struct *work);
 static void rx_timer_work_func(struct work_struct *work);
 static void queue_rx_work_func(struct work_struct *work);
+static int ssrestart_check(void);
 
 static DECLARE_WORK(rx_timer_work, rx_timer_work_func);
 static DECLARE_WORK(queue_rx_work, queue_rx_work_func);
@@ -229,8 +234,10 @@ static struct srcu_struct bam_dmux_srcu;
 
 /* A2 power collaspe */
 #define UL_TIMEOUT_DELAY 1000	/* in ms */
+#define UL_FAST_TIMEOUT_DELAY 100 /* in ms */
 #define SHUTDOWN_TIMEOUT_MS	500
 #define UL_WAKEUP_TIMEOUT_MS	2000
+static uint32_t ul_timeout_delay = UL_TIMEOUT_DELAY;
 static void toggle_apps_ack(void);
 static void reconnect_to_bam(void);
 static void disconnect_to_bam(void);
@@ -267,7 +274,6 @@ static LIST_HEAD(bam_other_notify_funcs);
 static DEFINE_MUTEX(smsm_cb_lock);
 static DEFINE_MUTEX(delayed_ul_vote_lock);
 static int need_delayed_ul_vote;
-static int in_ssr;
 static int ssr_skipped_disconnect;
 static struct completion shutdown_completion;
 
@@ -388,9 +394,11 @@ static void __queue_rx(gfp_t alloc_flags)
 	struct rx_pkt_info *info;
 	int ret;
 	int rx_len_cached;
+	uint16_t current_buffer_size;
 
 	mutex_lock(&bam_rx_pool_mutexlock);
 	rx_len_cached = bam_rx_pool_len;
+	current_buffer_size = buffer_size;
 	mutex_unlock(&bam_rx_pool_mutexlock);
 
 	while (bam_connection_is_active && rx_len_cached < num_buffers) {
@@ -406,9 +414,11 @@ static void __queue_rx(gfp_t alloc_flags)
 			goto fail;
 		}
 
+		info->len = current_buffer_size;
+
 		INIT_WORK(&info->work, handle_bam_mux_cmd);
 
-		info->skb = __dev_alloc_skb(BUFFER_SIZE, alloc_flags);
+		info->skb = __dev_alloc_skb(info->len, alloc_flags);
 		if (info->skb == NULL) {
 			DMUX_LOG_KERR(
 				"%s: unable to alloc skb w/ flags %x, will retry later\n",
@@ -416,9 +426,9 @@ static void __queue_rx(gfp_t alloc_flags)
 								alloc_flags);
 			goto fail_info;
 		}
-		ptr = skb_put(info->skb, BUFFER_SIZE);
+		ptr = skb_put(info->skb, info->len);
 
-		info->dma_address = dma_map_single(NULL, ptr, BUFFER_SIZE,
+		info->dma_address = dma_map_single(dma_dev, ptr, info->len,
 							bam_ops->dma_from);
 		if (info->dma_address == 0 || info->dma_address == ~0) {
 			DMUX_LOG_KERR("%s: dma_map_single failure %p for %p\n",
@@ -429,8 +439,9 @@ static void __queue_rx(gfp_t alloc_flags)
 		mutex_lock(&bam_rx_pool_mutexlock);
 		list_add_tail(&info->list_node, &bam_rx_pool);
 		rx_len_cached = ++bam_rx_pool_len;
+		current_buffer_size = buffer_size;
 		ret = bam_ops->sps_transfer_one_ptr(bam_rx_pipe,
-				info->dma_address, BUFFER_SIZE, info, 0);
+				info->dma_address, info->len, info, 0);
 		if (ret) {
 			list_del(&info->list_node);
 			rx_len_cached = --bam_rx_pool_len;
@@ -438,7 +449,8 @@ static void __queue_rx(gfp_t alloc_flags)
 			DMUX_LOG_KERR("%s: sps_transfer_one failed %d\n",
 				__func__, ret);
 
-			dma_unmap_single(NULL, info->dma_address, BUFFER_SIZE,
+			dma_unmap_single(dma_dev, info->dma_address,
+						info->len,
 						bam_ops->dma_from);
 
 			goto fail_skb;
@@ -481,31 +493,129 @@ static void queue_rx_work_func(struct work_struct *work)
 	__queue_rx(GFP_KERNEL);
 }
 
+/**
+ * process_dynamic_mtu() - Process the dynamic MTU signal bit from data cmds
+ * @current_state:	State of the dynamic MTU signal bit for the current
+ *			data command packet.
+ */
+static void process_dynamic_mtu(bool current_state)
+{
+	static bool old_state;
+
+	if (!dynamic_mtu_enabled)
+		return;
+
+	if (old_state == current_state)
+		return;
+
+	mutex_lock(&bam_rx_pool_mutexlock);
+	if (current_state) {
+		buffer_size = dl_mtu;
+		BAM_DMUX_LOG("%s: switching to large mtu %x\n", __func__,
+									dl_mtu);
+	} else {
+		buffer_size = DEFAULT_BUFFER_SIZE;
+		BAM_DMUX_LOG("%s: switching to reg mtu %x\n", __func__,
+							DEFAULT_BUFFER_SIZE);
+	}
+	mutex_unlock(&bam_rx_pool_mutexlock);
+
+	old_state = current_state;
+}
+
 static void bam_mux_process_data(struct sk_buff *rx_skb)
 {
 	unsigned long flags;
 	struct bam_mux_hdr *rx_hdr;
 	unsigned long event_data;
+	uint8_t ch_id;
+	void (*notify)(void *, int, unsigned long);
+	void *priv;
 
 	rx_hdr = (struct bam_mux_hdr *)rx_skb->data;
+	ch_id = rx_hdr->ch_id;
+
+	process_dynamic_mtu(rx_hdr->signal & DYNAMIC_MTU_MASK);
 
 	rx_skb->data = (unsigned char *)(rx_hdr + 1);
-	rx_skb->tail = rx_skb->data + rx_hdr->pkt_len;
+	skb_set_tail_pointer(rx_skb, rx_hdr->pkt_len);
 	rx_skb->len = rx_hdr->pkt_len;
 	rx_skb->truesize = rx_hdr->pkt_len + sizeof(struct sk_buff);
 
 	event_data = (unsigned long)(rx_skb);
+	notify = NULL;
+	priv = NULL;
 
-	spin_lock_irqsave(&bam_ch[rx_hdr->ch_id].lock, flags);
-	if (bam_ch[rx_hdr->ch_id].notify)
-		bam_ch[rx_hdr->ch_id].notify(
-			bam_ch[rx_hdr->ch_id].priv, BAM_DMUX_RECEIVE,
-							event_data);
+	spin_lock_irqsave(&bam_ch[ch_id].lock, flags);
+	if (bam_ch[ch_id].notify) {
+		notify = bam_ch[ch_id].notify;
+		priv = bam_ch[ch_id].priv;
+	}
+	spin_unlock_irqrestore(&bam_ch[ch_id].lock, flags);
+	if (notify)
+		notify(priv, BAM_DMUX_RECEIVE, event_data);
 	else
 		dev_kfree_skb_any(rx_skb);
-	spin_unlock_irqrestore(&bam_ch[rx_hdr->ch_id].lock, flags);
 
 	queue_rx();
+}
+
+/**
+ * set_ul_mtu() - Converts the MTU code received from the remote side in the
+ *		  open cmd into a byte value.
+ * @mtu_code:	MTU size code to translate.
+ * @reset:	Reset the MTU.
+ */
+static void set_ul_mtu(int mtu_code, bool reset)
+{
+	static bool first = true;
+
+	if (reset) {
+		first = true;
+		ul_mtu = DEFAULT_BUFFER_SIZE;
+		return;
+	}
+
+	switch (mtu_code) {
+	case 0:
+		if (ul_mtu != SZ_2K && !first) {
+			BAM_DMUX_LOG("%s: bad request for 2k, ul_mtu is %d\n",
+							__func__, ul_mtu);
+			ssrestart_check();
+		}
+		ul_mtu = SZ_2K;
+		break;
+	case 1:
+		if (ul_mtu != SZ_4K && !first) {
+			BAM_DMUX_LOG("%s: bad request for 4k, ul_mtu is %d\n",
+							__func__, ul_mtu);
+			ssrestart_check();
+		}
+		ul_mtu = SZ_4K;
+		break;
+	case 2:
+		if (ul_mtu != SZ_8K && !first) {
+			BAM_DMUX_LOG("%s: bad request for 8k, ul_mtu is %d\n",
+							__func__, ul_mtu);
+			ssrestart_check();
+		}
+		ul_mtu = SZ_8K;
+		break;
+	case 3:
+		if (ul_mtu != SZ_16K && !first) {
+			BAM_DMUX_LOG("%s: bad request for 16k, ul_mtu is %d\n",
+							__func__, ul_mtu);
+			ssrestart_check();
+		}
+		ul_mtu = SZ_16K;
+		break;
+	default:
+		BAM_DMUX_LOG("%s: bad request %d\n", __func__, mtu_code);
+		ssrestart_check();
+		break;
+	}
+
+	first = false;
 }
 
 static inline void handle_bam_mux_cmd_open(struct bam_mux_hdr *rx_hdr)
@@ -521,7 +631,24 @@ static inline void handle_bam_mux_cmd_open(struct bam_mux_hdr *rx_hdr)
 		queue_rx();
 		return;
 	}
+	if (rx_hdr->signal & DYNAMIC_MTU_MASK) {
+		dynamic_mtu_enabled = true;
+		set_ul_mtu((rx_hdr->signal & MTU_SIZE_MASK) >> MTU_SIZE_SHIFT,
+									false);
+	} else {
+		set_ul_mtu(0, false);
+	}
 	spin_lock_irqsave(&bam_ch[rx_hdr->ch_id].lock, flags);
+	if (bam_ch_is_remote_open(rx_hdr->ch_id)) {
+		/*
+		 * Receiving an open command for a channel that is already open
+		 * is an invalid operation and likely signifies a significant
+		 * issue within the A2 which should be caught immediately
+		 * before it snowballs and the root cause is lost.
+		 */
+		panic("A2 sent invalid duplicate open for channel %d\n",
+								rx_hdr->ch_id);
+	}
 	bam_ch[rx_hdr->ch_id].status |= BAM_CH_REMOTE_OPEN;
 	bam_ch[rx_hdr->ch_id].num_tx_pkts = 0;
 	spin_unlock_irqrestore(&bam_ch[rx_hdr->ch_id].lock, flags);
@@ -539,35 +666,36 @@ static void handle_bam_mux_cmd(struct work_struct *work)
 	struct bam_mux_hdr *rx_hdr;
 	struct rx_pkt_info *info;
 	struct sk_buff *rx_skb;
+	uint16_t sps_size;
 
 	info = container_of(work, struct rx_pkt_info, work);
 	rx_skb = info->skb;
-	dma_unmap_single(NULL, info->dma_address, BUFFER_SIZE,
+	dma_unmap_single(dma_dev, info->dma_address, info->len,
 			bam_ops->dma_from);
+	sps_size = info->sps_size;
 	kfree(info);
 
 	rx_hdr = (struct bam_mux_hdr *)rx_skb->data;
 
 	DBG_INC_READ_CNT(sizeof(struct bam_mux_hdr));
-	DBG("%s: magic %x reserved %d cmd %d pad %d ch %d len %d\n", __func__,
-			rx_hdr->magic_num, rx_hdr->reserved, rx_hdr->cmd,
+	DBG("%s: magic %x signal %x cmd %d pad %d ch %d len %d\n", __func__,
+			rx_hdr->magic_num, rx_hdr->signal, rx_hdr->cmd,
 			rx_hdr->pad_len, rx_hdr->ch_id, rx_hdr->pkt_len);
 	if (rx_hdr->magic_num != BAM_MUX_HDR_MAGIC_NO) {
-		DMUX_LOG_KERR("%s: dropping invalid hdr. magic %x"
-			" reserved %d cmd %d"
-			" pad %d ch %d len %d\n", __func__,
-			rx_hdr->magic_num, rx_hdr->reserved, rx_hdr->cmd,
-			rx_hdr->pad_len, rx_hdr->ch_id, rx_hdr->pkt_len);
+		DMUX_LOG_KERR(
+			"%s: dropping invalid hdr. magic %x signal %x cmd %d pad %d ch %d len %d\n",
+			__func__, rx_hdr->magic_num, rx_hdr->signal,
+			rx_hdr->cmd, rx_hdr->pad_len, rx_hdr->ch_id,
+			rx_hdr->pkt_len);
 		dev_kfree_skb_any(rx_skb);
 		queue_rx();
 		return;
 	}
 
 	if (rx_hdr->ch_id >= BAM_DMUX_NUM_CHANNELS) {
-		DMUX_LOG_KERR("%s: dropping invalid LCID %d"
-			" reserved %d cmd %d"
-			" pad %d ch %d len %d\n", __func__,
-			rx_hdr->ch_id, rx_hdr->reserved, rx_hdr->cmd,
+		DMUX_LOG_KERR(
+			"%s: dropping invalid LCID %d signal %x cmd %d pad %d ch %d len %d\n",
+			__func__, rx_hdr->ch_id, rx_hdr->signal, rx_hdr->cmd,
 			rx_hdr->pad_len, rx_hdr->ch_id, rx_hdr->pkt_len);
 		dev_kfree_skb_any(rx_skb);
 		queue_rx();
@@ -576,6 +704,9 @@ static void handle_bam_mux_cmd(struct work_struct *work)
 
 	switch (rx_hdr->cmd) {
 	case BAM_MUX_HDR_CMD_DATA:
+		if (rx_hdr->pkt_len == 0xffff)
+			/* SPS includes the header bytes, need just payload */
+			rx_hdr->pkt_len = sps_size - sizeof(*rx_hdr);
 		DBG_INC_READ_CNT(rx_hdr->pkt_len);
 		bam_mux_process_data(rx_skb);
 		break;
@@ -621,9 +752,9 @@ static void handle_bam_mux_cmd(struct work_struct *work)
 		queue_rx();
 		break;
 	default:
-		DMUX_LOG_KERR("%s: dropping invalid hdr. magic %x"
-			   " reserved %d cmd %d pad %d ch %d len %d\n",
-			__func__, rx_hdr->magic_num, rx_hdr->reserved,
+		DMUX_LOG_KERR(
+			"%s: dropping invalid hdr. magic %x signal %x cmd %d pad %d ch %d len %d\n",
+			__func__, rx_hdr->magic_num, rx_hdr->signal,
 			rx_hdr->cmd, rx_hdr->pad_len, rx_hdr->ch_id,
 			rx_hdr->pkt_len);
 		dev_kfree_skb_any(rx_skb);
@@ -646,7 +777,7 @@ static int bam_mux_write_cmd(void *data, uint32_t len)
 		return rc;
 	}
 
-	dma_address = dma_map_single(NULL, data, len,
+	dma_address = dma_map_single(dma_dev, data, len,
 					bam_ops->dma_to);
 	if (!dma_address) {
 		pr_err("%s: dma_map_single() failed\n", __func__);
@@ -670,7 +801,7 @@ static int bam_mux_write_cmd(void *data, uint32_t len)
 		list_del(&pkt->list_node);
 		DBG_INC_TX_SPS_FAILURE_CNT();
 		spin_unlock_irqrestore(&bam_tx_pool_spinlock, flags);
-		dma_unmap_single(NULL, pkt->dma_address,
+		dma_unmap_single(dma_dev, pkt->dma_address,
 					pkt->len,
 					bam_ops->dma_to);
 		kfree(pkt);
@@ -729,6 +860,11 @@ static void bam_mux_write_done(struct work_struct *work)
 	kfree(info);
 	hdr = (struct bam_mux_hdr *)skb->data;
 	DBG_INC_WRITE_CNT(skb->len);
+	/* Restore skb for client */
+	skb_pull(skb, sizeof(*hdr));
+	if (hdr->pad_len)
+		skb_trim(skb, skb->len - hdr->pad_len);
+
 	event_data = (unsigned long)(skb);
 	spin_lock_irqsave(&bam_ch[hdr->ch_id].lock, flags);
 	bam_ch[hdr->ch_id].num_tx_pkts--;
@@ -816,7 +952,7 @@ int msm_bam_dmux_write(uint32_t id, struct sk_buff *skb)
 	   hdr is fine, padding is tricky */
 	hdr->magic_num = BAM_MUX_HDR_MAGIC_NO;
 	hdr->cmd = BAM_MUX_HDR_CMD_DATA;
-	hdr->reserved = 0;
+	hdr->signal = 0;
 	hdr->ch_id = id;
 	hdr->pkt_len = skb->len - sizeof(struct bam_mux_hdr);
 	if (skb->len & 0x3)
@@ -825,7 +961,7 @@ int msm_bam_dmux_write(uint32_t id, struct sk_buff *skb)
 	hdr->pad_len = skb->len - (sizeof(struct bam_mux_hdr) + hdr->pkt_len);
 
 	DBG("%s: data %p, tail %p skb len %d pkt len %d pad len %d\n",
-	    __func__, skb->data, skb->tail, skb->len,
+	    __func__, skb->data, skb_tail_pointer(skb), skb->len,
 	    hdr->pkt_len, hdr->pad_len);
 
 	pkt = kmalloc(sizeof(struct tx_pkt_info), GFP_ATOMIC);
@@ -834,7 +970,7 @@ int msm_bam_dmux_write(uint32_t id, struct sk_buff *skb)
 		goto write_fail2;
 	}
 
-	dma_address = dma_map_single(NULL, skb->data, skb->len,
+	dma_address = dma_map_single(dma_dev, skb->data, skb->len,
 					bam_ops->dma_to);
 	if (!dma_address) {
 		pr_err("%s: dma_map_single() failed\n", __func__);
@@ -855,7 +991,7 @@ int msm_bam_dmux_write(uint32_t id, struct sk_buff *skb)
 		list_del(&pkt->list_node);
 		DBG_INC_TX_SPS_FAILURE_CNT();
 		spin_unlock_irqrestore(&bam_tx_pool_spinlock, flags);
-		dma_unmap_single(NULL, pkt->dma_address,
+		dma_unmap_single(dma_dev, pkt->dma_address,
 					pkt->skb->len,	bam_ops->dma_to);
 		kfree(pkt);
 		if (new_skb)
@@ -881,6 +1017,64 @@ write_fail:
 	read_unlock(&ul_wakeup_lock);
 	srcu_read_unlock(&bam_dmux_srcu, rcu_id);
 	return -ENOMEM;
+}
+
+/**
+ * create_open_signal() - Generate a proper signal field for outgoing open cmds
+ *
+ * A properly constructed signal field of the mux header for opem commands semt
+ * to the remote side depend on what has been locally configured, and what has
+ * been received from the remote side.  The byte value to code translations
+ * must match the valid values in set_rx_buffer_ring_pool() and set_dl_mtu().
+ *
+ * Return: A properly constructed signal field for an outgoing mux open command.
+ */
+static uint8_t create_open_signal(void)
+{
+	uint8_t signal = 0;
+	uint8_t buff_count = 0;
+	uint8_t dl_size = 0;
+
+	if (!dynamic_mtu_enabled)
+		return signal;
+
+	signal = DYNAMIC_MTU_MASK;
+
+	switch (num_buffers) {
+	case SZ_256:
+		buff_count = 3;
+		break;
+	case SZ_128:
+		buff_count = 2;
+		break;
+	case SZ_64:
+		buff_count = 1;
+		break;
+	case SZ_32:
+		buff_count = 0;
+		break;
+	}
+
+	signal |= buff_count << DL_POOL_SIZE_SHIFT;
+
+	switch (dl_mtu) {
+	case SZ_16K:
+		dl_size = 3;
+		break;
+	case SZ_8K:
+		dl_size = 2;
+		break;
+	case SZ_4K:
+		dl_size = 1;
+		break;
+	case SZ_2K:
+		dl_size = 0;
+		break;
+	}
+
+	signal |= dl_size << MTU_SIZE_SHIFT;
+
+	return signal;
 }
 
 int msm_bam_dmux_open(uint32_t id, void *priv,
@@ -930,6 +1124,8 @@ int msm_bam_dmux_open(uint32_t id, void *priv,
 	bam_ch[id].use_wm = 0;
 	spin_unlock_irqrestore(&bam_ch[id].lock, flags);
 
+	notify(priv, BAM_DMUX_TRANSMIT_SIZE, ul_mtu);
+
 	read_lock(&ul_wakeup_lock);
 	if (!bam_is_connected) {
 		read_unlock(&ul_wakeup_lock);
@@ -944,7 +1140,7 @@ int msm_bam_dmux_open(uint32_t id, void *priv,
 
 	hdr->magic_num = BAM_MUX_HDR_MAGIC_NO;
 	hdr->cmd = BAM_MUX_HDR_CMD_OPEN;
-	hdr->reserved = 0;
+	hdr->signal = create_open_signal();
 	hdr->ch_id = id;
 	hdr->pkt_len = 0;
 	hdr->pad_len = 0;
@@ -999,7 +1195,7 @@ int msm_bam_dmux_close(uint32_t id)
 	}
 	hdr->magic_num = BAM_MUX_HDR_MAGIC_NO;
 	hdr->cmd = BAM_MUX_HDR_CMD_CLOSE;
-	hdr->reserved = 0;
+	hdr->signal = 0;
 	hdr->ch_id = id;
 	hdr->pkt_len = 0;
 	hdr->pad_len = 0;
@@ -1104,7 +1300,7 @@ static void rx_switch_to_interrupt_mode(void)
 		mutex_lock(&bam_rx_pool_mutexlock);
 		if (unlikely(list_empty(&bam_rx_pool))) {
 			DMUX_LOG_KERR("%s: have iovec %p but rx pool empty\n",
-				__func__, (void *)iov.addr);
+				__func__, (void *)(uintptr_t)iov.addr);
 			mutex_unlock(&bam_rx_pool_mutexlock);
 			continue;
 		}
@@ -1113,11 +1309,11 @@ static void rx_switch_to_interrupt_mode(void)
 		if (info->dma_address != iov.addr) {
 			DMUX_LOG_KERR("%s: iovec %p != dma %p\n",
 				__func__,
-				(void *)iov.addr,
-				(void *)info->dma_address);
+				(void *)(uintptr_t)iov.addr,
+				(void *)(uintptr_t)info->dma_address);
 			list_for_each_entry(info, &bam_rx_pool, list_node) {
 				DMUX_LOG_KERR("%s: dma %p\n", __func__,
-					(void *)info->dma_address);
+					(void *)(uintptr_t)info->dma_address);
 				if (iov.addr == info->dma_address)
 					break;
 			}
@@ -1126,13 +1322,17 @@ static void rx_switch_to_interrupt_mode(void)
 		list_del(&info->list_node);
 		--bam_rx_pool_len;
 		mutex_unlock(&bam_rx_pool_mutexlock);
+		info->sps_size = iov.size;
 		handle_bam_mux_cmd(&info->work);
 	}
 	return;
 
 fail:
 	pr_err("%s: reverting to polling\n", __func__);
-	queue_work_on(0, bam_mux_rx_workqueue, &rx_timer_work);
+	if (no_cpu_affinity)
+		queue_work(bam_mux_rx_workqueue, &rx_timer_work);
+	else
+		queue_work_on(0, bam_mux_rx_workqueue, &rx_timer_work);
 }
 
 /**
@@ -1191,7 +1391,7 @@ static void rx_timer_work_func(struct work_struct *work)
 			if (unlikely(list_empty(&bam_rx_pool))) {
 				DMUX_LOG_KERR(
 					"%s: have iovec %p but rx pool empty\n",
-					__func__, (void *)iov.addr);
+					__func__, (void *)(uintptr_t)iov.addr);
 				mutex_unlock(&bam_rx_pool_mutexlock);
 				continue;
 			}
@@ -1200,12 +1400,13 @@ static void rx_timer_work_func(struct work_struct *work)
 			if (info->dma_address != iov.addr) {
 				DMUX_LOG_KERR("%s: iovec %p != dma %p\n",
 					__func__,
-					(void *)iov.addr,
-					(void *)info->dma_address);
+					(void *)(uintptr_t)iov.addr,
+					(void *)(uintptr_t)info->dma_address);
 				list_for_each_entry(info, &bam_rx_pool,
 						list_node) {
 					DMUX_LOG_KERR("%s: dma %p\n", __func__,
-						(void *)info->dma_address);
+						(void *)(uintptr_t)
+							info->dma_address);
 					if (iov.addr == info->dma_address)
 						break;
 				}
@@ -1214,6 +1415,7 @@ static void rx_timer_work_func(struct work_struct *work)
 			list_del(&info->list_node);
 			--bam_rx_pool_len;
 			mutex_unlock(&bam_rx_pool_mutexlock);
+			info->sps_size = iov.size;
 			handle_bam_mux_cmd(&info->work);
 		}
 
@@ -1276,11 +1478,11 @@ static void bam_mux_tx_notify(struct sps_event_notify *notify)
 	case SPS_EVENT_EOT:
 		pkt = notify->data.transfer.user;
 		if (!pkt->is_cmd)
-			dma_unmap_single(NULL, pkt->dma_address,
+			dma_unmap_single(dma_dev, pkt->dma_address,
 						pkt->skb->len,
 						bam_ops->dma_to);
 		else
-			dma_unmap_single(NULL, pkt->dma_address,
+			dma_unmap_single(dma_dev, pkt->dma_address,
 						pkt->len,
 						bam_ops->dma_to);
 		queue_work(bam_mux_tx_workqueue, &pkt->work);
@@ -1326,9 +1528,14 @@ static void bam_mux_rx_notify(struct sps_event_notify *notify)
 			polling_mode = 1;
 			/*
 			 * run on core 0 so that netif_rx() in rmnet uses only
-			 * one queue
+			 * one queue if RPS enable use no_cpu_affinity
 			 */
-			queue_work_on(0, bam_mux_rx_workqueue, &rx_timer_work);
+			if (no_cpu_affinity)
+				queue_work(bam_mux_rx_workqueue,
+							&rx_timer_work);
+			else
+				queue_work_on(0, bam_mux_rx_workqueue,
+							&rx_timer_work);
 		}
 		break;
 	default:
@@ -1439,14 +1646,25 @@ static void debug_create(const char *name, mode_t mode,
 static void notify_all(int event, unsigned long data)
 {
 	int i;
+	unsigned long flags;
 	struct list_head *temp;
 	struct outside_notify_func *func;
+	void (*notify)(void *, int, unsigned long);
+	void *priv;
 
 	BAM_DMUX_LOG("%s: event=%d, data=%lu\n", __func__, event, data);
 
 	for (i = 0; i < BAM_DMUX_NUM_CHANNELS; ++i) {
-		if (bam_ch_is_open(i))
-			bam_ch[i].notify(bam_ch[i].priv, event, data);
+		notify = NULL;
+		priv = NULL;
+		spin_lock_irqsave(&bam_ch[i].lock, flags);
+		if (bam_ch_is_open(i)) {
+			notify = bam_ch[i].notify;
+			priv = bam_ch[i].priv;
+		}
+		spin_unlock_irqrestore(&bam_ch[i].lock, flags);
+		if (notify)
+			notify(priv, event, data);
 	}
 
 	__list_for_each(temp, &bam_other_notify_funcs) {
@@ -1599,7 +1817,7 @@ static void ul_timeout(struct work_struct *work)
 	ret = write_trylock_irqsave(&ul_wakeup_lock, flags);
 	if (!ret) { /* failed to grab lock, reschedule and bail */
 		schedule_delayed_work(&ul_timeout_work,
-				msecs_to_jiffies(UL_TIMEOUT_DELAY));
+				msecs_to_jiffies(ul_timeout_delay));
 		return;
 	}
 	if (bam_is_connected) {
@@ -1623,7 +1841,7 @@ static void ul_timeout(struct work_struct *work)
 				__func__, ul_packet_written);
 			ul_packet_written = 0;
 			schedule_delayed_work(&ul_timeout_work,
-					msecs_to_jiffies(UL_TIMEOUT_DELAY));
+					msecs_to_jiffies(ul_timeout_delay));
 		} else {
 			ul_powerdown();
 		}
@@ -1637,12 +1855,13 @@ static int ssrestart_check(void)
 	int ret = 0;
 
 	if (in_global_reset) {
-		DMUX_LOG_KERR("%s: modem timeout: already in SSR\n",
+		DMUX_LOG_KERR("%s: already in SSR\n",
 			__func__);
 		return 1;
 	}
 
-	DMUX_LOG_KERR("%s: modem timeout: BAM DMUX disabled for SSR\n",
+	DMUX_LOG_KERR(
+		"%s: fatal modem interaction: BAM DMUX disabled for SSR\n",
 								__func__);
 	in_global_reset = 1;
 	ret = subsystem_restart("modem");
@@ -1709,7 +1928,7 @@ static void ul_wakeup(void)
 		if (likely(do_vote_dfab))
 			vote_dfab();
 		schedule_delayed_work(&ul_timeout_work,
-				msecs_to_jiffies(UL_TIMEOUT_DELAY));
+				msecs_to_jiffies(ul_timeout_delay));
 		bam_is_connected = 1;
 		mutex_unlock(&wakeup_lock);
 		return;
@@ -1754,7 +1973,7 @@ static void ul_wakeup(void)
 	bam_is_connected = 1;
 	BAM_DMUX_LOG("%s complete\n", __func__);
 	schedule_delayed_work(&ul_timeout_work,
-				msecs_to_jiffies(UL_TIMEOUT_DELAY));
+				msecs_to_jiffies(ul_timeout_delay));
 	mutex_unlock(&wakeup_lock);
 }
 
@@ -1762,16 +1981,19 @@ static void reconnect_to_bam(void)
 {
 	int i;
 
-	in_global_reset = 0;
-	in_ssr = 0;
+	if (in_global_reset) {
+		BAM_DMUX_LOG("%s: skipping due to SSR\n", __func__);
+		return;
+	}
+
 	vote_dfab();
 
 	if (ssr_skipped_disconnect) {
 		/* delayed to here to prevent bus stall */
 		bam_ops->sps_disconnect_ptr(bam_tx_pipe);
 		bam_ops->sps_disconnect_ptr(bam_rx_pipe);
-		__memzero(rx_desc_mem_buf.base, rx_desc_mem_buf.size);
-		__memzero(tx_desc_mem_buf.base, tx_desc_mem_buf.size);
+		memset(rx_desc_mem_buf.base, 0, rx_desc_mem_buf.size);
+		memset(tx_desc_mem_buf.base, 0, tx_desc_mem_buf.size);
 	}
 	ssr_skipped_disconnect = 0;
 	i = bam_ops->sps_device_reset_ptr(a2_device_handle);
@@ -1839,16 +2061,16 @@ static void disconnect_to_bam(void)
 	/* tear down BAM connection */
 	INIT_COMPLETION(bam_connection_completion);
 
-	/* in_ssr documentation/assumptions found in restart_notifier_cb */
-	if (likely(!in_ssr)) {
+	/* documentation/assumptions found in restart_notifier_cb */
+	if (likely(!in_global_reset)) {
 		BAM_DMUX_LOG("%s: disconnect tx\n", __func__);
 		bam_ops->sps_disconnect_ptr(bam_tx_pipe);
 		BAM_DMUX_LOG("%s: disconnect rx\n", __func__);
 		bam_ops->sps_disconnect_ptr(bam_rx_pipe);
-		__memzero(rx_desc_mem_buf.base, rx_desc_mem_buf.size);
-		__memzero(tx_desc_mem_buf.base, tx_desc_mem_buf.size);
+		memset(rx_desc_mem_buf.base, 0, rx_desc_mem_buf.size);
+		memset(tx_desc_mem_buf.base, 0, tx_desc_mem_buf.size);
 		BAM_DMUX_LOG("%s: device reset\n", __func__);
-		sps_device_reset(a2_device_handle);
+		bam_ops->sps_device_reset_ptr(a2_device_handle);
 	} else {
 		ssr_skipped_disconnect = 1;
 	}
@@ -1859,7 +2081,7 @@ static void disconnect_to_bam(void)
 		node = bam_rx_pool.next;
 		list_del(node);
 		info = container_of(node, struct rx_pkt_info, list_node);
-		dma_unmap_single(NULL, info->dma_address, BUFFER_SIZE,
+		dma_unmap_single(dma_dev, info->dma_address, info->len,
 							bam_ops->dma_from);
 		dev_kfree_skb_any(info->skb);
 		kfree(info);
@@ -1974,12 +2196,13 @@ static int restart_notifier_cb(struct notifier_block *this,
 	if (code == SUBSYS_BEFORE_SHUTDOWN) {
 		BAM_DMUX_LOG("%s: begin\n", __func__);
 		in_global_reset = 1;
-		in_ssr = 1;
-		/* wait till all bam_dmux writes completes */
+		/* sync to ensure the driver sees SSR */
 		synchronize_srcu(&bam_dmux_srcu);
 		BAM_DMUX_LOG("%s: ssr signaling complete\n", __func__);
 		flush_workqueue(bam_mux_rx_workqueue);
 	}
+	if (code == SUBSYS_BEFORE_POWERUP)
+		in_global_reset = 0;
 	if (code != SUBSYS_AFTER_SHUTDOWN)
 		return NOTIFY_DONE;
 
@@ -1998,6 +2221,9 @@ static int restart_notifier_cb(struct notifier_block *this,
 	ul_powerdown_finish();
 	a2_pc_disabled = 0;
 	a2_pc_disabled_wakelock_skipped = 0;
+	process_dynamic_mtu(false);
+	set_ul_mtu(0, true);
+	dynamic_mtu_enabled = false;
 
 	/* Cleanup Channel States */
 	mutex_lock(&bam_pdev_mutexlock);
@@ -2023,12 +2249,12 @@ static int restart_notifier_cb(struct notifier_block *this,
 		info = container_of(node, struct tx_pkt_info,
 							list_node);
 		if (!info->is_cmd) {
-			dma_unmap_single(NULL, info->dma_address,
+			dma_unmap_single(dma_dev, info->dma_address,
 						info->skb->len,
 						bam_ops->dma_to);
 			dev_kfree_skb_any(info->skb);
 		} else {
-			dma_unmap_single(NULL, info->dma_address,
+			dma_unmap_single(dma_dev, info->dma_address,
 						info->len,
 						bam_ops->dma_to);
 			kfree(info->skb);
@@ -2043,26 +2269,26 @@ static int restart_notifier_cb(struct notifier_block *this,
 
 static int bam_init(void)
 {
-	u32 h;
+	unsigned long h;
 	dma_addr_t dma_addr;
 	int ret;
 	void *a2_virt_addr;
 	int skip_iounmap = 0;
 
+	in_global_reset = 0;
 	vote_dfab();
 	/* init BAM */
-	a2_virt_addr = ioremap_nocache((unsigned long)(a2_phys_base),
-							a2_phys_size);
+	a2_virt_addr = ioremap_nocache(a2_phys_base, a2_phys_size);
 	if (!a2_virt_addr) {
 		pr_err("%s: ioremap failed\n", __func__);
 		ret = -ENOMEM;
 		goto ioremap_failed;
 	}
-	a2_props.phys_addr = (u32)(a2_phys_base);
+	a2_props.phys_addr = a2_phys_base;
 	a2_props.virt_addr = a2_virt_addr;
 	a2_props.virt_size = a2_phys_size;
 	a2_props.irq = a2_bam_irq;
-	a2_props.options = SPS_BAM_OPT_IRQ_WAKEUP;
+	a2_props.options = SPS_BAM_OPT_IRQ_WAKEUP | SPS_BAM_HOLD_MEM;
 	a2_props.num_pipes = A2_NUM_PIPES;
 	a2_props.summing_threshold = A2_SUMMING_THRESHOLD;
 	a2_props.constrained_logging = true;
@@ -2096,7 +2322,7 @@ static int bam_init(void)
 	tx_connection.mode = SPS_MODE_DEST;
 	tx_connection.options = SPS_O_AUTO_ENABLE | SPS_O_EOT;
 	tx_desc_mem_buf.size = 0x800; /* 2k */
-	tx_desc_mem_buf.base = dma_alloc_coherent(NULL, tx_desc_mem_buf.size,
+	tx_desc_mem_buf.base = dma_alloc_coherent(dma_dev, tx_desc_mem_buf.size,
 							&dma_addr, 0);
 	if (tx_desc_mem_buf.base == NULL) {
 		pr_err("%s: tx memory alloc failed\n", __func__);
@@ -2134,7 +2360,7 @@ static int bam_init(void)
 	rx_connection.options = SPS_O_AUTO_ENABLE | SPS_O_EOT |
 					SPS_O_ACK_TRANSFERS;
 	rx_desc_mem_buf.size = 0x800; /* 2k */
-	rx_desc_mem_buf.base = dma_alloc_coherent(NULL, rx_desc_mem_buf.size,
+	rx_desc_mem_buf.base = dma_alloc_coherent(dma_dev, rx_desc_mem_buf.size,
 							&dma_addr, 0);
 	if (rx_desc_mem_buf.base == NULL) {
 		pr_err("%s: rx memory alloc failed\n", __func__);
@@ -2190,7 +2416,7 @@ static int bam_init(void)
 rx_event_reg_failed:
 	bam_ops->sps_disconnect_ptr(bam_rx_pipe);
 rx_connect_failed:
-	dma_free_coherent(NULL, rx_desc_mem_buf.size, rx_desc_mem_buf.base,
+	dma_free_coherent(dma_dev, rx_desc_mem_buf.size, rx_desc_mem_buf.base,
 				rx_desc_mem_buf.phys_base);
 rx_mem_failed:
 rx_get_config_failed:
@@ -2198,7 +2424,7 @@ rx_get_config_failed:
 rx_alloc_endpoint_failed:
 	bam_ops->sps_disconnect_ptr(bam_tx_pipe);
 tx_connect_failed:
-	dma_free_coherent(NULL, tx_desc_mem_buf.size, tx_desc_mem_buf.base,
+	dma_free_coherent(dma_dev, tx_desc_mem_buf.size, tx_desc_mem_buf.base,
 				tx_desc_mem_buf.phys_base);
 tx_get_config_failed:
 	bam_ops->sps_free_endpoint_ptr(bam_tx_pipe);
@@ -2239,7 +2465,9 @@ static void toggle_apps_ack(void)
 static void bam_dmux_smsm_cb(void *priv, uint32_t old_state, uint32_t new_state)
 {
 	static int last_processed_state;
+	int rcu_id;
 
+	rcu_id = srcu_read_lock(&bam_dmux_srcu);
 	mutex_lock(&smsm_cb_lock);
 	bam_dmux_power_state = new_state & SMSM_A2_POWER_CONTROL ? 1 : 0;
 	DBG_INC_A2_POWER_CONTROL_IN_CNT();
@@ -2248,6 +2476,7 @@ static void bam_dmux_smsm_cb(void *priv, uint32_t old_state, uint32_t new_state)
 	if (last_processed_state == (new_state & SMSM_A2_POWER_CONTROL)) {
 		BAM_DMUX_LOG("%s: already processed this state\n", __func__);
 		mutex_unlock(&smsm_cb_lock);
+		srcu_read_unlock(&bam_dmux_srcu, rcu_id);
 		return;
 	}
 
@@ -2271,16 +2500,20 @@ static void bam_dmux_smsm_cb(void *priv, uint32_t old_state, uint32_t new_state)
 		pr_err("%s: unsupported state change\n", __func__);
 	}
 	mutex_unlock(&smsm_cb_lock);
-
+	srcu_read_unlock(&bam_dmux_srcu, rcu_id);
 }
 
 static void bam_dmux_smsm_ack_cb(void *priv, uint32_t old_state,
 						uint32_t new_state)
 {
+	int rcu_id;
+
+	rcu_id = srcu_read_lock(&bam_dmux_srcu);
 	DBG_INC_ACK_IN_CNT();
 	BAM_DMUX_LOG("%s: 0x%08x -> 0x%08x\n", __func__, old_state,
 			new_state);
 	complete_all(&ul_wakeup_ack_completion);
+	srcu_read_unlock(&bam_dmux_srcu, rcu_id);
 }
 
 /**
@@ -2309,6 +2542,9 @@ void msm_bam_dmux_deinit(void)
 {
 	restart_notifier_cb(NULL, SUBSYS_BEFORE_SHUTDOWN, NULL);
 	restart_notifier_cb(NULL, SUBSYS_AFTER_SHUTDOWN, NULL);
+	restart_notifier_cb(NULL, SUBSYS_BEFORE_POWERUP, NULL);
+	restart_notifier_cb(NULL, SUBSYS_AFTER_POWERUP, NULL);
+	in_global_reset = 0;
 }
 EXPORT_SYMBOL(msm_bam_dmux_deinit);
 
@@ -2317,21 +2553,81 @@ EXPORT_SYMBOL(msm_bam_dmux_deinit);
  */
 void msm_bam_dmux_reinit(void)
 {
+	bam_mux_initialized = 0;
 	bam_ops->smsm_state_cb_register_ptr(SMSM_MODEM_STATE,
 			SMSM_A2_POWER_CONTROL,
 			bam_dmux_smsm_cb, NULL);
 	bam_ops->smsm_state_cb_register_ptr(SMSM_MODEM_STATE,
 			SMSM_A2_POWER_CONTROL_ACK,
 			bam_dmux_smsm_ack_cb, NULL);
-	bam_mux_initialized = 0;
-	bam_init();
 }
 EXPORT_SYMBOL(msm_bam_dmux_reinit);
+
+/**
+ * set_rx_buffer_ring_pool() - Configure the size of the rx ring pool to a
+ *			       supported value.
+ * @requested_buffs:	Desired pool size.
+ *
+ * The requested size will be reduced to the largest supported size.  The
+ * supported sizes must match the values in create_open_signal() for proper
+ * signal field construction in that function.
+ */
+static void set_rx_buffer_ring_pool(int requested_buffs)
+{
+	if (requested_buffs >= SZ_256) {
+		num_buffers = SZ_256;
+		return;
+	}
+
+	if (requested_buffs >= SZ_128) {
+		num_buffers = SZ_128;
+		return;
+	}
+
+	if (requested_buffs >= SZ_64) {
+		num_buffers = SZ_64;
+		return;
+	}
+
+	num_buffers = SZ_32;
+}
+
+/**
+ * set_dl_mtu() - Configure the non-default MTU to a supported value.
+ * @requested_mtu:	Desired MTU size.
+ *
+ * Sets the dynamic receive MTU which can be enabled via negotiation with the
+ * remote side.  Until the dynamic MTU is enabled, the default MTU will be used.
+ * The requested size will be reduced to the largest supported size.  The
+ * supported sizes must match the values in create_open_signal() for proper
+ * signal field construction in that function.
+ */
+static void set_dl_mtu(int requested_mtu)
+{
+	if (requested_mtu >= SZ_16K) {
+		dl_mtu = SZ_16K;
+		return;
+	}
+
+	if (requested_mtu >= SZ_8K) {
+		dl_mtu = SZ_8K;
+		return;
+	}
+
+	if (requested_mtu >= SZ_4K) {
+		dl_mtu = SZ_4K;
+		return;
+	}
+
+	dl_mtu = SZ_2K;
+}
 
 static int bam_dmux_probe(struct platform_device *pdev)
 {
 	int rc;
 	struct resource *r;
+	void *subsys_h;
+	uint32_t requested_dl_mtu;
 
 	DBG("%s probe called\n", __func__);
 	if (bam_mux_initialized)
@@ -2343,7 +2639,7 @@ static int bam_dmux_probe(struct platform_device *pdev)
 			pr_err("%s: reg field missing\n", __func__);
 			return -ENODEV;
 		}
-		a2_phys_base = (void *)(r->start);
+		a2_phys_base = r->start;
 		a2_phys_size = (uint32_t)(resource_size(r));
 		a2_bam_irq = platform_get_irq(pdev, 0);
 		if (a2_bam_irq == -ENXIO) {
@@ -2362,19 +2658,56 @@ static int bam_dmux_probe(struct platform_device *pdev)
 			num_buffers = DEFAULT_NUM_BUFFERS;
 		}
 
-		DBG("%s: base:%p size:%x irq:%d satellite:%d num_buffs:%d\n",
-							__func__,
-							a2_phys_base,
-							a2_phys_size,
-							a2_bam_irq,
-							satellite_mode,
-							num_buffers);
+		set_rx_buffer_ring_pool(num_buffers);
+
+		rc = of_property_read_u32(pdev->dev.of_node,
+						"qcom,max-rx-mtu",
+						&requested_dl_mtu);
+		if (rc) {
+			DBG("%s: falling back to dl_mtu default, rc:%d\n",
+							__func__, rc);
+			requested_dl_mtu = 0;
+		}
+
+		set_dl_mtu(requested_dl_mtu);
+
+		no_cpu_affinity = of_property_read_bool(pdev->dev.of_node,
+						"qcom,no-cpu-affinity");
+
+		rc = of_property_read_bool(pdev->dev.of_node,
+						"qcom,fast-shutdown");
+		if (rc) {
+			ul_timeout_delay = UL_FAST_TIMEOUT_DELAY;
+		}
+
+		BAM_DMUX_LOG(
+			"%s: base:%p size:%x irq:%d satellite:%d num_buffs:%d dl_mtu:%x cpu-affinity:%d ul_timeout_delay:%d\n",
+						__func__,
+						(void *)(uintptr_t)a2_phys_base,
+						a2_phys_size,
+						a2_bam_irq,
+						satellite_mode,
+						num_buffers,
+						dl_mtu,
+						no_cpu_affinity,
+						ul_timeout_delay);
 	} else { /* fallback to default init data */
-		a2_phys_base = (void *)(A2_PHYS_BASE);
+		a2_phys_base = A2_PHYS_BASE;
 		a2_phys_size = A2_PHYS_SIZE;
 		a2_bam_irq = A2_BAM_IRQ;
 		num_buffers = DEFAULT_NUM_BUFFERS;
+		set_rx_buffer_ring_pool(num_buffers);
 	}
+
+	dma_dev = &pdev->dev;
+	/* The BAM only suports 32 bits of address */
+	dma_dev->dma_mask = kmalloc(sizeof(*dma_dev->dma_mask), GFP_KERNEL);
+	if (!dma_dev->dma_mask) {
+		DMUX_LOG_KERR("%s: cannot allocate dma_mask\n", __func__);
+		return -ENOMEM;
+	}
+	*dma_dev->dma_mask = DMA_BIT_MASK(32);
+	dma_dev->coherent_dma_mask = DMA_BIT_MASK(32);
 
 	xo_clk = clk_get(&pdev->dev, "xo");
 	if (IS_ERR(xo_clk)) {
@@ -2430,11 +2763,21 @@ static int bam_dmux_probe(struct platform_device *pdev)
 	wake_lock_init(&bam_wakelock, WAKE_LOCK_SUSPEND, "bam_dmux_wakelock");
 	init_srcu_struct(&bam_dmux_srcu);
 
+	subsys_h = subsys_notif_register_notifier("modem", &restart_notifier);
+	if (IS_ERR(subsys_h)) {
+		destroy_workqueue(bam_mux_rx_workqueue);
+		destroy_workqueue(bam_mux_tx_workqueue);
+		rc = (int)PTR_ERR(subsys_h);
+		pr_err("%s: failed to register for ssr rc: %d\n", __func__, rc);
+		return rc;
+	}
+
 	rc = bam_ops->smsm_state_cb_register_ptr(SMSM_MODEM_STATE,
 			SMSM_A2_POWER_CONTROL,
 			bam_dmux_smsm_cb, NULL);
 
 	if (rc) {
+		subsys_notif_unregister_notifier(subsys_h, &restart_notifier);
 		destroy_workqueue(bam_mux_rx_workqueue);
 		destroy_workqueue(bam_mux_tx_workqueue);
 		pr_err("%s: smsm cb register failed, rc: %d\n", __func__, rc);
@@ -2446,6 +2789,7 @@ static int bam_dmux_probe(struct platform_device *pdev)
 			bam_dmux_smsm_ack_cb, NULL);
 
 	if (rc) {
+		subsys_notif_unregister_notifier(subsys_h, &restart_notifier);
 		destroy_workqueue(bam_mux_rx_workqueue);
 		destroy_workqueue(bam_mux_tx_workqueue);
 		bam_ops->smsm_state_cb_deregister_ptr(SMSM_MODEM_STATE,
@@ -2493,14 +2837,14 @@ static int __init bam_dmux_init(void)
 	}
 #endif
 
-	bam_ipc_log_txt = ipc_log_context_create(BAM_IPC_LOG_PAGES, "bam_dmux");
+	bam_ipc_log_txt = ipc_log_context_create(BAM_IPC_LOG_PAGES, "bam_dmux",
+			0);
 	if (!bam_ipc_log_txt) {
 		pr_err("%s : unable to create IPC Logging Context", __func__);
 	}
 
 	rx_timer_interval = DEFAULT_POLLING_MIN_SLEEP;
 
-	subsys_notif_register_notifier("modem", &restart_notifier);
 	return platform_driver_register(&bam_dmux_driver);
 }
 

@@ -1,7 +1,7 @@
 /* arch/arm/mach-msm/include/mach/board.h
  *
  * Copyright (C) 2007 Google, Inc.
- * Copyright (c) 2008-2014, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2008-2015, The Linux Foundation. All rights reserved.
  * Author: Brian Swetland <swetland@google.com>
  *
  * This software is licensed under the terms of the GNU General Public
@@ -25,11 +25,13 @@
 #include <linux/clkdev.h>
 #include <linux/of_platform.h>
 #include <linux/ssbi.h>
-#include <mach/msm_bus.h>
+#include <linux/msm-bus.h>
 
+#define RF_TYPE_4  0x4
 #define RF_TYPE_16 0x10
 #define RF_TYPE_17 0x11
 #define RF_TYPE_18 0x12
+#define RF_TYPE_19 0x13
 #define RF_TYPE_32 0x20
 #define RF_TYPE_33 0x21
 #define RF_TYPE_48 0x30
@@ -526,11 +528,12 @@ struct msm_mhl_platform_data {
  *       unprepare_disable) is controlled by i2c-transaction's begining and
  *       ending. When false, the clock's state is controlled by runtime-pm
  *       events.
- * @active_only when set, votes when system active and removes the vote when
- *       system goes idle (optimises for performance). When unset, voting using
- *       runtime pm (optimizes for power).
  * @master_id master id number of the i2c core or its wrapper (BLSP/GSBI).
  *       When zero, clock path voting is disabled.
+ * @noise_rjct_sda Number of low samples on data line to consider it low.
+ *       Range of values is 0-3. When missing default to 0.
+ * @noise_rjct_scl Number of low samples on clock line to consider it low.
+ *       Range of values is 0-3. When missing default to 0.
  */
 struct msm_i2c_platform_data {
 	int clk_freq;
@@ -543,10 +546,11 @@ struct msm_i2c_platform_data {
 	int aux_clk;
 	int aux_dat;
 	int src_clk_rate;
+	int noise_rjct_sda;
+	int noise_rjct_scl;
 	int use_gsbi_shared_mode;
 	int keep_ahb_clk_on;
 	void (*msm_i2c_config_gpio)(int iface, int config_type);
-	bool active_only;
 	uint32_t master_id;
 };
 
@@ -627,10 +631,12 @@ void msm_map_fsm9xxx_io(void);
 void msm_map_fsm9900_io(void);
 void fsm9900_init_gpiomux(void);
 void fsm9900_rf_init_gpiomux(void);
+void msm_map_fsm9010_io(void);
 void msm_map_8974_io(void);
 void msm_map_8084_io(void);
 void msm_map_mdm9630_io(void);
-void msm_map_msmsamarium_io(void);
+void msm_map_mdm9640_io(void);
+void msm_map_msmvpipa_io(void);
 void msm_map_msm8625_io(void);
 void msm_map_msm9625_io(void);
 void msm_init_irq(void);
@@ -642,15 +648,15 @@ void msm_8974_init_gpiomux(void);
 void apq8084_init_gpiomux(void);
 void msm9625_init_gpiomux(void);
 void mdm9630_init_gpiomux(void);
-void msmsamarium_init_gpiomux(void);
-void msm_map_mpq8092_io(void);
-void mpq8092_init_gpiomux(void);
+void msm_map_msm8916_io(void);
+void msm_map_msm8909_io(void);
 void msm_map_msm8226_io(void);
 void msm8226_init_irq(void);
 void msm8226_init_gpiomux(void);
 void msm8610_init_gpiomux(void);
 void msm_map_msm8610_io(void);
 void msm8610_init_irq(void);
+void msm_map_mdmfermium_io(void);
 
 /* Dump debug info (states, rate, etc) of clocks */
 #if defined(CONFIG_ARCH_MSM7X27)

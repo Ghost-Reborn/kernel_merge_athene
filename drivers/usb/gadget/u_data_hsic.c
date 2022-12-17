@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2013, Linux Foundation. All rights reserved.
+/* Copyright (c) 2011-2014, Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -20,8 +20,10 @@
 #include <linux/debugfs.h>
 #include <linux/bitops.h>
 #include <linux/termios.h>
-#include <mach/usb_bridge.h>
-#include <mach/usb_gadget_xport.h>
+#include <linux/usb/usb_bridge.h>
+
+#include "f_qdss.h"
+#include "usb_gadget_xport.h"
 
 static unsigned int no_data_ports;
 
@@ -31,6 +33,10 @@ static unsigned int no_data_ports;
 #define GHSIC_DATA_SERIAL_TX_Q_SIZE		20
 #define GHSIC_DATA_RX_REQ_SIZE			2048
 #define GHSIC_DATA_TX_INTR_THRESHOLD		20
+#define GHSIC_DATA_QDSS_TX_Q_SIZE		300
+
+static unsigned int ghsic_data_qdss_tx_q_size = GHSIC_DATA_QDSS_TX_Q_SIZE;
+module_param(ghsic_data_qdss_tx_q_size, uint, S_IRUGO | S_IWUSR);
 
 static unsigned int ghsic_data_rmnet_tx_q_size = GHSIC_DATA_RMNET_TX_Q_SIZE;
 module_param(ghsic_data_rmnet_tx_q_size, uint, S_IRUGO | S_IWUSR);
@@ -150,7 +156,7 @@ static int ghsic_data_alloc_requests(struct usb_ep *ep, struct list_head *head,
 	struct usb_request	*req;
 	unsigned long		flags;
 
-	pr_debug("%s: ep:%s head:%p num:%d cb:%p", __func__,
+	pr_debug("%s: ep:%s head:%pK num:%d cb:%pK", __func__,
 			ep->name, head, num, cb);
 
 	for (i = 0; i < num; i++) {
@@ -266,7 +272,7 @@ static int ghsic_data_receive(void *p, void *data, size_t len)
 		return -ENOTCONN;
 	}
 
-	pr_debug("%s: p:%p#%d skb_len:%d\n", __func__,
+	pr_debug("%s: p:%pK#%d skb_len:%d\n", __func__,
 			port, port->port_num, skb->len);
 
 	spin_lock_irqsave(&port->tx_lock, flags);
@@ -310,7 +316,7 @@ static void ghsic_data_write_tomdm(struct work_struct *w)
 	}
 
 	while ((skb = __skb_dequeue(&port->rx_skb_q))) {
-		pr_debug("%s: port:%p tom:%lu pno:%d\n", __func__,
+		pr_debug("%s: port:%pK tom:%lu pno:%d\n", __func__,
 				port, port->to_modem, port->port_num);
 
 		info = (struct timestamp_info *)skb->cb;
@@ -418,7 +424,7 @@ static void ghsic_data_start_rx(struct gdata_port *port)
 	struct timestamp_info	*info;
 	unsigned int		created;
 
-	pr_debug("%s: port:%p\n", __func__, port);
+	pr_debug("%s: port:%pK\n", __func__, port);
 	if (!port)
 		return;
 
@@ -475,7 +481,7 @@ static void ghsic_data_start_io(struct gdata_port *port)
 	struct usb_ep	*ep_out, *ep_in;
 	int		ret;
 
-	pr_debug("%s: port:%p\n", __func__, port);
+	pr_debug("%s: port:%pK\n", __func__, port);
 
 	if (!port)
 		return;
@@ -483,22 +489,31 @@ static void ghsic_data_start_io(struct gdata_port *port)
 	spin_lock_irqsave(&port->rx_lock, flags);
 	ep_out = port->out;
 	spin_unlock_irqrestore(&port->rx_lock, flags);
-	if (!ep_out)
-		return;
 
-	ret = ghsic_data_alloc_requests(ep_out, &port->rx_idle,
-		port->rx_q_size, ghsic_data_epout_complete, &port->rx_lock);
-	if (ret) {
-		pr_err("%s: rx req allocation failed\n", __func__);
-		return;
+	if (ep_out) {
+		ret = ghsic_data_alloc_requests(ep_out,
+					&port->rx_idle,
+					port->rx_q_size,
+					ghsic_data_epout_complete,
+					&port->rx_lock);
+
+		pr_debug("%s: ret:%u\n", __func__, ret);
+
+		if (ret) {
+			pr_err("%s: rx req allocation failed\n", __func__);
+			return;
+		}
 	}
 
 	spin_lock_irqsave(&port->tx_lock, flags);
 	ep_in = port->in;
 	spin_unlock_irqrestore(&port->tx_lock, flags);
+	pr_debug("%s: ep_in:%pK\n", __func__, ep_in);
+
 	if (!ep_in) {
 		spin_lock_irqsave(&port->rx_lock, flags);
-		ghsic_data_free_requests(ep_out, &port->rx_idle);
+		if (ep_out)
+			ghsic_data_free_requests(ep_out, &port->rx_idle);
 		spin_unlock_irqrestore(&port->rx_lock, flags);
 		return;
 	}
@@ -508,7 +523,8 @@ static void ghsic_data_start_io(struct gdata_port *port)
 	if (ret) {
 		pr_err("%s: tx req allocation failed\n", __func__);
 		spin_lock_irqsave(&port->rx_lock, flags);
-		ghsic_data_free_requests(ep_out, &port->rx_idle);
+		if (ep_out)
+			ghsic_data_free_requests(ep_out, &port->rx_idle);
 		spin_unlock_irqrestore(&port->rx_lock, flags);
 		return;
 	}
@@ -522,12 +538,14 @@ static void ghsic_data_connect_w(struct work_struct *w)
 	struct gdata_port	*port =
 		container_of(w, struct gdata_port, connect_w);
 	int			ret;
-
+	printk("%s: connected=%d, CH_READY=%d, port=%pK\n",
+		__func__, atomic_read(&port->connected),
+		test_bit(CH_READY, &port->bridge_sts), port);
 	if (!port || !atomic_read(&port->connected) ||
 		!test_bit(CH_READY, &port->bridge_sts))
 		return;
 
-	pr_debug("%s: port:%p\n", __func__, port);
+	pr_debug("%s: port:%pK\n", __func__, port);
 
 	ret = data_bridge_open(&port->brdg);
 	if (ret) {
@@ -724,8 +742,7 @@ static int ghsic_data_port_alloc(unsigned port_num, enum gadget_type gtype)
 	pdrv->driver.owner = THIS_MODULE;
 
 	platform_driver_register(pdrv);
-
-	pr_debug("%s: port:%p portno:%d\n", __func__, port, port_num);
+	pr_debug("%s: port:%pK portno:%d\n", __func__, port, port_num);
 
 	return 0;
 }
@@ -782,6 +799,7 @@ int ghsic_data_connect(void *gptr, int port_num)
 {
 	struct gdata_port		*port;
 	struct gserial			*gser;
+	struct gqdss			*qdss;
 	struct grmnet			*gr;
 	unsigned long			flags;
 	int				ret = 0;
@@ -799,7 +817,7 @@ int ghsic_data_connect(void *gptr, int port_num)
 		pr_err("%s: port is null\n", __func__);
 		return -ENODEV;
 	}
-
+	pr_debug("%s: port gtype #%d\n", __func__, port->gtype);
 	if (port->gtype == USB_GADGET_SERIAL) {
 		gser = gptr;
 
@@ -815,9 +833,8 @@ int ghsic_data_connect(void *gptr, int port_num)
 		port->rx_q_size = ghsic_data_serial_rx_q_size;
 		gser->in->driver_data = port;
 		gser->out->driver_data = port;
-	} else {
+	} else if (port->gtype == USB_GADGET_RMNET) {
 		gr = gptr;
-
 		spin_lock_irqsave(&port->tx_lock, flags);
 		port->in = gr->in;
 		spin_unlock_irqrestore(&port->tx_lock, flags);
@@ -830,21 +847,30 @@ int ghsic_data_connect(void *gptr, int port_num)
 		port->rx_q_size = ghsic_data_rmnet_rx_q_size;
 		gr->in->driver_data = port;
 		gr->out->driver_data = port;
+	} else if (port->gtype == USB_GADGET_QDSS) {
+		pr_debug("%s:: port type = USB_GADGET_QDSS\n", __func__);
+		qdss = gptr;
+		spin_lock_irqsave(&port->tx_lock, flags);
+		port->in = qdss->data;
+		spin_unlock_irqrestore(&port->tx_lock, flags);
+		port->tx_q_size = ghsic_data_qdss_tx_q_size;
+		qdss->data->driver_data = port;
 	}
 
 	ret = usb_ep_enable(port->in);
 	if (ret) {
-		pr_err("%s: usb_ep_enable failed eptype:IN ep:%p",
+		pr_err("%s: usb_ep_enable failed eptype:IN ep:%pK",
 				__func__, port->in);
 		goto fail;
 	}
-
-	ret = usb_ep_enable(port->out);
-	if (ret) {
-		pr_err("%s: usb_ep_enable failed eptype:OUT ep:%p",
-				__func__, port->out);
-		usb_ep_disable(port->in);
-		goto fail;
+	if (port->out) {
+		ret = usb_ep_enable(port->out);
+		if (ret) {
+			pr_err("%s: usb_ep_enable failed eptype:OUT ep:%pK",
+					__func__, port->out);
+			usb_ep_disable(port->in);
+			goto fail;
+		}
 	}
 
 	atomic_set(&port->connected, 1);
@@ -917,7 +943,7 @@ static void dbg_timestamp(char *event, struct sk_buff * skb)
 	write_lock_irqsave(&dbg_data.lck, flags);
 
 	scnprintf(dbg_data.buf[dbg_data.idx], DBG_DATA_MSG,
-		  "%p %u[%s] %u %u %u %u %u %u\n",
+		  "%pK %u[%s] %u %u %u %u %u %u\n",
 		  skb, skb->len, event, info->created, info->rx_queued,
 		  info->rx_done, info->rx_done_sent, info->tx_queued,
 		  get_timestamp());
@@ -991,7 +1017,7 @@ static ssize_t ghsic_data_read_stats(struct file *file,
 		spin_lock_irqsave(&port->rx_lock, flags);
 		temp += scnprintf(buf + temp, DEBUG_DATA_BUF_SIZE - temp,
 				"\nName:           %s\n"
-				"#PORT:%d port#:   %p\n"
+				"#PORT:%d port#:   %pK\n"
 				"data_ch_open:	   %d\n"
 				"data_ch_ready:    %d\n"
 				"\n******UL INFO*****\n\n"

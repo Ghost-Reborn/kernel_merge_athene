@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2011-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -22,6 +22,7 @@
 #include <linux/spinlock.h>
 #include <linux/types.h>
 #include <linux/version.h>
+#include <linux/switch.h>
 
 #include "mdss_panel.h"
 #include "mdss_wb.h"
@@ -44,6 +45,11 @@ static int mdss_wb_check_params(struct mdss_panel_data *pdata,
 
 	if (!pdata || !new) {
 		pr_err("%s: Invalid input\n", __func__);
+		return -EINVAL;
+	}
+
+	if (new->xres >= 4096 || new->yres >= 4096) {
+		pr_err("%s: Invalid resolutions\n", __func__);
 		return -EINVAL;
 	}
 
@@ -122,6 +128,7 @@ static int mdss_wb_probe(struct platform_device *pdev)
 	struct mdss_panel_data *pdata = NULL;
 	struct mdss_wb_ctrl *wb_ctrl = NULL;
 	int rc = 0;
+	struct device_node *fb_node;
 
 	if (!pdev->dev.of_node)
 		return -ENODEV;
@@ -136,12 +143,12 @@ static int mdss_wb_probe(struct platform_device *pdev)
 
 	rc = !mdss_wb_parse_dt(pdev, pdata);
 	if (!rc)
-		return rc;
+		goto error_no_mem;
 
 	rc = mdss_wb_dev_init(wb_ctrl);
 	if (rc) {
 		dev_err(&pdev->dev, "unable to set up device nodes for writeback panel\n");
-		return rc;
+		goto error_no_mem;
 	}
 
 	pdata->panel_info.type = WRITEBACK_PANEL;
@@ -152,12 +159,24 @@ static int mdss_wb_probe(struct platform_device *pdev)
 	pdata->event_handler = mdss_wb_event_handler;
 	pdev->dev.platform_data = pdata;
 
-	rc = mdss_register_panel(pdev, pdata);
-	if (rc) {
-		dev_err(&pdev->dev, "unable to register writeback panel\n");
-		return rc;
+	fb_node = of_parse_phandle(pdev->dev.of_node, "qcom,mdss-fb-map", 0);
+	if (!fb_node) {
+		pr_err("Unable to find fb node for device: %s\n", pdev->name);
+		goto error_init;
 	}
 
+	rc = mdss_register_panel(pdev, pdata, fb_node);
+	if (rc) {
+		dev_err(&pdev->dev, "unable to register writeback panel\n");
+		goto error_init;
+	}
+
+	return rc;
+
+error_init:
+	mdss_wb_dev_uninit(wb_ctrl);
+error_no_mem:
+	devm_kfree(&pdev->dev, wb_ctrl);
 	return rc;
 }
 

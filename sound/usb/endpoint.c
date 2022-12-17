@@ -334,7 +334,7 @@ static void queue_pending_output_urbs(struct snd_usb_endpoint *ep)
 
 		err = usb_submit_urb(ctx->urb, GFP_ATOMIC);
 		if (err < 0)
-			snd_printk(KERN_ERR "Unable to submit urb #%d: %d (urb %p)\n",
+			snd_printk(KERN_ERR "Unable to submit urb #%d: %d (urb %pK)\n",
 				   ctx->index, err, ctx->urb);
 		else
 			set_bit(ctx->index, &ep->active_mask);
@@ -424,7 +424,7 @@ struct snd_usb_endpoint *snd_usb_add_endpoint(struct snd_usb_audio *chip,
 		if (ep->ep_num == ep_num &&
 		    ep->iface == alts->desc.bInterfaceNumber &&
 		    ep->alt_idx == alts->desc.bAlternateSetting) {
-			snd_printdd(KERN_DEBUG "Re-using EP %x in iface %d,%d @%p\n",
+			snd_printdd(KERN_DEBUG "Re-using EP %x in iface %d,%d @%pK\n",
 					ep_num, ep->iface, ep->alt_idx, ep);
 			goto __exit_unlock;
 		}
@@ -467,6 +467,10 @@ struct snd_usb_endpoint *snd_usb_add_endpoint(struct snd_usb_audio *chip,
 			ep->syncinterval = 3;
 
 		ep->syncmaxsize = le16_to_cpu(get_endpoint(alts, 1)->wMaxPacketSize);
+
+		if (chip->usb_id == USB_ID(0x0644, 0x8038) /* TEAC UD-H01 */ &&
+		    ep->syncmaxsize == 4)
+			ep->udh01_fb_quirk = 1;
 	}
 
 	list_add_tail(&ep->list, &chip->ep_list);
@@ -591,17 +595,16 @@ static int data_ep_set_params(struct snd_usb_endpoint *ep,
 	ep->stride = frame_bits >> 3;
 	ep->silence_value = pcm_format == SNDRV_PCM_FORMAT_U8 ? 0x80 : 0;
 
-	/* calculate max. frequency */
-	if (ep->maxpacksize) {
+	/* assume max. frequency is 25% higher than nominal */
+	ep->freqmax = ep->freqn + (ep->freqn >> 2);
+	maxsize = ((ep->freqmax + 0xffff) * (frame_bits >> 3))
+				>> (16 - ep->datainterval);
+	/* but wMaxPacketSize might reduce this */
+	if (ep->maxpacksize && ep->maxpacksize < maxsize) {
 		/* whatever fits into a max. size packet */
 		maxsize = ep->maxpacksize;
 		ep->freqmax = (maxsize / (frame_bits >> 3))
 				<< (16 - ep->datainterval);
-	} else {
-		/* no max. packet size: just take 25% higher than nominal */
-		ep->freqmax = ep->freqn + (ep->freqn >> 2);
-		maxsize = ((ep->freqmax + 0xffff) * (frame_bits >> 3))
-				>> (16 - ep->datainterval);
 	}
 
 	if (ep->fill_max)
@@ -954,19 +957,30 @@ int snd_usb_endpoint_deactivate(struct snd_usb_endpoint *ep)
 }
 
 /**
+ * snd_usb_endpoint_release: Tear down an snd_usb_endpoint
+ *
+ * @ep: the endpoint to release
+ *
+ * This function does not care for the endpoint's use count but will tear
+ * down all the streaming URBs immediately.
+ */
+void snd_usb_endpoint_release(struct snd_usb_endpoint *ep)
+{
+	release_urbs(ep, 1);
+}
+
+/**
  * snd_usb_endpoint_free: Free the resources of an snd_usb_endpoint
  *
  * @ep: the list header of the endpoint to free
  *
- * This function does not care for the endpoint's use count but will tear
- * down all the streaming URBs immediately and free all resources.
+ * This free all resources of the given ep.
  */
 void snd_usb_endpoint_free(struct list_head *head)
 {
 	struct snd_usb_endpoint *ep;
 
 	ep = list_entry(head, struct snd_usb_endpoint, list);
-	release_urbs(ep, 1);
 	kfree(ep);
 }
 
@@ -1076,7 +1090,16 @@ void snd_usb_handle_sync_urb(struct snd_usb_endpoint *ep,
 	if (f == 0)
 		return;
 
-	if (unlikely(ep->freqshift == INT_MIN)) {
+	if (unlikely(sender->udh01_fb_quirk)) {
+		/*
+		 * The TEAC UD-H01 firmware sometimes changes the feedback value
+		 * by +/- 0x1.0000.
+		 */
+		if (f < ep->freqn - 0x8000)
+			f += 0x10000;
+		else if (f > ep->freqn + 0x8000)
+			f -= 0x10000;
+	} else if (unlikely(ep->freqshift == INT_MIN)) {
 		/*
 		 * The first time we see a feedback value, determine its format
 		 * by shifting it left or right until it matches the nominal

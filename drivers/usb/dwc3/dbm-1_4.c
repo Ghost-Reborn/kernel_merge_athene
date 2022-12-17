@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2014, 2018 The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -119,6 +119,7 @@ static int msm_dbm_find_matching_dbm_ep(u8 usb_ep)
 		if (dbm_data->ep_num_mapping[i] == usb_ep)
 			return i;
 
+	pr_err("%s: No DBM EP matches USB EP %d", __func__, usb_ep);
 	return -ENODEV; /* Not found */
 }
 
@@ -147,12 +148,12 @@ static int soft_reset(bool reset)
  * @enter_reset - should we enter a reset state or get out of it.
  *
  */
-static int dbm_ep_soft_reset(u8 dbm_ep, bool enter_reset)
+static int ep_soft_reset(u8 dbm_ep, bool enter_reset)
 {
-	pr_debug("%s\n", __func__);
+	pr_debug("Setting DBM ep %d reset to %d\n", dbm_ep, enter_reset);
 
 	if (dbm_ep >= dbm_data->dbm_num_eps) {
-		pr_err("%s: Invalid DBM ep index\n", __func__);
+		pr_err("Invalid DBM ep index %d\n", dbm_ep);
 		return -ENODEV;
 	}
 
@@ -165,6 +166,28 @@ static int dbm_ep_soft_reset(u8 dbm_ep, bool enter_reset)
 	}
 
 	return 0;
+}
+
+
+/**
+ * Soft reset specific DBM ep (by USB EP number).
+ * This function is called by the function driver upon events
+ * such as transfer aborting, USB re-enumeration and USB
+ * disconnection.
+ *
+ * The function relies on ep_soft_reset() for checking
+ * the legality of the resulting DBM ep number.
+ *
+ * @usb_ep - USB ep number.
+ * @enter_reset - should we enter a reset state or get out of it.
+ *
+ */
+static int usb_ep_soft_reset(u8 usb_ep, bool enter_reset)
+{
+	int dbm_ep = msm_dbm_find_matching_dbm_ep(usb_ep);
+
+	pr_debug("Setting USB ep %d reset to %d\n", usb_ep, enter_reset);
+	return ep_soft_reset(dbm_ep, enter_reset);
 }
 
 
@@ -186,17 +209,17 @@ static int ep_config(u8 usb_ep, u8 bam_pipe, bool producer, bool disable_wb,
 	int dbm_ep;
 	u32 ep_cfg;
 
-	pr_debug("%s\n", __func__);
+	pr_debug("Configuring DBM ep\n");
 
 	dbm_ep = msm_dbm_find_matching_dbm_ep(usb_ep);
 
 	if (dbm_ep < 0) {
-		pr_err("%s: Invalid usb ep index\n", __func__);
+		pr_err("usb ep index %d has no corresponding dbm ep\n", usb_ep);
 		return -ENODEV;
 	}
 
 	/* First, reset the dbm endpoint */
-	dbm_ep_soft_reset(dbm_ep, 0);
+	ep_soft_reset(dbm_ep, 0);
 
 	/* Set ioc bit for dbm_ep if needed */
 	msm_dbm_write_reg_field(dbm_data->base, DBM_DBG_CNFG,
@@ -232,12 +255,12 @@ static int ep_unconfig(u8 usb_ep)
 	int dbm_ep;
 	u32 data;
 
-	pr_debug("%s\n", __func__);
+	pr_debug("Unconfiguring DB ep\n");
 
 	dbm_ep = msm_dbm_find_matching_dbm_ep(usb_ep);
 
 	if (dbm_ep < 0) {
-		pr_err("%s: Invalid usb ep index\n", __func__);
+		pr_err("usb ep index %d has no corresponding dbm ep\n", usb_ep);
 		return -ENODEV;
 	}
 
@@ -248,13 +271,13 @@ static int ep_unconfig(u8 usb_ep)
 	msm_dbm_write_reg(dbm_data->base, DBM_EP_CFG(dbm_ep), data);
 
 	/* Reset the dbm endpoint */
-	dbm_ep_soft_reset(dbm_ep, true);
+	ep_soft_reset(dbm_ep, true);
 	/*
 	 * 10 usec delay is required before deasserting DBM endpoint reset
 	 * according to hardware programming guide.
 	 */
 	udelay(10);
-	dbm_ep_soft_reset(dbm_ep, false);
+	ep_soft_reset(dbm_ep, false);
 
 	return 0;
 }
@@ -285,10 +308,10 @@ static int get_num_of_eps_configured(void)
  */
 static int event_buffer_config(u32 addr_lo, u32 addr_hi, int size)
 {
-	pr_debug("%s\n", __func__);
+	pr_debug("Configuring event buffer\n");
 
 	if (size < 0) {
-		pr_err("%s: Invalid size. size = %d", __func__, size);
+		pr_err("Invalid size. size = %d", size);
 		return -EINVAL;
 	}
 
@@ -333,7 +356,12 @@ static int data_fifo_config(u8 dep_num, phys_addr_t addr,
 
 static void set_speed(bool speed)
 {
-	msm_dbm_write_reg(dbm_data->base, DBM_GEN_CFG, speed >> 2);
+	msm_dbm_write_reg(dbm_data->base, DBM_GEN_CFG, speed);
+}
+
+static bool reset_ep_after_lpm(void)
+{
+	return false;
 }
 
 static void enable(void) {}
@@ -344,7 +372,6 @@ static int msm_dbm_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct dbm *dbm;
 	struct resource *res;
-	int ret = 0;
 
 	dbm_data = devm_kzalloc(dev, sizeof(*dbm_data), GFP_KERNEL);
 	if (!dbm_data)
@@ -354,24 +381,21 @@ static int msm_dbm_probe(struct platform_device *pdev)
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!res) {
 		dev_err(&pdev->dev, "missing memory base resource\n");
-		ret = -ENODEV;
-		goto free_dbm_data;
+		return -ENODEV;
 	}
 
 	dbm_data->base = devm_ioremap_nocache(&pdev->dev, res->start,
 		resource_size(res));
 	if (!dbm_data->base) {
 		dev_err(&pdev->dev, "ioremap failed\n");
-		ret = -ENOMEM;
-		goto free_dbm_data;
+		return -ENOMEM;
 	}
 
 
 	dbm = devm_kzalloc(dev, sizeof(*dbm), GFP_KERNEL);
 	if (!dbm) {
 		dev_err(&pdev->dev, "not enough memory\n");
-		ret = -ENOMEM;
-		goto free_dbm_data;
+		return -ENOMEM;
 	}
 
 	dbm->dev = dev;
@@ -384,24 +408,12 @@ static int msm_dbm_probe(struct platform_device *pdev)
 	dbm->data_fifo_config = data_fifo_config;
 	dbm->set_speed = set_speed;
 	dbm->enable = enable;
+	dbm->ep_soft_reset = usb_ep_soft_reset;
+	dbm->reset_ep_after_lpm = reset_ep_after_lpm;
 
 	platform_set_drvdata(pdev, dbm);
 
 	return usb_add_dbm(dbm);
-
-free_dbm_data:
-	kfree(dbm_data);
-	return ret;
-}
-
-static int msm_dbm_remove(struct platform_device *pdev)
-{
-	struct dbm *dbm = platform_get_drvdata(pdev);
-
-	kfree(dbm);
-	kfree(dbm_data);
-
-	return 0;
 }
 
 static const struct of_device_id msm_dbm_1_4_id_table[] = {
@@ -414,7 +426,6 @@ MODULE_DEVICE_TABLE(of, msm_dbm_1_4_id_table);
 
 static struct platform_driver msm_dbm_driver = {
 	.probe		= msm_dbm_probe,
-	.remove		= msm_dbm_remove,
 	.driver = {
 		.name	= "msm-usb-dbm-1-4",
 		.of_match_table = of_match_ptr(msm_dbm_1_4_id_table),

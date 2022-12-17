@@ -25,8 +25,10 @@
 #include <linux/delay.h>
 #include <linux/init.h>
 #include <linux/sched.h>
+#include <linux/bug.h>
 
 #include <linux/atomic.h>
+#include <asm/arch_timer.h>
 #include <asm/cacheflush.h>
 #include <asm/exception.h>
 #include <asm/unistd.h>
@@ -37,7 +39,13 @@
 
 #include <trace/events/exception.h>
 
-static const char *handler[]= { "prefetch abort", "data abort", "address exception", "interrupt" };
+static const char *handler[]= {
+	"prefetch abort",
+	"data abort",
+	"address exception",
+	"interrupt",
+	"undefined instruction",
+};
 
 void *vectors_page;
 
@@ -343,15 +351,17 @@ void arm_notify_die(const char *str, struct pt_regs *regs,
 int is_valid_bugaddr(unsigned long pc)
 {
 #ifdef CONFIG_THUMB2_KERNEL
-	unsigned short bkpt;
+	u16 bkpt;
+	u16 insn = __opcode_to_mem_thumb16(BUG_INSTR_VALUE);
 #else
-	unsigned long bkpt;
+	u32 bkpt;
+	u32 insn = __opcode_to_mem_arm(BUG_INSTR_VALUE);
 #endif
 
 	if (probe_kernel_address((unsigned *)pc, bkpt))
 		return 0;
 
-	return bkpt == BUG_INSTR_VALUE;
+	return bkpt == insn;
 }
 
 #endif
@@ -724,6 +734,44 @@ late_initcall(arm_mrc_hook_init);
 
 #endif
 
+static int get_timer_count_trap(struct pt_regs *regs, unsigned int instr)
+{
+	u64 cval;
+	unsigned int res;
+	int rd = (instr >> 12) & 0xF;
+	int rn =  (instr >> 16) & 0xF;
+	int read_virtual = (instr >> 4) & 1;
+
+	res = arm_check_condition(instr, regs->ARM_cpsr);
+	if (res == ARM_OPCODE_CONDTEST_FAIL) {
+		regs->ARM_pc += 4;
+		return 0;
+	}
+
+	if (rd == 15 || rn == 15)
+		return 1;
+	cval = read_virtual ?
+		arch_counter_get_cntvct() : arch_counter_get_cntpct();
+	regs->uregs[rd] = cval;
+	regs->uregs[rn] = cval >> 32;
+	regs->ARM_pc += 4;
+	return 0;
+}
+
+static struct undef_hook get_timer_count_hook = {
+	.instr_mask	= 0x0ff00fef,
+	.instr_val	= 0x0c500f0e,
+	.cpsr_mask	= MODE_MASK,
+	.cpsr_val	= USR_MODE,
+	.fn		= get_timer_count_trap,
+};
+
+void get_timer_count_hook_init(void)
+{
+	register_undef_hook(&get_timer_count_hook);
+}
+EXPORT_SYMBOL(get_timer_count_hook_init);
+
 void __bad_xchg(volatile void *ptr, int size)
 {
 	printk("xchg: bad data size: pc 0x%p, ptr 0x%p, size %d\n",
@@ -731,6 +779,51 @@ void __bad_xchg(volatile void *ptr, int size)
 	BUG();
 }
 EXPORT_SYMBOL(__bad_xchg);
+
+#ifdef CONFIG_ARM_ARCH_TIMER
+static int read_cntfrq_trap(struct pt_regs *regs, unsigned int instr)
+{
+	int reg = (instr >> 12) & 15;
+	if (reg == 15)
+		return 1;
+	regs->uregs[reg] = arch_timer_get_rate();
+	regs->ARM_pc += 4;
+	return 0;
+}
+
+static struct undef_hook cntfrq_hook = {
+	.instr_mask     = 0x0fff0fff,
+	.instr_val      = 0x0e1e0f10,
+	.fn             = read_cntfrq_trap,
+};
+
+static int read_cntvct_trap(struct pt_regs *regs, unsigned int instr)
+{
+	int rt  = (instr >> 12) & 15;
+	int rt2 = (instr >> 16) & 15;
+	u64 val = arch_counter_get_cntvct_cp15();
+
+	regs->uregs[rt]  = lower_32_bits(val);
+	regs->uregs[rt2] = upper_32_bits(val);
+	regs->ARM_pc += 4;
+	return 0;
+}
+
+static struct undef_hook cntvct_hook = {
+	.instr_mask     = 0x0ff00fff,
+	.instr_val      = 0x0c500f1e,
+	.fn             = read_cntvct_trap,
+};
+
+static int __init arch_timer_hook_init(void)
+{
+	register_undef_hook(&cntvct_hook);
+	register_undef_hook(&cntfrq_hook);
+	return 0;
+}
+
+late_initcall(arch_timer_hook_init);
+#endif
 
 /*
  * A data abort trap was taken, but we did not handle the instruction.
@@ -784,6 +877,7 @@ void __pgd_error(const char *file, int line, pgd_t pgd)
 asmlinkage void __div0(void)
 {
 	printk("Division by zero in kernel.\n");
+	BUG_ON(PANIC_CORRUPTION);
 	dump_stack();
 }
 EXPORT_SYMBOL(__div0);

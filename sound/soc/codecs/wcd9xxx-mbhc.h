@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -13,6 +13,7 @@
 #define __WCD9XXX_MBHC_H__
 
 #include "wcd9xxx-resmgr.h"
+#include "wcdcal-hwdep.h"
 
 #define WCD9XXX_CFILT_FAST_MODE 0x00
 #define WCD9XXX_CFILT_SLOW_MODE 0x40
@@ -43,9 +44,29 @@ enum mbhc_cal_type {
 };
 
 enum mbhc_impedance_detect_stages {
-	PRE_MEAS,
-	POST_MEAS,
-	PA_DISABLE,
+	MBHC_ZDET_PRE_MEASURE,
+	MBHC_ZDET_POST_MEASURE,
+	MBHC_ZDET_GAIN_0,
+	MBHC_ZDET_GAIN_1,
+	MBHC_ZDET_GAIN_2,
+	MBHC_ZDET_HPHR_RAMP_DISABLE,
+	MBHC_ZDET_HPHL_RAMP_DISABLE,
+	MBHC_ZDET_RAMP_DISABLE,
+	MBHC_ZDET_HPHR_PA_DISABLE,
+	MBHC_ZDET_PA_DISABLE,
+	MBHC_ZDET_GAIN_UPDATE_1X,
+};
+
+/* Zone assignments used in WCD9330 for Zdet */
+enum mbhc_zdet_zones {
+	ZL_ZONE1__ZR_ZONE1,
+	ZL_ZONE2__ZR_ZONE2,
+	ZL_ZONE3__ZR_ZONE3,
+	ZL_ZONE2__ZR_ZONE1,
+	ZL_ZONE3__ZR_ZONE1,
+	ZL_ZONE1__ZR_ZONE2,
+	ZL_ZONE1__ZR_ZONE3,
+	ZL_ZR_NOT_IN_ZONE1,
 };
 
 /* Data used by MBHC */
@@ -136,8 +157,14 @@ enum wcd9xxx_mbhc_clk_freq {
 enum wcd9xxx_mbhc_event_state {
 	MBHC_EVENT_PA_HPHL,
 	MBHC_EVENT_PA_HPHR,
-	MBHC_EVENT_PRE_TX_3_ON,
-	MBHC_EVENT_POST_TX_3_OFF,
+	MBHC_EVENT_PRE_TX_1_3_ON,
+	MBHC_EVENT_POST_TX_1_3_OFF,
+};
+
+enum mbhc_hph_type {
+	MBHC_HPH_NONE = 0,
+	MBHC_HPH_MONO,
+	MBHC_HPH_STEREO,
 };
 
 struct wcd9xxx_mbhc_general_cfg {
@@ -248,6 +275,7 @@ struct wcd9xxx_mbhc_config {
 	bool use_vddio_meas;
 	bool enable_anc_mic_detect;
 	enum hw_jack_type hw_jack_type;
+	int key_code[8];
 };
 
 struct wcd9xxx_cfilt_mode {
@@ -280,11 +308,20 @@ struct wcd9xxx_mbhc_cb {
 	void (*enable_clock_gate) (struct snd_soc_codec *, bool);
 	int (*setup_zdet) (struct wcd9xxx_mbhc *,
 			   enum mbhc_impedance_detect_stages stage);
-	void (*compute_impedance) (s16 *, s16 *, uint32_t *, uint32_t *);
+	void (*compute_impedance) (struct wcd9xxx_mbhc *, s16 *, s16 *,
+				   uint32_t *, uint32_t *);
+	void (*zdet_error_approx) (struct wcd9xxx_mbhc *, uint32_t *,
+				    uint32_t *);
 	void (*enable_mbhc_txfe) (struct snd_soc_codec *, bool);
 	int (*enable_mb_source) (struct snd_soc_codec *, bool, bool);
 	void (*setup_int_rbias) (struct snd_soc_codec *, bool);
 	void (*pull_mb_to_vddio) (struct snd_soc_codec *, bool);
+	bool (*insert_rem_status) (struct snd_soc_codec *);
+	void (*micbias_pulldown_ctrl) (struct wcd9xxx_mbhc *, bool);
+	int (*codec_rco_ctrl) (struct snd_soc_codec *, bool);
+	void (*hph_auto_pulldown_ctrl) (struct snd_soc_codec *, bool);
+	struct firmware_cal * (*get_hwdep_fw_cal) (struct snd_soc_codec *,
+				enum wcd_cal_type);
 };
 
 struct wcd9xxx_mbhc {
@@ -310,6 +347,7 @@ struct wcd9xxx_mbhc {
 	/* Work to perform MBHC Firmware Read */
 	struct delayed_work mbhc_firmware_dwork;
 	const struct firmware *mbhc_fw;
+	struct firmware_cal *mbhc_cal;
 
 	struct delayed_work mbhc_insert_dwork;
 
@@ -364,10 +402,20 @@ struct wcd9xxx_mbhc {
 	/* Holds codec specific interrupt mapping */
 	const struct wcd9xxx_mbhc_intr *intr_ids;
 
+	/* Indicates status of current source switch */
+	bool is_cs_enabled;
+
+	/* Holds type of Headset - Mono/Stereo */
+	enum mbhc_hph_type hph_type;
+
+	bool is_jack_type_swchd;
+
 #ifdef CONFIG_DEBUG_FS
 	struct dentry *debugfs_poke;
 	struct dentry *debugfs_mbhc;
 #endif
+
+	struct mutex mbhc_lock;
 };
 
 #define WCD9XXX_MBHC_CAL_SIZE(buttons, rload) ( \
@@ -425,6 +473,7 @@ struct wcd9xxx_mbhc {
 	    (cfg_ptr->_n_rload * \
 	     (sizeof(cfg_ptr->_rload[0]) + sizeof(cfg_ptr->_alpha[0]))))
 
+int wcd9xxx_mbhc_set_keycode(struct wcd9xxx_mbhc *mbhc);
 int wcd9xxx_mbhc_start(struct wcd9xxx_mbhc *mbhc,
 		       struct wcd9xxx_mbhc_config *mbhc_cfg);
 void wcd9xxx_mbhc_stop(struct wcd9xxx_mbhc *mbhc);

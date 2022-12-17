@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2013-2015,2017 The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -24,23 +24,13 @@
 #include <linux/slab.h>
 #include <linux/stat.h>
 #include <soc/qcom/subsystem_notif.h>
+#include <soc/qcom/subsystem_restart.h>
 #include <soc/qcom/ramdump.h>
 
 #include <soc/qcom/smem.h>
 
 
 #include "smem_private.h"
-
-/**
- * OVERFLOW_ADD_UNSIGNED() - check for unsigned overflow
- *
- * @type: type to check for overflow
- * @a: left value to use
- * @b: right value to use
- * @returns: true if a + b will result in overflow; false otherwise
- */
-#define OVERFLOW_ADD_UNSIGNED(type, a, b) \
-	(((type)~0 - (a)) < (b) ? true : false)
 
 #define MODEM_SBL_VERSION_INDEX 7
 #define SMEM_VERSION_INFO_SIZE (32 * 4)
@@ -177,6 +167,7 @@ static struct restart_notifier_block restart_notifiers[] = {
 	{SMEM_DSPS, "dsps", .nb.notifier_call = restart_notifier_cb},
 	{SMEM_MODEM, "gss", .nb.notifier_call = restart_notifier_cb},
 	{SMEM_Q6, "adsp", .nb.notifier_call = restart_notifier_cb},
+	{SMEM_DSPS, "slpi", .nb.notifier_call = restart_notifier_cb},
 };
 
 static int init_smem_remote_spinlock(void);
@@ -371,7 +362,7 @@ static void *__smem_get_entry_secure(unsigned id,
 	uint32_t a_hdr_size;
 	int rc;
 
-	SMEM_DBG("%s(%u, %u, %u, %u, %d, %d)\n", __func__, id, *size, to_proc,
+	SMEM_DBG("%s(%u, %u, %u, %d, %d)\n", __func__, id, to_proc,
 					flags, skip_init_check, use_rspinlock);
 
 	if (!skip_init_check && !smem_initialized_check())
@@ -786,7 +777,7 @@ EXPORT_SYMBOL(smem_alloc);
 void *smem_get_entry(unsigned id, unsigned *size, unsigned to_proc,
 								unsigned flags)
 {
-	SMEM_DBG("%s(%u, %u, %u, %u)\n", __func__, id, *size, to_proc, flags);
+	SMEM_DBG("%s(%u, %u, %u)\n", __func__, id, to_proc, flags);
 
 	/*
 	 * Handle the circular dependecy between SMEM and software implemented
@@ -998,34 +989,42 @@ static int restart_notifier_cb(struct notifier_block *this,
 				unsigned long code,
 				void *data)
 {
-	if (code == SUBSYS_AFTER_SHUTDOWN) {
-		struct restart_notifier_block *notifier;
+	struct restart_notifier_block *notifier;
+	struct notif_data *notifdata = data;
+	int ret;
 
+	switch (code) {
+
+	case SUBSYS_AFTER_SHUTDOWN:
 		notifier = container_of(this,
 					struct restart_notifier_block, nb);
 		SMEM_INFO("%s: ssrestart for processor %d ('%s')\n",
 				__func__, notifier->processor,
 				notifier->name);
-
 		remote_spin_release(&remote_spinlock, notifier->processor);
 		remote_spin_release_all(notifier->processor);
-
-		if (smem_ramdump_dev) {
-			int ret;
-
-			SMEM_DBG("%s: saving ramdump\n", __func__);
-			/*
-			 * XPU protection does not currently allow the
-			 * auxiliary memory regions to be dumped.  If this
-			 * changes, then num_smem_areas + 1 should be passed
-			 * into do_elf_ramdump() to dump all regions.
-			 */
-			ret = do_elf_ramdump(smem_ramdump_dev,
-					smem_ramdump_segments, 1);
-			if (ret < 0)
-				LOG_ERR("%s: unable to dump smem %d\n",
-								__func__, ret);
-		}
+		break;
+	case SUBSYS_SOC_RESET:
+		if (!(smem_ramdump_dev && notifdata->enable_mini_ramdumps))
+			break;
+	case SUBSYS_RAMDUMP_NOTIFICATION:
+		if (!(smem_ramdump_dev && (notifdata->enable_mini_ramdumps
+						|| notifdata->enable_ramdump)))
+			break;
+		SMEM_DBG("%s: saving ramdump\n", __func__);
+		/*
+		 * XPU protection does not currently allow the
+		 * auxiliary memory regions to be dumped.  If this
+		 * changes, then num_smem_areas + 1 should be passed
+		 * into do_elf_ramdump() to dump all regions.
+		 */
+		ret = do_elf_ramdump(smem_ramdump_dev,
+				smem_ramdump_segments, 1);
+		if (ret < 0)
+			LOG_ERR("%s: unable to dump smem %d\n", __func__, ret);
+		break;
+	default:
+		break;
 	}
 
 	return NOTIFY_DONE;
@@ -1142,6 +1141,13 @@ static void smem_init_security_partition(struct smem_toc_entry *entry,
 
 	hdr = smem_areas[0].virt_addr + entry->offset;
 
+	if (entry->host0 != SMEM_APPS && entry->host1 != SMEM_APPS) {
+		SMEM_INFO(
+			"Non-APSS Partition %d offset:%x host0:%d host1:%d\n",
+			num, entry->offset, entry->host0, entry->host1);
+		return;
+	}
+
 	if (hdr->identifier != SMEM_PART_HDR_IDENTIFIER) {
 		LOG_ERR("Smem partition %d hdr magic is bad\n", num);
 		BUG();
@@ -1200,10 +1206,7 @@ static void smem_init_security(void)
 		SMEM_DBG("Partition %d host0:%d host1:%d\n", i,
 							toc->entry[i].host0,
 							toc->entry[i].host1);
-
-		if (toc->entry[i].host0 == SMEM_APPS ||
-					toc->entry[i].host1 == SMEM_APPS)
-			smem_init_security_partition(&toc->entry[i], i);
+		smem_init_security_partition(&toc->entry[i], i);
 	}
 
 	SMEM_DBG("%s done\n", __func__);
@@ -1353,7 +1356,7 @@ smem_targ_info_done:
 		goto free_smem_areas;
 	}
 
-	ramdump_segments_tmp = kmalloc_array(num_smem_areas,
+	ramdump_segments_tmp = kcalloc(num_smem_areas,
 			sizeof(struct ramdump_segment), GFP_KERNEL);
 	if (!ramdump_segments_tmp) {
 		LOG_ERR("%s: ramdump segment kmalloc failed\n", __func__);
@@ -1473,7 +1476,7 @@ int __init msm_smem_init(void)
 
 	registered = true;
 
-	smem_ipc_log_ctx = ipc_log_context_create(NUM_LOG_PAGES, "smem");
+	smem_ipc_log_ctx = ipc_log_context_create(NUM_LOG_PAGES, "smem", 0);
 	if (!smem_ipc_log_ctx) {
 		pr_err("%s: unable to create logging context\n", __func__);
 		msm_smem_debug_mask = 0;

@@ -15,9 +15,9 @@
 
 #include <linux/msm_ion.h>
 #include <linux/iommu.h>
-#include <mach/iommu.h>
+#include <linux/qcom_iommu.h>
 #include <linux/msm_iommu_domains.h>
-#include <mach/msm_bus_board.h>
+#include <linux/msm-bus-board.h>
 #include <asm-generic/sizes.h>
 
 #include "vpu_resources.h"
@@ -82,7 +82,6 @@ struct vpu_clock_descr {
 	char *name;
 	u32 flag;	/* enum vpu_clock_flag */
 	u32 pwr_frequencies[VPU_POWER_MAX];
-	char *load_freq_dt_entry;
 };
 
 const struct vpu_clock_descr vpu_clock_set[VPU_MAX_CLKS] = {
@@ -90,25 +89,21 @@ const struct vpu_clock_descr vpu_clock_set[VPU_MAX_CLKS] = {
 			.name = "vdp_bus_clk",
 			.flag = CLOCK_CORE | CLOCK_BOOT | CLOCK_SCALABLE,
 			.pwr_frequencies = { 40000000,  80000000,  80000000},
-			.load_freq_dt_entry = "qcom,bus-clk-load-freq-tbl",
 		},
 		[VPU_MAPLE_CLK] = {
 			.name = "core_clk",
 			.flag = CLOCK_CORE | CLOCK_BOOT | CLOCK_SCALABLE,
 			.pwr_frequencies = {200000000, 400000000, 400000000},
-			.load_freq_dt_entry = "qcom,maple-clk-load-freq-tbl",
 		},
 		[VPU_VDP_CLK] = {
 			.name = "vdp_clk",
 			.flag = CLOCK_CORE | CLOCK_BOOT | CLOCK_SCALABLE,
 			.pwr_frequencies = {200000000, 200000000, 400000000},
-			.load_freq_dt_entry = "qcom,vdp-clk-load-freq-tbl",
 		},
 		[VPU_VDP_XIN] = {
 			.name = "vdp_xin_clk",
 			.flag = CLOCK_CORE | CLOCK_BOOT | CLOCK_SCALABLE,
 			.pwr_frequencies = {200000000, 467000000, 467000000},
-			.load_freq_dt_entry = "qcom,vdp-xin-clk-load-freq-tbl",
 		},
 		[VPU_AHB_CLK] = {
 			.name = "iface_clk",
@@ -209,60 +204,6 @@ static int __get_u32_array_num_elements(struct platform_device *pdev,
 	return num_elements;
 }
 
-static int __vpu_load_freq_table(struct vpu_platform_resources *res,
-		const char *name, struct load_freq_table *clk_table)
-{
-	int ret = 0, i;
-	int num_elements = 0;
-	struct platform_device *pdev = res->pdev;
-
-	num_elements = __get_u32_array_num_elements(pdev, name, 2);
-	if (num_elements == 0) {
-		pr_warn("no valid %s table\n", name);
-		return ret;
-	}
-
-	clk_table->entry = devm_kzalloc(&pdev->dev,
-		num_elements * sizeof(*clk_table->entry), GFP_KERNEL);
-	if (!clk_table->entry) {
-		pr_err("Failed alloc load_freq_table\n");
-		return -ENOMEM;
-	}
-
-	if (of_property_read_u32_array(pdev->dev.of_node, name,
-			(u32 *) clk_table->entry, num_elements * 2)) {
-		pr_err("Failed to read frequency table\n");
-		return -EINVAL;
-	}
-
-	for (i = 0; i < num_elements; i++)
-		pr_debug("%s, entry %d: load = %d, freq = %d\n", name, i,
-			clk_table->entry[i].load, clk_table->entry[i].freq);
-
-	clk_table->count = num_elements;
-
-	return ret;
-}
-
-static int __vpu_load_freq_tables(struct vpu_platform_resources *res)
-{
-	int ret = 0, i;
-
-	for (i = 0; i < VPU_MAX_CLKS; i++) {
-		struct vpu_clock *cl = &res->clock[i];
-
-		if ((cl->flag & CLOCK_PRESENT) && (cl->flag & CLOCK_SCALABLE)) {
-			ret = __vpu_load_freq_table(res,
-					vpu_clock_set[i].load_freq_dt_entry,
-					&cl->load_freq_tbl);
-			if (ret)
-				return ret;
-		}
-	}
-
-	return ret;
-}
-
 static int __vpu_load_bus_vector_data(struct vpu_platform_resources *res,
 		int num_elements, int num_ports)
 {
@@ -290,7 +231,7 @@ static int __vpu_load_bus_vector_data(struct vpu_platform_resources *res,
 		return -EINVAL;
 	}
 
-	bus_pdata->name = bus_pdata_config.name;
+	bus_pdata->name = "msm_vpu";
 	bus_pdata->num_usecases = num_elements;
 
 	bus_pdata->usecase = devm_kzalloc(&pdev->dev,
@@ -312,10 +253,11 @@ static int __vpu_load_bus_vector_data(struct vpu_platform_resources *res,
 		res->bus_table.loads[i] = vectors[i].load;
 
 		for (j = 0; j < num_ports; j++) {
+			/* change ab and ib values from kilobits to bytes */
 			bus_pdata->usecase[i].vectors[j].ab =
-					(u64)vectors[i].ab * 1000;
+					(u64)vectors[i].ab * 1000 / 8;
 			bus_pdata->usecase[i].vectors[j].ib =
-					(u64)vectors[i].ib * 1000;
+					(u64)vectors[i].ib * 1000 / 8;
 			bus_pdata->usecase[i].vectors[j].src =
 					bus_pdata_config.masters[j];
 			bus_pdata->usecase[i].vectors[j].dst =
@@ -407,6 +349,37 @@ static int __vpu_load_clk_names(struct vpu_platform_resources *res)
 	return 0;
 }
 
+static int __vpu_load_reg_values_table(struct vpu_platform_resources *res,
+		struct reg_value_set *reg_set, const char *propname)
+{
+	int ret = 0;
+	int num_elements = 0;
+	struct platform_device *pdev = res->pdev;
+
+	num_elements = __get_u32_array_num_elements(pdev, propname, 2);
+	if (num_elements == 0) {
+		pr_debug("no elements in %s\n", propname);
+		return 0;
+	}
+
+	reg_set->count = num_elements;
+	reg_set->table = devm_kzalloc(&pdev->dev,
+		sizeof(*reg_set->table) * num_elements, GFP_KERNEL);
+	if (!reg_set->table) {
+		pr_err("Failed to allocate memory for %s\n", propname);
+		return -ENOMEM;
+	}
+
+	ret = of_property_read_u32_array(pdev->dev.of_node, propname,
+			(u32 *)reg_set->table, num_elements * 2);
+	if (ret) {
+		pr_err("Failed to read %s table entries\n", propname);
+		return ret;
+	}
+
+	return 0;
+}
+
 static int __vpu_load_iommu_maps(struct vpu_platform_resources *res)
 {
 	int ret = 0, i, j, num_elements;
@@ -466,28 +439,37 @@ int read_vpu_platform_resources(struct vpu_platform_resources *res,
 
 	kres = platform_get_resource_byname(pdev, IORESOURCE_MEM, "vpu_csr");
 	res->register_base_phy = kres ? kres->start : -1;
-	res->register_size = kres ? (kres->end + 1 - kres->start) : -1;
+	res->register_size = kres ? (kres->end + 1 - kres->start) : 0;
 
 	kres = platform_get_resource_byname(pdev, IORESOURCE_MEM, "vpu_smem");
 	res->mem_base_phy = kres ? kres->start : -1;
-	res->mem_size = kres ? (kres->end + 1 - kres->start) : -1;
+	res->mem_size = kres ? (kres->end + 1 - kres->start) : 0;
 
-	kres = platform_get_resource_byname(pdev, IORESOURCE_IRQ, "vpu_wdog");
-	res->irq_wd = kres ? kres->start : -1;
+	kres = platform_get_resource_byname(pdev, IORESOURCE_MEM, "vpu_vbif");
+	res->vbif_base_phy = kres ? kres->start : -1;
+	res->vbif_size = kres ? (kres->end + 1 - kres->start) : 0;
 
-	kres = platform_get_resource_byname(pdev, IORESOURCE_IRQ, "vpu_hfi");
-	res->irq = kres ? kres->start : -1;
-
-	if ((res->register_base_phy | res->register_size |
-			res->mem_base_phy | res->mem_size |
-			res->irq_wd | res->irq) < 0) {
-		pr_err("Failed to read platform resources\n");
+	if (res->register_size == 0 || res->mem_size == 0) {
+		pr_err("Failed to read IO memory resources\n");
 		return -ENODEV;
 	}
 	pr_debug("CSR base = 0x%08x, size = 0x%x\n",
 			(u32) res->register_base_phy, res->register_size);
 	pr_debug("Shared mem base = 0x%08x, size = 0x%x\n",
 			(u32) res->mem_base_phy, res->mem_size);
+	pr_debug("VBIF base = 0x%08x, size = 0x%x\n",
+			(u32) res->vbif_base_phy, res->vbif_size);
+
+	kres = platform_get_resource_byname(pdev, IORESOURCE_IRQ, "vpu_wdog");
+	res->irq_wd = kres ? kres->start : 0;
+
+	kres = platform_get_resource_byname(pdev, IORESOURCE_IRQ, "vpu_hfi");
+	res->irq = kres ? kres->start : 0;
+
+	if (res->irq_wd == 0 || res->irq == 0) {
+		pr_err("Failed to read IRQ resources\n");
+		return -ENODEV;
+	}
 	pr_debug("Wdog IRQ = %d\n", res->irq_wd);
 	pr_debug("IPC IRQ = %d\n", res->irq);
 
@@ -505,14 +487,15 @@ int read_vpu_platform_resources(struct vpu_platform_resources *res,
 		goto err_read_dt_resources;
 	}
 
-	ret = __vpu_load_freq_tables(res);
-	if (ret) {
-		pr_err("Failed to load freq tables: %d\n", ret);
-		goto err_read_dt_resources;
-	}
 	ret = __vpu_load_bus_vectors(res);
 	if (ret) {
 		pr_err("Failed to load bus vectors: %d\n", ret);
+		goto err_read_dt_resources;
+	}
+	ret = __vpu_load_reg_values_table(res, &res->vbif_reg_set,
+			"qcom,vbif-reg-presets");
+	if (ret) {
+		pr_err("Failed to load register values table: %d\n", ret);
 		goto err_read_dt_resources;
 	}
 	ret = __vpu_load_iommu_maps(res);
@@ -611,7 +594,7 @@ static void *__vpu_mem_create_client(struct vpu_platform_resources *res)
 		return NULL;
 	}
 
-	ion_client = msm_ion_client_create(-1, "VPU");
+	ion_client = msm_ion_client_create("VPU");
 	if (IS_ERR(ion_client)) {
 		pr_err("ION client creation failed\n");
 		kfree(mem_client);
@@ -683,12 +666,6 @@ static void __vpu_mem_release_handle(void *mem_handle, u32 device_id)
 				ion_unmap_iommu(ion_client, ion_handle,
 					handle->domain_num[i], 0);
 
-			if (handle->flags & MEM_SECURE) {
-				if (msm_ion_unsecure_buffer(ion_client,
-						ion_handle))
-					pr_warn("Failed to unsecure memory\n");
-			}
-
 			handle->mapped &= ~(1 << i);
 			handle->domain_num[i] = -1;
 			handle->device_addr[i] = 0;
@@ -750,16 +727,8 @@ static int __vpu_mem_map_handle(struct vpu_mem_handle *handle, u32 device_id,
 
 		domain_number = handle->domain_num[device_id];
 
-		if (handle->flags & MEM_SECURE) { /* handle secure buffers */
-			pr_debug("Securing ION buffer\n");
+		if (handle->flags & MEM_SECURE) /* handle secure buffers */
 			align = SZ_1M;
-			ret = msm_ion_secure_buffer(ion_client, ion_handle,
-					VIDEO_PIXEL, 0);
-			if (ret) {
-				pr_err("Failed to secure memory\n");
-				return ret;
-			}
-		}
 
 		pr_debug("Using IOMMU mapping\n");
 		ret = ion_map_iommu(ion_client, ion_handle, domain_number, 0,
@@ -774,8 +743,6 @@ static int __vpu_mem_map_handle(struct vpu_mem_handle *handle, u32 device_id,
 
 	if (ret) {
 		pr_err("Failed to map ion buffer\n");
-		if (handle->flags & MEM_SECURE)
-			msm_ion_unsecure_buffer(ion_client, ion_handle);
 		return ret;
 	}
 

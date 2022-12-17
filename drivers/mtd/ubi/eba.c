@@ -422,7 +422,7 @@ retry:
 				 */
 				if (err == UBI_IO_BAD_HDR_EBADMSG ||
 				    err == UBI_IO_BAD_HDR) {
-					ubi_warn("corrupted VID header at PEB %d, LEB %d:%d",
+					ubi_warn(ubi->ubi_num, "corrupted VID header at PEB %d, LEB %d:%d",
 						 pnum, vol_id, lnum);
 					err = -EBADMSG;
 				} else
@@ -449,7 +449,7 @@ retry:
 				goto out_unlock;
 			scrub = 1;
 			if (!check) {
-				ubi_msg("force data checking");
+				ubi_msg(ubi->ubi_num, "force data checking");
 				check = 1;
 				goto retry;
 			}
@@ -460,7 +460,7 @@ retry:
 	if (check) {
 		uint32_t crc1 = crc32(UBI_CRC32_INIT, buf, len);
 		if (crc1 != crc) {
-			ubi_warn("CRC error: calculated %#08x, must be %#08x",
+			ubi_warn(ubi->ubi_num, "CRC error: calculated %#08x, must be %#08x",
 				 crc1, crc);
 			err = -EBADMSG;
 			goto out_unlock;
@@ -511,22 +511,27 @@ retry:
 	new_pnum = ubi_wl_get_peb(ubi);
 	if (new_pnum < 0) {
 		ubi_free_vid_hdr(ubi, vid_hdr);
+		up_read(&ubi->fm_sem);
 		return new_pnum;
 	}
 
-	ubi_msg("recover PEB %d, move data to PEB %d", pnum, new_pnum);
+	ubi_msg(ubi->ubi_num, "recover PEB %d, move data to PEB %d",
+		pnum, new_pnum);
 
 	err = ubi_io_read_vid_hdr(ubi, pnum, vid_hdr, 1);
 	if (err && err != UBI_IO_BITFLIPS) {
 		if (err > 0)
 			err = -EIO;
+		up_read(&ubi->fm_sem);
 		goto out_put;
 	}
 
 	vid_hdr->sqnum = cpu_to_be64(ubi_next_sqnum(ubi));
 	err = ubi_io_write_vid_hdr(ubi, new_pnum, vid_hdr);
-	if (err)
+	if (err) {
+		up_read(&ubi->fm_sem);
 		goto write_error;
+	}
 
 	data_size = offset + len;
 	mutex_lock(&ubi->buf_mutex);
@@ -535,8 +540,10 @@ retry:
 	/* Read everything before the area where the write failure happened */
 	if (offset > 0) {
 		err = ubi_io_read_data(ubi, ubi->peb_buf, pnum, 0, offset);
-		if (err && err != UBI_IO_BITFLIPS)
+		if (err && err != UBI_IO_BITFLIPS) {
+			up_read(&ubi->fm_sem);
 			goto out_unlock;
+		}
 	}
 
 	memcpy(ubi->peb_buf + offset, buf, len);
@@ -544,18 +551,18 @@ retry:
 	err = ubi_io_write_data(ubi, ubi->peb_buf, new_pnum, 0, data_size);
 	if (err) {
 		mutex_unlock(&ubi->buf_mutex);
+		up_read(&ubi->fm_sem);
 		goto write_error;
 	}
 
 	mutex_unlock(&ubi->buf_mutex);
 	ubi_free_vid_hdr(ubi, vid_hdr);
 
-	down_read(&ubi->fm_sem);
 	vol->eba_tbl[lnum] = new_pnum;
 	up_read(&ubi->fm_sem);
 	ubi_wl_put_peb(ubi, vol_id, lnum, pnum, 1);
 
-	ubi_msg("data was successfully recovered");
+	ubi_msg(ubi->ubi_num, "data was successfully recovered");
 	return 0;
 
 out_unlock:
@@ -570,13 +577,13 @@ write_error:
 	 * Bad luck? This physical eraseblock is bad too? Crud. Let's try to
 	 * get another one.
 	 */
-	ubi_warn("failed to write to PEB %d", new_pnum);
+	ubi_warn(ubi->ubi_num, "failed to write to PEB %d", new_pnum);
 	ubi_wl_put_peb(ubi, vol_id, lnum, new_pnum, 1);
 	if (++tries > UBI_IO_RETRIES) {
 		ubi_free_vid_hdr(ubi, vid_hdr);
 		return err;
 	}
-	ubi_msg("try again");
+	ubi_msg(ubi->ubi_num, "try again");
 	goto retry;
 }
 
@@ -614,7 +621,8 @@ int ubi_eba_write_leb(struct ubi_device *ubi, struct ubi_volume *vol, int lnum,
 
 		err = ubi_io_write_data(ubi, buf, pnum, offset, len);
 		if (err) {
-			ubi_warn("failed to write data to PEB %d", pnum);
+			ubi_warn(ubi->ubi_num,
+				 "failed to write data to PEB %d", pnum);
 			if (err == -EIO && ubi->bad_allowed)
 				err = recover_peb(ubi, pnum, vol_id, lnum, buf,
 						  offset, len);
@@ -647,6 +655,7 @@ retry:
 	if (pnum < 0) {
 		ubi_free_vid_hdr(ubi, vid_hdr);
 		leb_write_unlock(ubi, vol_id, lnum);
+		up_read(&ubi->fm_sem);
 		return pnum;
 	}
 
@@ -655,21 +664,22 @@ retry:
 
 	err = ubi_io_write_vid_hdr(ubi, pnum, vid_hdr);
 	if (err) {
-		ubi_warn("failed to write VID header to LEB %d:%d, PEB %d",
+		ubi_warn(ubi->ubi_num, "failed to write VID header to LEB %d:%d, PEB %d",
 			 vol_id, lnum, pnum);
+		up_read(&ubi->fm_sem);
 		goto write_error;
 	}
 
 	if (len) {
 		err = ubi_io_write_data(ubi, buf, pnum, offset, len);
 		if (err) {
-			ubi_warn("failed to write %d bytes at offset %d of LEB %d:%d, PEB %d",
+			ubi_warn(ubi->ubi_num, "failed to write %d bytes at offset %d of LEB %d:%d, PEB %d",
 				 len, offset, vol_id, lnum, pnum);
+			up_read(&ubi->fm_sem);
 			goto write_error;
 		}
 	}
 
-	down_read(&ubi->fm_sem);
 	vol->eba_tbl[lnum] = pnum;
 	up_read(&ubi->fm_sem);
 
@@ -699,7 +709,7 @@ write_error:
 	}
 
 	vid_hdr->sqnum = cpu_to_be64(ubi_next_sqnum(ubi));
-	ubi_msg("try another PEB");
+	ubi_msg(ubi->ubi_num, "try another PEB");
 	goto retry;
 }
 
@@ -768,6 +778,7 @@ retry:
 	if (pnum < 0) {
 		ubi_free_vid_hdr(ubi, vid_hdr);
 		leb_write_unlock(ubi, vol_id, lnum);
+		up_read(&ubi->fm_sem);
 		return pnum;
 	}
 
@@ -776,20 +787,21 @@ retry:
 
 	err = ubi_io_write_vid_hdr(ubi, pnum, vid_hdr);
 	if (err) {
-		ubi_warn("failed to write VID header to LEB %d:%d, PEB %d",
+		ubi_warn(ubi->ubi_num, "failed to write VID header to LEB %d:%d, PEB %d",
 			 vol_id, lnum, pnum);
+		up_read(&ubi->fm_sem);
 		goto write_error;
 	}
 
 	err = ubi_io_write_data(ubi, buf, pnum, 0, len);
 	if (err) {
-		ubi_warn("failed to write %d bytes of data to PEB %d",
+		ubi_warn(ubi->ubi_num, "failed to write %d bytes of data to PEB %d",
 			 len, pnum);
+		up_read(&ubi->fm_sem);
 		goto write_error;
 	}
 
 	ubi_assert(vol->eba_tbl[lnum] < 0);
-	down_read(&ubi->fm_sem);
 	vol->eba_tbl[lnum] = pnum;
 	up_read(&ubi->fm_sem);
 
@@ -819,7 +831,7 @@ write_error:
 	}
 
 	vid_hdr->sqnum = cpu_to_be64(ubi_next_sqnum(ubi));
-	ubi_msg("try another PEB");
+	ubi_msg(ubi->ubi_num, "try another PEB");
 	goto retry;
 }
 
@@ -843,7 +855,7 @@ write_error:
 int ubi_eba_atomic_leb_change(struct ubi_device *ubi, struct ubi_volume *vol,
 			      int lnum, const void *buf, int len)
 {
-	int err, pnum, tries = 0, vol_id = vol->vol_id;
+	int err, pnum, old_pnum, tries = 0, vol_id = vol->vol_id;
 	struct ubi_vid_hdr *vid_hdr;
 	uint32_t crc;
 
@@ -886,6 +898,7 @@ retry:
 	pnum = ubi_wl_get_peb(ubi);
 	if (pnum < 0) {
 		err = pnum;
+		up_read(&ubi->fm_sem);
 		goto out_leb_unlock;
 	}
 
@@ -894,27 +907,29 @@ retry:
 
 	err = ubi_io_write_vid_hdr(ubi, pnum, vid_hdr);
 	if (err) {
-		ubi_warn("failed to write VID header to LEB %d:%d, PEB %d",
+		ubi_warn(ubi->ubi_num, "failed to write VID header to LEB %d:%d, PEB %d",
 			 vol_id, lnum, pnum);
+		up_read(&ubi->fm_sem);
 		goto write_error;
 	}
 
 	err = ubi_io_write_data(ubi, buf, pnum, 0, len);
 	if (err) {
-		ubi_warn("failed to write %d bytes of data to PEB %d",
+		ubi_warn(ubi->ubi_num, "failed to write %d bytes of data to PEB %d",
 			 len, pnum);
+		up_read(&ubi->fm_sem);
 		goto write_error;
 	}
 
-	if (vol->eba_tbl[lnum] >= 0) {
-		err = ubi_wl_put_peb(ubi, vol_id, lnum, vol->eba_tbl[lnum], 0);
+	old_pnum = vol->eba_tbl[lnum];
+	vol->eba_tbl[lnum] = pnum;
+	up_read(&ubi->fm_sem);
+
+	if (old_pnum >= 0) {
+		err = ubi_wl_put_peb(ubi, vol_id, lnum, old_pnum, 0);
 		if (err)
 			goto out_leb_unlock;
 	}
-
-	down_read(&ubi->fm_sem);
-	vol->eba_tbl[lnum] = pnum;
-	up_read(&ubi->fm_sem);
 
 out_leb_unlock:
 	leb_write_unlock(ubi, vol_id, lnum);
@@ -941,7 +956,7 @@ write_error:
 	}
 
 	vid_hdr->sqnum = cpu_to_be64(ubi_next_sqnum(ubi));
-	ubi_msg("try another PEB");
+	ubi_msg(ubi->ubi_num, "try another PEB");
 	goto retry;
 }
 
@@ -1064,7 +1079,7 @@ int ubi_eba_copy_leb(struct ubi_device *ubi, int from, int to,
 	dbg_wl("read %d bytes of data", aldata_size);
 	err = ubi_io_read_data(ubi, ubi->peb_buf, from, 0, aldata_size);
 	if (err && err != UBI_IO_BITFLIPS) {
-		ubi_warn("error %d while reading data from PEB %d",
+		ubi_warn(ubi->ubi_num, "error %d while reading data from PEB %d",
 			 err, from);
 		err = MOVE_SOURCE_RD_ERR;
 		goto out_unlock_buf;
@@ -1114,7 +1129,7 @@ int ubi_eba_copy_leb(struct ubi_device *ubi, int from, int to,
 	err = ubi_io_read_vid_hdr(ubi, to, vid_hdr, 1);
 	if (err) {
 		if (err != UBI_IO_BITFLIPS) {
-			ubi_warn("error %d while reading VID header back from PEB %d",
+			ubi_warn(ubi->ubi_num, "error %d while reading VID header back from PEB %d",
 				 err, to);
 			if (is_error_sane(err))
 				err = MOVE_TARGET_RD_ERR;
@@ -1141,7 +1156,7 @@ int ubi_eba_copy_leb(struct ubi_device *ubi, int from, int to,
 		err = ubi_io_read_data(ubi, ubi->peb_buf, to, 0, aldata_size);
 		if (err) {
 			if (err != UBI_IO_BITFLIPS) {
-				ubi_warn("error %d while reading data back from PEB %d",
+				ubi_warn(ubi->ubi_num, "error %d while reading data back from PEB %d",
 					 err, to);
 				if (is_error_sane(err))
 					err = MOVE_TARGET_RD_ERR;
@@ -1153,7 +1168,7 @@ int ubi_eba_copy_leb(struct ubi_device *ubi, int from, int to,
 		cond_resched();
 
 		if (crc != crc32(UBI_CRC32_INIT, ubi->peb_buf, data_size)) {
-			ubi_warn("read data back from PEB %d and it is different",
+			ubi_warn(ubi->ubi_num, "read data back from PEB %d and it is different",
 				 to);
 			err = -EINVAL;
 			goto out_unlock_buf;
@@ -1206,10 +1221,10 @@ static void print_rsvd_warning(struct ubi_device *ubi,
 			return;
 	}
 
-	ubi_warn("cannot reserve enough PEBs for bad PEB handling, reserved %d, need %d",
+	ubi_warn(ubi->ubi_num, "cannot reserve enough PEBs for bad PEB handling, reserved %d, need %d",
 		 ubi->beb_rsvd_pebs, ubi->beb_rsvd_level);
 	if (ubi->corr_peb_count)
-		ubi_warn("%d PEBs are corrupted and not used",
+		ubi_warn(ubi->ubi_num, "%d PEBs are corrupted and not used",
 			 ubi->corr_peb_count);
 }
 
@@ -1287,7 +1302,7 @@ int self_check_eba(struct ubi_device *ubi, struct ubi_attach_info *ai_fastmap,
 					fm_eba[i][j] == UBI_LEB_UNMAPPED)
 					continue;
 
-				ubi_err("LEB:%i:%i is PEB:%i instead of %i!",
+				ubi_err(ubi->ubi_num, "LEB:%i:%i is PEB:%i instead of %i!",
 					vol->vol_id, i, fm_eba[i][j],
 					scan_eba[i][j]);
 				ubi_assert(0);
@@ -1362,15 +1377,16 @@ int ubi_eba_init(struct ubi_device *ubi, struct ubi_attach_info *ai)
 				 * during re-size.
 				 */
 				ubi_move_aeb_to_list(av, aeb, &ai->erase);
-			vol->eba_tbl[aeb->lnum] = aeb->pnum;
+			else
+				vol->eba_tbl[aeb->lnum] = aeb->pnum;
 		}
 	}
 
 	if (ubi->avail_pebs < EBA_RESERVED_PEBS) {
-		ubi_err("no enough physical eraseblocks (%d, need %d)",
+		ubi_err(ubi->ubi_num, "no enough physical eraseblocks (%d, need %d)",
 			ubi->avail_pebs, EBA_RESERVED_PEBS);
 		if (ubi->corr_peb_count)
-			ubi_err("%d PEBs are corrupted and not used",
+			ubi_err(ubi->ubi_num, "%d PEBs are corrupted and not used",
 				ubi->corr_peb_count);
 		err = -ENOSPC;
 		goto out_free;

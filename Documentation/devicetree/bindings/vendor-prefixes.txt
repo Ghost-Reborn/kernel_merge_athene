@@ -11,6 +11,8 @@ amcc	Applied Micro Circuits Corporation (APM, formally AMCC)
 apm	Applied Micro Circuits Corporation (APM)
 arm	ARM Ltd.
 atmel	Atmel Corporation
+avago	Avago Technologies
+awinic	AWINIC Technology Co.Ltd
 bosch	Bosch Sensortec GmbH
 brcm	Broadcom Corporation
 capella	Capella Microsystems, Inc.
@@ -20,11 +22,13 @@ cirrus	Cirrus Logic, Inc.
 cortina	Cortina Systems, Inc.
 dallas	Maxim Integrated Products (formerly Dallas Semiconductor)
 denx	Denx Software Engineering
+di	Dyna Image Corporation
 emmicro	EM Microelectronic
 epson	Seiko Epson Corp.
 est	ESTeem Wireless Modems
 fairchild	Fairchild Semiconductor International, Inc.
 focaltech Focaltech systems
+fpc	Fingerprint Cards
 fsl	Freescale Semiconductor
 GEFanuc	GE Fanuc Intelligent Platforms Embedded Systems, Inc.
 goodix	Goodix. Ltd.
@@ -35,10 +39,17 @@ idt	Integrated Device Technologies, Inc.
 img	Imagination Technologies Ltd.
 intercontrol	Inter Control Group
 invn	InvenSense Inc.
+intersil	Intersil Corp.
+ite	ITE Tech. Inc.
+jdi	Japan Display Inc.
+lattice	Lattice Semiconductor.
 linux	Linux-specific binding
+liteon	Lite-On Technology Corporation
 kionix	Kionix Inc.
 marvell	Marvell Technology Group Ltd.
 maxim	Maxim Integrated Products
+mcube	mCube, Inc.
+memsic	MEMSIC, Inc
 mosaixtech	Mosaix Technologies, Inc.
 national	National Semiconductor
 nintendo	Nintendo
@@ -46,8 +57,10 @@ nvidia	NVIDIA
 nxp	NXP Semiconductors
 onnn	ON Semiconductor Corp.
 ovti	OmniVision Technologies, Inc.
+pericom	Pericom Semiconductor Corp.
 picochip	Picochip Ltd
 powervr	PowerVR (deprecated, use img)
+qca	Qualcomm Atheros, Inc.
 qcom	Qualcomm Technologies, Inc
 ralink	Mediatek/Ralink Technology Corp.
 ramtron	Ramtron International
@@ -61,6 +74,7 @@ stk	Sensortek Technology Corporation.(formerly Sitronix Technology Co., Ltd.)
 shinetech	Shine Tech Corporation, Ltd.
 sil	Silicon Image
 silabs	Silicon Laboratories
+silergy	Silergy Corp.
 simtek
 sirf	SiRF Technology, Inc.
 sne	Sony
@@ -68,6 +82,8 @@ snps 	Synopsys, Inc.
 st	STMicroelectronics
 ste	ST-Ericsson
 stericsson	ST-Ericsson
+synaptics	Synaptics Inc.
+synopsys 	Synopsys, Inc. (deprecated, use snps)
 ti	Texas Instruments
 toshiba	Toshiba Corporation
 via	VIA Technologies, Inc.

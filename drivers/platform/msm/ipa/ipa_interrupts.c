@@ -1,4 +1,4 @@
-/* Copyright (c) 2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2014-2016, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -16,6 +16,7 @@
 
 struct ipa_interrupt_info {
 	ipa_irq_handler_t handler;
+	enum ipa_irq_type interrupt;
 	void *private_data;
 	bool deferred_flag;
 };
@@ -32,15 +33,19 @@ static struct ipa_interrupt_info ipa_interrupt_to_cb[IPA_IRQ_MAX];
 static struct workqueue_struct *ipa_interrupt_wq;
 static u32 ipa_ee;
 
+static void ipa_interrupt_defer(struct work_struct *work);
+static DECLARE_WORK(ipa_interrupt_defer_work, ipa_interrupt_defer);
+
 static void deferred_interrupt_work(struct work_struct *work)
 {
 	struct ipa_interrupt_work_wrap *work_data =
 			container_of(work,
 			struct ipa_interrupt_work_wrap,
 			interrupt_work);
-	IPAERR("call handler from workq...\n");
+	IPADBG("call handler from workq...\n");
 	work_data->handler(work_data->interrupt, work_data->private_data,
 			work_data->interrupt_data);
+	kfree(work_data->interrupt_data);
 	kfree(work_data);
 }
 
@@ -49,7 +54,7 @@ static bool is_valid_ep(u32 ep_suspend_data)
 	u32 bmsk = 1;
 	u32 i = 0;
 
-	for (i = 0; i < IPA_NUM_PIPES; i++) {
+	for (i = 0; i < ipa_ctx->ipa_num_pipes; i++) {
 		if ((ep_suspend_data & bmsk) && (ipa_ctx->ep[i].valid))
 			return true;
 		bmsk = bmsk << 1;
@@ -57,12 +62,14 @@ static bool is_valid_ep(u32 ep_suspend_data)
 	return false;
 }
 
-static int handle_interrupt(enum ipa_irq_type interrupt)
+static int handle_interrupt(enum ipa_irq_type interrupt, bool isr_context)
 {
 	struct ipa_interrupt_info interrupt_info;
 	struct ipa_interrupt_work_wrap *work_data;
 	u32 suspend_data;
 	void *interrupt_data = NULL;
+	struct ipa_tx_suspend_irq_data *suspend_interrupt_data = NULL;
+	int res;
 
 	interrupt_info = ipa_interrupt_to_cb[interrupt];
 	if (interrupt_info.handler == NULL) {
@@ -78,19 +85,27 @@ static int handle_interrupt(enum ipa_irq_type interrupt)
 		if (!is_valid_ep(suspend_data))
 			return 0;
 
-		interrupt_data = (void *)suspend_data;
-
+		suspend_interrupt_data =
+			kzalloc(sizeof(*suspend_interrupt_data), GFP_ATOMIC);
+		if (!suspend_interrupt_data) {
+			IPAERR("failed allocating suspend_interrupt_data\n");
+			return -ENOMEM;
+		}
+		suspend_interrupt_data->endpoints = suspend_data;
+		interrupt_data = suspend_interrupt_data;
 		break;
 	default:
 		break;
 	}
 
-	if (interrupt_info.deferred_flag) {
+	/* Force defer processing if in ISR context. */
+	if (interrupt_info.deferred_flag || isr_context) {
 		work_data = kzalloc(sizeof(struct ipa_interrupt_work_wrap),
 				GFP_ATOMIC);
 		if (!work_data) {
 			IPAERR("failed allocating ipa_interrupt_work_wrap\n");
-			return -ENOMEM;
+			res = -ENOMEM;
+			goto fail_alloc_work;
 		}
 		INIT_WORK(&work_data->interrupt_work, deferred_interrupt_work);
 		work_data->handler = interrupt_info.handler;
@@ -102,28 +117,99 @@ static int handle_interrupt(enum ipa_irq_type interrupt)
 	} else {
 		interrupt_info.handler(interrupt, interrupt_info.private_data,
 				interrupt_data);
+		kfree(interrupt_data);
 	}
 
 	return 0;
+
+fail_alloc_work:
+	kfree(interrupt_data);
+	return res;
+}
+
+static inline bool is_uc_irq(int irq_num)
+{
+	if (ipa_interrupt_to_cb[irq_num].interrupt >= IPA_UC_IRQ_0 &&
+		ipa_interrupt_to_cb[irq_num].interrupt <= IPA_UC_IRQ_3)
+		return true;
+	else
+		return false;
+}
+
+static void ipa_process_interrupts(bool isr_context)
+{
+	u32 reg;
+	u32 bmsk;
+	u32 i = 0;
+	u32 en;
+	bool uc_irq;
+
+	en = ipa_read_reg(ipa_ctx->mmio, IPA_IRQ_EN_EE_n_ADDR(ipa_ee));
+	reg = ipa_read_reg(ipa_ctx->mmio, IPA_IRQ_STTS_EE_n_ADDR(ipa_ee));
+	while (en & reg) {
+		bmsk = 1;
+		for (i = 0; i < IPA_IRQ_MAX; i++) {
+			if (!(en & reg & bmsk)) {
+				bmsk = bmsk << 1;
+				continue;
+			}
+			uc_irq = is_uc_irq(i);
+			/* Clear uC interrupt before processing to avoid
+					clearing unhandled interrupts */
+			if (uc_irq)
+				ipa_write_reg(ipa_ctx->mmio,
+					IPA_IRQ_CLR_EE_n_ADDR(ipa_ee), bmsk);
+
+			/* Process the interrupts */
+			handle_interrupt(i, isr_context);
+
+			/* Clear non uC interrupt after processing
+			   to avoid clearing interrupt data */
+			if (!uc_irq)
+				ipa_write_reg(ipa_ctx->mmio,
+				   IPA_IRQ_CLR_EE_n_ADDR(ipa_ee), bmsk);
+
+			bmsk = bmsk << 1;
+		}
+		/* Check pending interrupts that may have
+		   been raised since last read */
+		reg = ipa_read_reg(ipa_ctx->mmio,
+				IPA_IRQ_STTS_EE_n_ADDR(ipa_ee));
+	}
+}
+
+static void ipa_interrupt_defer(struct work_struct *work)
+{
+	IPADBG("processing interrupts in wq\n");
+	ipa_inc_client_enable_clks();
+	ipa_process_interrupts(false);
+	ipa_dec_client_disable_clks();
+	IPADBG("Done\n");
 }
 
 static irqreturn_t ipa_isr(int irq, void *ctxt)
 {
-	u32 reg;
-	u32 bmsk = 1;
-	u32 i = 0;
+	unsigned long flags;
 
-	reg = ipa_read_reg(ipa_ctx->mmio, IPA_IRQ_STTS_EE_n_ADDR(ipa_ee));
-	for (i = 0; i < IPA_IRQ_MAX; i++) {
-		if (reg & bmsk)
-			handle_interrupt(i);
-		bmsk = bmsk << 1;
+	/* defer interrupt handling in case IPA is not clocked on */
+	if (ipa_active_clients_trylock(&flags) == 0) {
+		IPADBG("defer interrupt processing\n");
+		queue_work(ipa_ctx->power_mgmt_wq, &ipa_interrupt_defer_work);
+		return IRQ_HANDLED;
 	}
-	ipa_write_reg(ipa_ctx->mmio, IPA_IRQ_CLR_EE_n_ADDR(ipa_ee), reg);
 
+	if (ipa_ctx->ipa_active_clients.cnt == 0) {
+		IPADBG("defer interrupt processing\n");
+		queue_work(ipa_ctx->power_mgmt_wq, &ipa_interrupt_defer_work);
+		goto bail;
+	}
+
+	ipa_process_interrupts(true);
+
+bail:
+	ipa_active_clients_trylock_unlock(&flags);
 	return IRQ_HANDLED;
 }
-
 /**
 * ipa_add_interrupt_handler() - Adds handler to an interrupt type
 * @interrupt:		Interrupt type
@@ -151,6 +237,7 @@ int ipa_add_interrupt_handler(enum ipa_irq_type interrupt,
 	ipa_interrupt_to_cb[interrupt].deferred_flag = deferred_flag;
 	ipa_interrupt_to_cb[interrupt].handler = handler;
 	ipa_interrupt_to_cb[interrupt].private_data = private_data;
+	ipa_interrupt_to_cb[interrupt].interrupt = interrupt;
 
 	val = ipa_read_reg(ipa_ctx->mmio, IPA_IRQ_EN_EE_n_ADDR(ipa_ee));
 	IPADBG("read IPA_IRQ_EN_EE_n_ADDR register. reg = %d\n", val);
@@ -213,7 +300,8 @@ int ipa_interrupts_init(u32 ipa_irq, u32 ee, struct device *ipa_dev)
 		ipa_interrupt_to_cb[idx].private_data = NULL;
 	}
 
-	ipa_interrupt_wq = create_workqueue(INTERRUPT_WORKQUEUE_NAME);
+	ipa_interrupt_wq = create_singlethread_workqueue(
+			INTERRUPT_WORKQUEUE_NAME);
 	if (!ipa_interrupt_wq) {
 		IPAERR("workqueue creation failed\n");
 		return -ENOMEM;
@@ -223,7 +311,7 @@ int ipa_interrupts_init(u32 ipa_irq, u32 ee, struct device *ipa_dev)
 	ipa_write_reg(ipa_ctx->mmio, IPA_IRQ_CLR_EE_n_ADDR(ipa_ee), reg);
 
 	res = request_irq(ipa_irq, (irq_handler_t) ipa_isr,
-				IRQF_TRIGGER_HIGH, "ipa", ipa_dev);
+				IRQF_TRIGGER_RISING, "ipa", ipa_dev);
 	if (res) {
 		IPAERR("fail to register IPA IRQ handler irq=%d\n", ipa_irq);
 		return -ENODEV;
@@ -231,18 +319,11 @@ int ipa_interrupts_init(u32 ipa_irq, u32 ee, struct device *ipa_dev)
 	IPADBG("IPA IRQ handler irq=%d registered\n", ipa_irq);
 
 	res = enable_irq_wake(ipa_irq);
-	if (res) {
+	if (res)
 		IPAERR("fail to enable IPA IRQ wakeup irq=%d res=%d\n",
 				ipa_irq, res);
-		res = -ENODEV;
-		goto fail_enable_irq_wake;
-	}
-	IPADBG("IPA IRQ wakeup enabled irq=%d\n", ipa_irq);
+	else
+		IPADBG("IPA IRQ wakeup enabled irq=%d\n", ipa_irq);
 
 	return 0;
-
-fail_enable_irq_wake:
-		free_irq(ipa_irq, ipa_dev);
-
-	return res;
 }

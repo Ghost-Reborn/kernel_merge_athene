@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -19,7 +19,7 @@
 			regulator-name = "8226_s2";
 			reg = <0x1700 0x100>;
 			regulator-min-microvolt = <900000>;
-			regulator-max-microvolt = <1275000>;
+			regulator-max-microvolt = <1350000>;
 			qcom,mode = "auto";
 		};
 	};
@@ -35,27 +35,51 @@
 		reg-names = "rbcpr", "rbcpr_clk", "efuse_addr";
 		interrupts = <0 15 0>;
 		regulator-name = "apc_corner";
-		regulator-min-microvolt = <1>;
-		regulator-max-microvolt = <3>;
+		qcom,cpr-fuse-corners = <3>;
 
 		qcom,pvs-fuse-redun-sel = <22 24 3 2 0>;
 		qcom,pvs-fuse = <22 6 5 0>;
 		qcom,pvs-fuse-redun = <22 27 5 0>;
 
-		qcom,pvs-init-voltage = <1275000 1275000 1275000 1275000 1275000
-					1275000 1260000 1245000 1230000 1215000
-					1200000 1185000 1170000 1155000 1140000
-					1140000 1140000 1140000 1140000 1140000
-					1150000 1140000 1140000 1140000 1140000
-					1140000 1140000 1140000 1275000 1275000
-					1275000 1275000>;
-		qcom,pvs-corner-ceiling-slow = <1050000 1150000 1275000>;
-		qcom,pvs-corner-ceiling-nom  = <1050000 1075000 1200000>;
-		qcom,pvs-corner-ceiling-fast = <1050000 1050000 1100000>;
+		qcom,pvs-voltage-table =
+			<1050000 1150000 1350000>,
+			<1050000 1150000 1340000>,
+			<1050000 1150000 1330000>,
+			<1050000 1150000 1320000>,
+			<1050000 1150000 1310000>,
+			<1050000 1150000 1300000>,
+			<1050000 1150000 1290000>,
+			<1050000 1150000 1280000>,
+			<1050000 1150000 1270000>,
+			<1050000 1140000 1260000>,
+			<1050000 1130000 1250000>,
+			<1050000 1120000 1240000>,
+			<1050000 1110000 1230000>,
+			<1050000 1100000 1220000>,
+			<1050000 1090000 1210000>,
+			<1050000 1080000 1200000>,
+			<1050000 1070000 1190000>,
+			<1050000 1060000 1180000>,
+			<1050000 1050000 1170000>,
+			<1050000 1050000 1160000>,
+			<1050000 1050000 1150000>,
+			<1050000 1050000 1140000>,
+			<1050000 1050000 1140000>,
+			<1050000 1050000 1140000>,
+			<1050000 1050000 1140000>,
+			<1050000 1050000 1140000>,
+			<1050000 1050000 1140000>,
+			<1050000 1050000 1140000>,
+			<1050000 1050000 1140000>,
+			<1050000 1050000 1140000>,
+			<1050000 1050000 1140000>,
+			<1050000 1050000 1140000>;
+		qcom,cpr-voltage-ceiling = <1050000 1150000 1280000>;
+		qcom,cpr-voltage-floor = <1050000 1050000 1100000>;
 		vdd-apc-supply = <&pm8226_s2>;
 
 		vdd-mx-supply = <&pm8226_l3_ao>;
-		qcom,vdd-mx-vmax = <1350000>;
+		qcom,vdd-mx-vmax = <1337500>;
 		qcom,vdd-mx-vmin-method = <1>;
 
 		qcom,cpr-ref-clk = <19200>;
@@ -63,14 +87,12 @@
 		qcom,cpr-timer-cons-up = <0>;
 		qcom,cpr-timer-cons-down = <2>;
 		qcom,cpr-irq-line = <0>;
-		qcom,cpr-step-quotient = <15>;
-		qcom,cpr-up-threshold = <0>;
-		qcom,cpr-down-threshold = <10>;
+		qcom,cpr-step-quotient = <30>;
 		qcom,cpr-idle-clocks = <0>;
 		qcom,cpr-gcnt-time = <1>;
 		qcom,vdd-apc-step-up-limit = <1>;
 		qcom,vdd-apc-step-down-limit = <1>;
-		qcom,cpr-apc-volt-step = <5000>;
+		qcom,cpr-apc-volt-step = <10000>;
 
 		qcom,cpr-fuse-redun-sel = <138 57 1 1 0>;
 		qcom,cpr-fuse-row = <138 0>;
@@ -88,7 +110,7 @@
 		qcom,cpr-fuse-uplift-sel = <22 53 1 0 0>;
 		qcom,cpr-uplift-voltage = <50000>;
 		qcom,cpr-uplift-quotient = <0 0 120>;
-		qcom,cpr-uplift-max-volt = <1350000>;
+		qcom,cpr-uplift-max-volt = <1330000>;
 		qcom,cpr-uplift-speed-bin = <1>;
 		qcom,speed-bin-fuse-sel = <22 0 3 0>;
 	};
@@ -111,7 +133,6 @@
 			regulator-min-microvolt = <1>;
 			regulator-max-microvolt = <7>;
 			qcom,use-voltage-corner;
-			qcom,consumer-supplies = "vdd_dig", "";
 		};
 		pm8226_s1_corner_ao: regulator-s1-corner-ao {
 			compatible = "qcom,rpm-smd-regulator";
@@ -120,7 +141,6 @@
 			regulator-min-microvolt = <1>;
 			regulator-max-microvolt = <7>;
 			qcom,use-voltage-corner;
-			qcom,consumer-supplies = "vdd_sr2_dig", "";
 		};
 		pm8226_s1_floor_corner: regulator-s1-floor-corner {
 			compatible = "qcom,rpm-smd-regulator";
@@ -189,7 +209,7 @@
 		pm8226_l3: regulator-l3 {
 			regulator-name = "8226_l3";
 			regulator-min-microvolt = <750000>;
-			regulator-max-microvolt = <1275000>;
+			regulator-max-microvolt = <1337500>;
 			status = "okay";
 		};
 		pm8226_l3_ao: regulator-3-ao {
@@ -197,7 +217,7 @@
 			regulator-name = "8226_l3_ao";
 			qcom,set = <1>;
 			regulator-min-microvolt = <750000>;
-			regulator-max-microvolt = <1275000>;
+			regulator-max-microvolt = <1337500>;
 			status = "okay";
 		};
 		pm8226_l3_so: regulator-l3-so {
@@ -205,7 +225,7 @@
 			regulator-name = "8226_l3_so";
 			qcom,set = <2>;
 			regulator-min-microvolt = <750000>;
-			regulator-max-microvolt = <1275000>;
+			regulator-max-microvolt = <1337500>;
 			qcom,init-voltage = <750000>;
 			status = "okay";
 		};
@@ -271,7 +291,6 @@
 			regulator-min-microvolt = <1800000>;
 			regulator-max-microvolt = <1800000>;
 			qcom,init-voltage = <1800000>;
-			qcom,consumer-supplies = "vdd_sr2_pll", "";
 		};
 
 		pm8226_l8_so: regulator-l8-so {
@@ -506,4 +525,8 @@
 
 &pm8226_chg_otg {
 	regulator-name = "8226_smbbp_otg";
+};
+
+&pm8226_chg_chgr {
+	regulator-name = "flash_wa";
 };

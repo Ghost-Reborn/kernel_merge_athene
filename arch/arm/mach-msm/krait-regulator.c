@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -30,11 +30,10 @@
 #include <linux/debugfs.h>
 #include <linux/syscore_ops.h>
 #include <linux/cpu.h>
+#include <soc/qcom/spm.h>
+#include <soc/qcom/pm.h>
+#include <soc/qcom/krait-regulator-pmic.h>
 #include <mach/msm_iomap.h>
-#include "krait-regulator-pmic.h"
-
-#include "spm.h"
-#include "pm.h"
 
 /*
  *                   supply
@@ -193,6 +192,7 @@ struct pmic_gang_vreg {
 	void __iomem		*apcs_gcc_base;
 	bool			manage_phases;
 	int			pfm_threshold;
+	bool			force_auto_mode;
 	int			efuse_phase_scaling_factor;
 	int			cores_per_phase;
 	int			*phase_coeff_threshold;
@@ -213,7 +213,9 @@ enum krait_supply_mode {
 struct krait_power_vreg {
 	struct list_head		link;
 	struct regulator_desc		desc;
+	struct regulator_desc		adj_desc;
 	struct regulator_dev		*rdev;
+	struct regulator_dev		*adj_rdev;
 	const char			*name;
 	struct pmic_gang_vreg		*pvreg;
 	int				uV;
@@ -233,6 +235,8 @@ struct krait_power_vreg {
 	bool				reg_en;
 	int				online_at_probe;
 	bool				force_bhs;
+	bool				adj;
+	int				coeff1_reduction;
 };
 
 DEFINE_PER_CPU(struct krait_power_vreg *, krait_vregs);
@@ -362,20 +366,24 @@ static int get_coeff2(int krait_uV, int phase_scaling_factor)
 	return  coeff2;
 }
 
-static int get_coeff1(int actual_uV, int requested_uV, int load)
+static int get_coeff1(int actual_uV, int requested_uV, int load, int reduction)
 {
 	int ratio = actual_uV * 1000 / requested_uV;
 	int coeff1 = 330 * load + (load * 673 * ratio / 1000);
 
+	coeff1 = reduction * coeff1 / 100;
+
 	return coeff1;
 }
 
+#define NON_ACTIVE_REDUCTION_PERCENTAGE	100
 static int get_coeff_total(struct krait_power_vreg *from)
 {
 	int coeff_total = 0;
 	struct krait_power_vreg *kvreg;
 	struct pmic_gang_vreg *pvreg = from->pvreg;
 	int phase_scaling_factor = PHASE_SCALING_REF;
+	int coeff1_reduction;
 
 	if (use_efuse_phase_scaling_factor)
 		phase_scaling_factor = pvreg->efuse_phase_scaling_factor;
@@ -383,28 +391,37 @@ static int get_coeff_total(struct krait_power_vreg *from)
 	list_for_each_entry(kvreg, &pvreg->krait_power_vregs, link) {
 		if (!kvreg->reg_en)
 			continue;
+		if (kvreg->adj)
+			coeff1_reduction = kvreg->coeff1_reduction;
+		else
+			coeff1_reduction = NON_ACTIVE_REDUCTION_PERCENTAGE;
 
 		if (kvreg->mode == LDO_MODE) {
 			kvreg->coeff1 =
 				get_coeff1(kvreg->uV - kvreg->ldo_delta_uV,
-							kvreg->uV, kvreg->load);
+							kvreg->uV, kvreg->load,
+							coeff1_reduction);
 			kvreg->coeff2 =
 				get_coeff2(kvreg->uV - kvreg->ldo_delta_uV,
 							phase_scaling_factor);
 		} else {
 			kvreg->coeff1 =
 				get_coeff1(pvreg->pmic_vmax_uV,
-							kvreg->uV, kvreg->load);
+							kvreg->uV, kvreg->load,
+							coeff1_reduction);
 			kvreg->coeff2 = get_coeff2(pvreg->pmic_vmax_uV,
 							phase_scaling_factor);
 		}
+		pr_debug("%s coeff1=%d coeff2=%d\n", kvreg->name,
+						kvreg->coeff1, kvreg->coeff2);
 		coeff_total += kvreg->coeff1 + kvreg->coeff2;
 	}
 
 	return coeff_total;
 }
 
-static int set_pmic_gang_phases(struct pmic_gang_vreg *pvreg, int phase_count)
+static int set_pmic_gang_phases(struct pmic_gang_vreg *pvreg,
+		struct krait_power_vreg *from, int phase_count)
 {
 	pr_debug("programming phase_count = %d\n", phase_count);
 	if (pvreg->use_phase_switching)
@@ -412,7 +429,8 @@ static int set_pmic_gang_phases(struct pmic_gang_vreg *pvreg, int phase_count)
 		 * note the PMIC sets the phase count to one more than
 		 * the value in the register - hence subtract 1 from it
 		 */
-		return msm_spm_apcs_set_phase(phase_count - 1);
+		return msm_spm_apcs_set_phase(from->cpu_num,
+						phase_count - 1);
 	else
 		return 0;
 }
@@ -459,11 +477,12 @@ static bool enable_phase_management(struct pmic_gang_vreg *pvreg)
 
 #define PMIC_FTS_MODE_PFM	0x00
 #define PMIC_FTS_MODE_PWM	0x80
+#define PMIC_FTS_MODE_AUTO	0x40
 #define ONE_PHASE_COEFF		1000000
 #define TWO_PHASE_COEFF		2000000
 
 #define PWM_SETTLING_TIME_US		50
-#define PHASE_SETTLING_TIME_US		50
+#define PHASE_SETTLING_TIME_US		100
 static unsigned int pmic_gang_set_phases(struct krait_power_vreg *from,
 				int coeff_total)
 {
@@ -483,34 +502,38 @@ static unsigned int pmic_gang_set_phases(struct krait_power_vreg *from,
 			return 0;
 	}
 
-	/* First check if the coeff is low for PFM mode */
-	if (load_total <= pvreg->pfm_threshold
-			&& n_online == 1
-			&& krait_pmic_is_ready()) {
-		if (!pvreg->pfm_mode) {
-			rc = msm_spm_enable_fts_lpm(PMIC_FTS_MODE_PFM);
-			if (rc) {
-				pr_err("%s PFM en failed load_t %d rc = %d\n",
-					from->name, load_total, rc);
-				return rc;
+	if (!pvreg->force_auto_mode) {
+		/* First check if the coeff is low for PFM mode */
+		if (load_total <= pvreg->pfm_threshold
+				&& n_online == 1
+				&& krait_pmic_is_ready()) {
+			if (!pvreg->pfm_mode) {
+				rc = msm_spm_enable_fts_lpm(from->cpu_num,
+							PMIC_FTS_MODE_PFM);
+				if (rc) {
+					pr_err("%s PFM en failed load_t %d rc = %d\n",
+						from->name, load_total, rc);
+					return rc;
+				}
+				krait_pmic_post_pfm_entry();
+				pvreg->pfm_mode = true;
 			}
-			krait_pmic_post_pfm_entry();
-			pvreg->pfm_mode = true;
-		}
-		return rc;
-	}
-
-	/* coeff is high switch to PWM mode before changing phases */
-	if (pvreg->pfm_mode) {
-		rc = msm_spm_enable_fts_lpm(PMIC_FTS_MODE_PWM);
-		if (rc) {
-			pr_err("%s PFM exit failed load %d rc = %d\n",
-				from->name, coeff_total, rc);
 			return rc;
 		}
-		pvreg->pfm_mode = false;
-		krait_pmic_post_pwm_entry();
-		udelay(PWM_SETTLING_TIME_US);
+
+		/* coeff is high switch to PWM mode before changing phases */
+		if (pvreg->pfm_mode) {
+			rc = msm_spm_enable_fts_lpm(from->cpu_num,
+						PMIC_FTS_MODE_PWM);
+			if (rc) {
+				pr_err("%s PFM exit failed load %d rc = %d\n",
+					from->name, coeff_total, rc);
+				return rc;
+			}
+			pvreg->pfm_mode = false;
+			krait_pmic_post_pwm_entry();
+			udelay(PWM_SETTLING_TIME_US);
+		}
 	}
 
 	phase_count = pvreg->valid_phases[pvreg->num_phase_entries - 1];
@@ -529,7 +552,27 @@ static unsigned int pmic_gang_set_phases(struct krait_power_vreg *from,
 		phase_count = DIV_ROUND_UP(n_online, pvreg->cores_per_phase);
 
 	if (phase_count != pvreg->pmic_phase_count) {
-		rc = set_pmic_gang_phases(pvreg, phase_count);
+		if (pvreg->force_auto_mode && phase_count > 1) {
+			/* Disable Auto Mode prior to setting phase count > 1 */
+			rc = msm_spm_enable_fts_lpm(from->cpu_num,
+						PMIC_FTS_MODE_PWM);
+			if (rc) {
+				dev_err(&from->rdev->dev,
+					"failed to force PWM, rc=%d\n", rc);
+				return rc;
+			}
+			/* complete the writes before switching phases */
+			mb();
+		}
+
+		if (phase_count >= 2) {
+			rc = krait_pmic_pre_multiphase_enable();
+			if (rc < 0) {
+				pr_err("%s failed to run pre multiphase steps %d rc = %d\n",
+				from->name, phase_count, rc);
+			}
+		}
+		rc = set_pmic_gang_phases(pvreg, from, phase_count);
 		if (rc < 0) {
 			pr_err("%s failed set phase %d rc = %d\n",
 				from->name, phase_count, rc);
@@ -546,6 +589,18 @@ static unsigned int pmic_gang_set_phases(struct krait_power_vreg *from,
 		if (phase_count > pvreg->pmic_phase_count)
 			udelay(PHASE_SETTLING_TIME_US);
 
+		if (pvreg->force_auto_mode && phase_count == 1) {
+			/* Enable Auto Mode after setting phase count = 1 */
+			rc = msm_spm_enable_fts_lpm(from->cpu_num,
+						PMIC_FTS_MODE_AUTO);
+			if (rc) {
+				dev_err(&from->rdev->dev,
+					"failed to force AUTO, rc=%d\n", rc);
+				return rc;
+			}
+			/* complete the writes before any other access */
+			mb();
+		}
 		pvreg->pmic_phase_count = phase_count;
 	}
 
@@ -717,8 +772,10 @@ static void __switch_to_using_ldo(void *info)
 
 static int switch_to_using_ldo(struct krait_power_vreg *kvreg)
 {
-	if (kvreg->mode == LDO_MODE
-		&& get_krait_ldo_uv(kvreg) == kvreg->uV - kvreg->ldo_delta_uV)
+	int uV = kvreg->uV - kvreg->ldo_delta_uV;
+	int ldo_uV = DIV_ROUND_UP(uV, KRAIT_LDO_STEP) * KRAIT_LDO_STEP;
+
+	if (kvreg->mode == LDO_MODE && get_krait_ldo_uv(kvreg) == ldo_uV)
 		return 0;
 
 	return smp_call_function_single(kvreg->cpu_num,
@@ -1206,6 +1263,102 @@ static void glb_init(void __iomem *apcs_gcc_base)
 		writel_relaxed(0x0008736E, apcs_gcc_base + PWR_GATE_CONFIG);
 }
 
+static int krait_adj_enable(struct regulator_dev *rdev)
+{
+	struct krait_power_vreg *kvreg = rdev_get_drvdata(rdev);
+	struct pmic_gang_vreg *pvreg = kvreg->pvreg;
+
+	mutex_lock(&pvreg->krait_power_vregs_lock);
+	kvreg->adj = true;
+	_get_optimum_mode(rdev, 0, 0, kvreg->load);
+	mutex_unlock(&pvreg->krait_power_vregs_lock);
+	return 0;
+}
+
+static int krait_adj_disable(struct regulator_dev *rdev)
+{
+	struct krait_power_vreg *kvreg = rdev_get_drvdata(rdev);
+	struct pmic_gang_vreg *pvreg = kvreg->pvreg;
+
+	mutex_lock(&pvreg->krait_power_vregs_lock);
+	kvreg->adj = false;
+	_get_optimum_mode(rdev, 0, 0, kvreg->load);
+	mutex_unlock(&pvreg->krait_power_vregs_lock);
+	return 0;
+}
+
+static int krait_adj_is_enabled(struct regulator_dev *rdev)
+{
+	struct krait_power_vreg *kvreg = rdev_get_drvdata(rdev);
+
+	return kvreg->adj;
+}
+
+static struct regulator_ops krait_adj_ops = {
+	.enable			= krait_adj_enable,
+	.disable		= krait_adj_disable,
+	.is_enabled		= krait_adj_is_enabled,
+};
+
+#define DEFAULT_REDUCTION_PERCENTAGE	75
+static int krait_adj_init(struct krait_power_vreg *kvreg,
+						struct platform_device *pdev,
+						struct device_node *adj_node)
+{
+	struct regulator_init_data *init_data;
+	struct regulator_config reg_config = {};
+	int rc;
+	int coeff1_reduction;
+
+	if (kvreg->adj_rdev) {
+		dev_err(&pdev->dev, "Only one coeff1 adjustment regulator node allowed.\n");
+		return -EINVAL;
+	}
+
+	init_data = of_get_regulator_init_data(&pdev->dev, adj_node);
+	if (!init_data) {
+		dev_err(&pdev->dev, "init data required.\n");
+		return -EINVAL;
+	}
+
+	if (!init_data->constraints.name) {
+		dev_err(&pdev->dev,
+			"regulator name must be specified in constraints.\n");
+		return -EINVAL;
+	}
+
+	init_data->constraints.valid_ops_mask |= REGULATOR_CHANGE_STATUS;
+	init_data->constraints.input_uV = init_data->constraints.max_uV;
+	rc = of_property_read_u32(pdev->dev.of_node,
+				"qcom,coeff1-reduction",
+				&coeff1_reduction);
+	if (rc) {
+		dev_err(&pdev->dev,
+			"qcom,coeff1-reduction missing in %s assuming %d\n",
+			adj_node->name,
+			DEFAULT_REDUCTION_PERCENTAGE);
+		coeff1_reduction = DEFAULT_REDUCTION_PERCENTAGE;
+	}
+
+	kvreg->coeff1_reduction = coeff1_reduction;
+	kvreg->adj_desc.name = init_data->constraints.name;
+	kvreg->adj_desc.ops = &krait_adj_ops;
+	kvreg->adj_desc.type = REGULATOR_VOLTAGE;
+	kvreg->adj_desc.owner = THIS_MODULE;
+
+	reg_config.dev = &pdev->dev;
+	reg_config.init_data = init_data;
+	reg_config.driver_data = kvreg;
+	reg_config.of_node = adj_node;
+	kvreg->adj_rdev = regulator_register(&kvreg->adj_desc, &reg_config);
+	if (IS_ERR(kvreg->adj_rdev)) {
+		rc = PTR_ERR(kvreg->rdev);
+		pr_err("regulator_register failed, rc=%d.\n", rc);
+		return rc;
+	}
+	return 0;
+}
+
 static int krait_power_probe(struct platform_device *pdev)
 {
 	struct regulator_config reg_config = {};
@@ -1217,6 +1370,7 @@ static int krait_power_probe(struct platform_device *pdev)
 	int ldo_delta_uV;
 	int cpu_num;
 	bool ldo_disable = false;
+	struct device_node *child;
 
 	if (pdev->dev.of_node) {
 		/* Get init_data from device tree. */
@@ -1368,6 +1522,15 @@ static int krait_power_probe(struct platform_device *pdev)
 	list_add_tail(&kvreg->link, &the_gang->krait_power_vregs);
 	mutex_unlock(&the_gang->krait_power_vregs_lock);
 
+	for_each_child_of_node(pdev->dev.of_node, child) {
+		rc = krait_adj_init(kvreg, pdev, child);
+		if (rc) {
+			dev_err(&pdev->dev, "Couldn't add child nodes, rc=%d\n",
+					rc);
+			goto out;
+		}
+	}
+
 	online_at_probe(kvreg);
 	kvreg_ldo_voltage_init(kvreg);
 
@@ -1458,11 +1621,17 @@ static int krait_pdn_phase_scaling_init(struct pmic_gang_vreg *pvreg,
 {
 	struct resource *res;
 	void __iomem *efuse;
-	u32 efuse_data, efuse_version;
-	bool scaling_factor_valid, use_efuse;
+	u32 efuse_data, efuse_version, efuse_version_data;
+	bool sf_valid, use_efuse;
+	int sf_pos, sf_mask;
+	struct device_node *node = pdev->dev.of_node;
+	struct device *dev = &pdev->dev;
+	int valid_sfs[4] = {0, 0, 0, 0};
+	int sf_versions_len;
+	int rc;
 
-	use_efuse = of_property_read_bool(pdev->dev.of_node,
-					  "qcom,use-phase-scaling-factor");
+	use_efuse = of_property_read_bool(node,
+				"qcom,use-phase-scaling-factor");
 	/*
 	 * Allow usage of the eFuse phase scaling factor if it is enabled in
 	 * either device tree or by module parameter.
@@ -1477,6 +1646,7 @@ static int krait_pdn_phase_scaling_init(struct pmic_gang_vreg *pvreg,
 		return -EINVAL;
 	}
 
+	/* Read efuse registers */
 	efuse = ioremap(res->start, 8);
 	if (!efuse) {
 		pr_err("could not map phase scaling eFuse address\n");
@@ -1484,25 +1654,47 @@ static int krait_pdn_phase_scaling_init(struct pmic_gang_vreg *pvreg,
 	}
 
 	efuse_data = readl_relaxed(efuse);
-	efuse_version = readl_relaxed(efuse + 4);
-
+	efuse_version_data = readl_relaxed(efuse + 4);
 	iounmap(efuse);
 
-	scaling_factor_valid
-		= ((efuse_version & PHASE_SCALING_EFUSE_VERSION_MASK) >>
-				PHASE_SCALING_EFUSE_VERSION_POS)
-			== PHASE_SCALING_EFUSE_VERSION_SET;
+	rc = of_property_read_u32(pdev->dev.of_node,
+					"qcom,phase-scaling-factor-bits-pos",
+					&sf_pos);
+	if (rc < 0) {
+		dev_err(dev, "qcom,phase-scaling-factor-bits-pos missing rc=%d\n",
+									rc);
+		return -EINVAL;
+	}
 
-	if (scaling_factor_valid)
+	sf_mask = KRAIT_MASK(sf_pos + 2, sf_pos);
+
+	efuse_version
+		= ((efuse_version_data & PHASE_SCALING_EFUSE_VERSION_MASK) >>
+				PHASE_SCALING_EFUSE_VERSION_POS);
+
+	if (of_find_property(node, "qcom,valid-scaling-factor-versions",
+				&sf_versions_len)
+		&& (sf_versions_len == 4 * sizeof(u32))) {
+		rc = of_property_read_u32_array(node,
+				"qcom,valid-scaling-factor-versions",
+				valid_sfs, 4);
+		sf_valid = (valid_sfs[efuse_version] == 1);
+	} else {
+		dev_err(dev, "qcom,valid-scaling-factor-versions missing or its size is incorrect rc=%d\n",
+									rc);
+		return -EINVAL;
+	}
+
+	if (sf_valid)
 		pvreg->efuse_phase_scaling_factor
-			= ((efuse_data & PHASE_SCALING_EFUSE_VALUE_MASK)
-				>> PHASE_SCALING_EFUSE_VALUE_POS) + 1;
+			= ((efuse_data & sf_mask)
+				>> sf_pos) + 1;
 	else
 		pvreg->efuse_phase_scaling_factor = PHASE_SCALING_REF;
 
 	pr_info("eFuse phase scaling factor = %d/%d%s\n",
 		pvreg->efuse_phase_scaling_factor, PHASE_SCALING_REF,
-		scaling_factor_valid ? "" : " (eFuse not blown)");
+		sf_valid ? "" : " (eFuse not blown)");
 	pr_info("initial phase scaling factor = %d/%d%s\n",
 		use_efuse_phase_scaling_factor
 			? pvreg->efuse_phase_scaling_factor : PHASE_SCALING_REF,
@@ -1526,6 +1718,7 @@ static int krait_pdn_probe(struct platform_device *pdev)
 	int *phase_coeff_threshold;
 	int num_phase_entries;
 	int valid_phase_len, phase_coeff_threshold_entries;
+	bool force_auto_mode;
 	int i;
 
 	if (!dev->of_node) {
@@ -1536,10 +1729,16 @@ static int krait_pdn_probe(struct platform_device *pdev)
 	use_phase_switching = of_property_read_bool(node,
 						"qcom,use-phase-switching");
 
-	rc = of_property_read_u32(node, "qcom,pfm-threshold", &pfm_threshold);
-	if (rc < 0) {
-		dev_err(dev, "pfm-threshold missing rc=%d, pfm disabled\n", rc);
-		return -EINVAL;
+	force_auto_mode = of_property_read_bool(pdev->dev.of_node,
+				"qcom,force-auto-mode");
+
+	if (!force_auto_mode) {
+		rc = of_property_read_u32(node, "qcom,pfm-threshold",
+						&pfm_threshold);
+		if (rc < 0) {
+			dev_err(dev, "pfm-threshold missing rc=%d\n", rc);
+			return -EINVAL;
+		}
 	}
 
 	rc = of_property_read_u32(node, "qcom,cores-per-phase",
@@ -1643,6 +1842,7 @@ static int krait_pdn_probe(struct platform_device *pdev)
 	pvreg->valid_phases = valid_phases;
 	pvreg->phase_coeff_threshold = phase_coeff_threshold;
 	pvreg->num_phase_entries = num_phase_entries;
+	pvreg->force_auto_mode = force_auto_mode;
 
 	mutex_init(&pvreg->krait_power_vregs_lock);
 	INIT_LIST_HEAD(&pvreg->krait_power_vregs);

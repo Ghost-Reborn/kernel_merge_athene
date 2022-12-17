@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -9,16 +9,18 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  */
+#include <asm/barrier.h>
 #include <linux/delay.h>
+#include <linux/device.h>
 #include "ipa_i.h"
 
 /*
  * These values were determined empirically and shows good E2E bi-
  * directional throughputs
  */
-#define IPA_A2_HOLB_TMR_EN 0x1
-#define IPA_A2_HOLB_TMR_DIS 0x0
-#define IPA_A2_HOLB_TMR_DEFAULT_VAL 0x1ff
+#define IPA_HOLB_TMR_EN 0x1
+#define IPA_HOLB_TMR_DIS 0x0
+#define IPA_HOLB_TMR_DEFAULT_VAL 0x1ff
 
 #define IPA_PKT_FLUSH_TO_US 100
 
@@ -30,24 +32,24 @@ int ipa_enable_data_path(u32 clnt_hdl)
 	int res = 0;
 
 	IPADBG("Enabling data path\n");
-	/* IPA_HW_MODE_VIRTUAL lacks support for TAG IC & EP suspend */
-	if (ipa_ctx->ipa_hw_mode == IPA_HW_MODE_VIRTUAL)
-		return 0;
-
-	/* On IPA 2.0, disable HOLB */
-	if (ipa_ctx->ipa_hw_type == IPA_HW_v2_0 &&
-	    IPA_CLIENT_IS_CONS(ep->client)) {
+	/* From IPA 2.0, disable HOLB */
+	if ((ipa_ctx->ipa_hw_type >= IPA_HW_v2_0) &&
+		IPA_CLIENT_IS_CONS(ep->client)) {
 		memset(&holb_cfg, 0 , sizeof(holb_cfg));
-		holb_cfg.en = IPA_A2_HOLB_TMR_DIS;
+		holb_cfg.en = IPA_HOLB_TMR_DIS;
 		holb_cfg.tmr_val = 0;
 		res = ipa_cfg_ep_holb(clnt_hdl, &holb_cfg);
 	}
 
 	/* Enable the pipe */
-	memset(&ep_cfg_ctrl, 0 , sizeof(ep_cfg_ctrl));
-	ep_cfg_ctrl.ipa_ep_suspend = false;
-
-	ipa_cfg_ep_ctrl(clnt_hdl, &ep_cfg_ctrl);
+	if (IPA_CLIENT_IS_CONS(ep->client) &&
+	    (ep->keep_ipa_awake ||
+	     ipa_ctx->resume_on_connect[ep->client] ||
+	     !ipa_should_pipe_be_suspended(ep->client))) {
+		memset(&ep_cfg_ctrl, 0 , sizeof(ep_cfg_ctrl));
+		ep_cfg_ctrl.ipa_ep_suspend = false;
+		ipa_cfg_ep_ctrl(clnt_hdl, &ep_cfg_ctrl);
+	}
 
 	return res;
 }
@@ -57,33 +59,32 @@ int ipa_disable_data_path(u32 clnt_hdl)
 	struct ipa_ep_context *ep = &ipa_ctx->ep[clnt_hdl];
 	struct ipa_ep_cfg_holb holb_cfg;
 	struct ipa_ep_cfg_ctrl ep_cfg_ctrl;
+	u32 aggr_init;
 	int res = 0;
 
 	IPADBG("Disabling data path\n");
-	/* IPA_HW_MODE_VIRTUAL lacks support for TAG IC & EP suspend */
-	if (ipa_ctx->ipa_hw_mode == IPA_HW_MODE_VIRTUAL)
-		return 0;
-
 	/* On IPA 2.0, enable HOLB in order to prevent IPA from stalling */
-	if (ipa_ctx->ipa_hw_type == IPA_HW_v2_0 &&
-	    IPA_CLIENT_IS_CONS(ep->client)) {
-		memset(&holb_cfg, 0 , sizeof(holb_cfg));
-		holb_cfg.en = IPA_A2_HOLB_TMR_EN;
+	if ((ipa_ctx->ipa_hw_type >= IPA_HW_v2_0) &&
+		IPA_CLIENT_IS_CONS(ep->client)) {
+		memset(&holb_cfg, 0, sizeof(holb_cfg));
+		holb_cfg.en = IPA_HOLB_TMR_EN;
 		holb_cfg.tmr_val = 0;
 		res = ipa_cfg_ep_holb(clnt_hdl, &holb_cfg);
 	}
 
 	/* Suspend the pipe */
-	memset(&ep_cfg_ctrl, 0 , sizeof(struct ipa_ep_cfg_ctrl));
-	ep_cfg_ctrl.ipa_ep_suspend = true;
-
-	ipa_cfg_ep_ctrl(clnt_hdl, &ep_cfg_ctrl);
+	if (IPA_CLIENT_IS_CONS(ep->client)) {
+		memset(&ep_cfg_ctrl, 0 , sizeof(struct ipa_ep_cfg_ctrl));
+		ep_cfg_ctrl.ipa_ep_suspend = true;
+		ipa_cfg_ep_ctrl(clnt_hdl, &ep_cfg_ctrl);
+	}
 
 	udelay(IPA_PKT_FLUSH_TO_US);
-	if (IPA_CLIENT_IS_CONS(ep->client) &&
-			ep->cfg.aggr.aggr_en == IPA_ENABLE_AGGR &&
-			ep->cfg.aggr.aggr_time_limit)
-		msleep(ep->cfg.aggr.aggr_time_limit);
+	aggr_init = ipa_read_reg(ipa_ctx->mmio,
+			IPA_ENDP_INIT_AGGR_N_OFST_v2_0(clnt_hdl));
+	if (((aggr_init & IPA_ENDP_INIT_AGGR_N_AGGR_EN_BMSK) >>
+	    IPA_ENDP_INIT_AGGR_N_AGGR_EN_SHFT) == IPA_ENABLE_AGGR)
+		ipa_tag_aggr_force_close(clnt_hdl);
 
 	return res;
 }
@@ -95,6 +96,11 @@ static int ipa_connect_configure_sps(const struct ipa_connect_params *in,
 
 	/* Default Config */
 	ep->ep_hdl = sps_alloc_endpoint();
+
+	if (ipa_smmu_map_peer_bam(in->client_bam_hdl)) {
+		IPAERR("fail to iommu map peer BAM.\n");
+		return -EFAULT;
+	}
 
 	if (ep->ep_hdl == NULL) {
 		IPAERR("SPS EP alloc failed EP.\n");
@@ -113,6 +119,7 @@ static int ipa_connect_configure_sps(const struct ipa_connect_params *in,
 		ep->connect.mode = SPS_MODE_SRC;
 		ep->connect.destination =
 			in->client_bam_hdl;
+		ep->connect.dest_iova = ipa_ctx->peer_bam_iova;
 		ep->connect.source = ipa_ctx->bam_handle;
 		ep->connect.dest_pipe_index =
 			in->client_ep_idx;
@@ -120,6 +127,7 @@ static int ipa_connect_configure_sps(const struct ipa_connect_params *in,
 	} else {
 		ep->connect.mode = SPS_MODE_DEST;
 		ep->connect.source = in->client_bam_hdl;
+		ep->connect.source_iova = ipa_ctx->peer_bam_iova;
 		ep->connect.destination = ipa_ctx->bam_handle;
 		ep->connect.src_pipe_index = in->client_ep_idx;
 		ep->connect.dest_pipe_index = ipa_ep_idx;
@@ -137,6 +145,7 @@ static int ipa_connect_allocate_fifo(const struct ipa_connect_params *in,
 	dma_addr_t dma_addr;
 	u32 ofst;
 	int result = -EFAULT;
+	struct iommu_domain *smmu_domain;
 
 	mem_buff_ptr->size = fifo_size;
 	if (in->pipe_mem_preferred) {
@@ -161,35 +170,22 @@ static int ipa_connect_allocate_fifo(const struct ipa_connect_params *in,
 			dma_alloc_coherent(ipa_ctx->pdev, mem_buff_ptr->size,
 			&dma_addr, GFP_KERNEL);
 	}
-	mem_buff_ptr->phys_base = dma_addr;
+	if (!ipa_ctx->smmu_present) {
+		mem_buff_ptr->phys_base = dma_addr;
+	} else {
+		mem_buff_ptr->iova = dma_addr;
+		smmu_domain = ipa_get_smmu_domain();
+		if (smmu_domain != NULL) {
+			mem_buff_ptr->phys_base =
+				iommu_iova_to_phys(smmu_domain, dma_addr);
+		}
+	}
 	if (mem_buff_ptr->base == NULL) {
 		IPAERR("fail to get DMA memory.\n");
 		return -EFAULT;
 	}
 
 	return 0;
-}
-
-static void ipa_program_holb(struct ipa_ep_context *ep, int ipa_ep_idx)
-{
-	struct ipa_ep_cfg_holb holb;
-
-	if (IPA_CLIENT_IS_PROD(ep->client))
-		return;
-
-	memset(&holb, 0, sizeof(holb));
-
-	switch (ep->client) {
-	case IPA_CLIENT_A2_TETHERED_CONS:
-	case IPA_CLIENT_A2_EMBEDDED_CONS:
-		holb.en = IPA_A2_HOLB_TMR_EN;
-		holb.tmr_val = IPA_A2_HOLB_TMR_DEFAULT_VAL;
-		break;
-	default:
-		return;
-	}
-
-	ipa_cfg_ep_holb(ipa_ep_idx, &holb);
 }
 
 /**
@@ -199,7 +195,7 @@ static void ipa_program_holb(struct ipa_ep_context *ep, int ipa_ep_idx)
  * @clnt_hdl:	[out] opaque client handle assigned by IPA to client
  *
  * Should be called by the driver of the peripheral that wants to connect to
- * IPA in BAM-BAM mode. these peripherals are A2, USB and HSIC. this api
+ * IPA in BAM-BAM mode. these peripherals are USB and HSIC. this api
  * expects caller to take responsibility to add any needed headers, routing
  * and filtering tables and rules as needed.
  *
@@ -213,6 +209,14 @@ int ipa_connect(const struct ipa_connect_params *in, struct ipa_sps_params *sps,
 	int ipa_ep_idx;
 	int result = -EFAULT;
 	struct ipa_ep_context *ep;
+	struct ipa_ep_cfg_status ep_status;
+	unsigned long base;
+	struct iommu_domain *smmu_domain;
+
+	if (unlikely(!ipa_ctx)) {
+		IPAERR("IPA driver was not initialized\n");
+		return -EINVAL;
+	}
 
 	IPADBG("connecting client\n");
 
@@ -244,6 +248,13 @@ int ipa_connect(const struct ipa_connect_params *in, struct ipa_sps_params *sps,
 	ep->client = in->client;
 	ep->client_notify = in->notify;
 	ep->priv = in->priv;
+	ep->keep_ipa_awake = in->keep_ipa_awake;
+
+	/* Notify uc to start monitoring holb on USB BAM Producer pipe. */
+	if (IPA_CLIENT_IS_USB_CONS(in->client)) {
+		ipa_uc_monitor_holb(in->client, true);
+		IPADBG("Enabling holb monitor for client:%d", in->client);
+	}
 
 	result = ipa_enable_data_path(ipa_ep_idx);
 	if (result) {
@@ -257,6 +268,12 @@ int ipa_connect(const struct ipa_connect_params *in, struct ipa_sps_params *sps,
 			IPAERR("fail to configure EP.\n");
 			goto ipa_cfg_ep_fail;
 		}
+		/* Setting EP status 0 */
+		memset(&ep_status, 0, sizeof(ep_status));
+		if (ipa_cfg_ep_status(ipa_ep_idx, &ep_status)) {
+			IPAERR("fail to configure status of EP.\n");
+			goto ipa_cfg_ep_fail;
+		}
 		IPADBG("ep configuration successful\n");
 	} else {
 		IPADBG("Skipping endpoint configuration.\n");
@@ -266,6 +283,14 @@ int ipa_connect(const struct ipa_connect_params *in, struct ipa_sps_params *sps,
 	if (result) {
 		IPAERR("fail to configure SPS.\n");
 		goto ipa_cfg_ep_fail;
+	}
+
+	if (ipa_ctx->smmu_present &&
+			(in->desc.base == NULL ||
+			 in->data.base == NULL)) {
+		IPAERR(" allocate FIFOs data_fifo=0x%p desc_fifo=0x%p.\n",
+				in->data.base, in->desc.base);
+		goto desc_mem_alloc_fail;
 	}
 
 	if (in->desc.base == NULL) {
@@ -302,14 +327,45 @@ int ipa_connect(const struct ipa_connect_params *in, struct ipa_sps_params *sps,
 	IPADBG("Data FIFO pa=%pa, size=%d\n", &ep->connect.data.phys_base,
 	       ep->connect.data.size);
 
-	if (ipa_ctx->ipa_hw_type == IPA_HW_v2_0 &&
-					IPA_CLIENT_IS_USB_CONS(in->client))
+	if (ipa_ctx->smmu_present) {
+		ep->connect.data.iova = ep->connect.data.phys_base;
+		base = ep->connect.data.iova;
+		smmu_domain = ipa_get_smmu_domain();
+		if (smmu_domain != NULL) {
+			if (iommu_map(smmu_domain,
+				rounddown(base, PAGE_SIZE),
+				rounddown(base, PAGE_SIZE),
+				roundup(ep->connect.data.size + base -
+					rounddown(base, PAGE_SIZE), PAGE_SIZE),
+				IOMMU_READ | IOMMU_WRITE)) {
+				IPAERR("Fail to iommu_map data FIFO\n");
+				goto iommu_map_data_fail;
+			}
+		}
+		ep->connect.desc.iova = ep->connect.desc.phys_base;
+		base = ep->connect.desc.iova;
+		if (smmu_domain != NULL) {
+			if (iommu_map(smmu_domain,
+				rounddown(base, PAGE_SIZE),
+				rounddown(base, PAGE_SIZE),
+				roundup(ep->connect.desc.size + base -
+					rounddown(base, PAGE_SIZE), PAGE_SIZE),
+				IOMMU_READ | IOMMU_WRITE)) {
+				IPAERR("Fail to iommu_map desc FIFO\n");
+				goto iommu_map_desc_fail;
+			}
+		}
+	}
+
+	if ((ipa_ctx->ipa_hw_type == IPA_HW_v2_0 ||
+		ipa_ctx->ipa_hw_type == IPA_HW_v2_5) &&
+		IPA_CLIENT_IS_USB_CONS(in->client))
 		ep->connect.event_thresh = IPA_USB_EVENT_THRESHOLD;
 	else
 		ep->connect.event_thresh = IPA_EVENT_THRESHOLD;
 	ep->connect.options = SPS_O_AUTO_ENABLE;    /* BAM-to-BAM */
 
-	result = sps_connect(ep->ep_hdl, &ep->connect);
+	result = ipa_sps_connect_safe(ep->ep_hdl, &ep->connect, in->client);
 	if (result) {
 		IPAERR("sps_connect fails.\n");
 		goto sps_connect_fail;
@@ -321,35 +377,61 @@ int ipa_connect(const struct ipa_connect_params *in, struct ipa_sps_params *sps,
 	memcpy(&sps->desc, &ep->connect.desc, sizeof(struct sps_mem_buffer));
 	memcpy(&sps->data, &ep->connect.data, sizeof(struct sps_mem_buffer));
 
-	ipa_program_holb(ep, ipa_ep_idx);
-
+	ipa_ctx->skip_ep_cfg_shadow[ipa_ep_idx] = ep->skip_ep_cfg;
 	if (!ep->skip_ep_cfg && IPA_CLIENT_IS_PROD(in->client))
 		ipa_install_dflt_flt_rules(ipa_ep_idx);
+
+	if (!ep->keep_ipa_awake)
+		ipa_dec_client_disable_clks();
 
 	IPADBG("client %d (ep: %d) connected\n", in->client, ipa_ep_idx);
 
 	return 0;
 
 sps_connect_fail:
-	if (!ep->data_fifo_in_pipe_mem)
-		dma_free_coherent(ipa_ctx->pdev,
+	if (ipa_ctx->smmu_present) {
+		base = ep->connect.desc.iova;
+		smmu_domain = ipa_get_smmu_domain();
+		if (smmu_domain != NULL) {
+			iommu_unmap(smmu_domain,
+				rounddown(base, PAGE_SIZE),
+				roundup(ep->connect.desc.size + base -
+					rounddown(base, PAGE_SIZE), PAGE_SIZE));
+		}
+	}
+iommu_map_desc_fail:
+	if (ipa_ctx->smmu_present) {
+		base = ep->connect.data.iova;
+		smmu_domain = ipa_get_smmu_domain();
+		if (smmu_domain != NULL) {
+			iommu_unmap(smmu_domain,
+				rounddown(base, PAGE_SIZE),
+				roundup(ep->connect.data.size + base -
+					rounddown(base, PAGE_SIZE), PAGE_SIZE));
+		}
+	}
+iommu_map_data_fail:
+	if (!ep->data_fifo_client_allocated) {
+		if (!ep->data_fifo_in_pipe_mem)
+			dma_free_coherent(ipa_ctx->pdev,
 				  ep->connect.data.size,
 				  ep->connect.data.base,
 				  ep->connect.data.phys_base);
-	else
-		ipa_pipe_mem_free(ep->data_fifo_pipe_mem_ofst,
+		else
+			ipa_pipe_mem_free(ep->data_fifo_pipe_mem_ofst,
 				  ep->connect.data.size);
-
+	}
 data_mem_alloc_fail:
-	if (!ep->desc_fifo_in_pipe_mem)
-		dma_free_coherent(ipa_ctx->pdev,
+	if (!ep->desc_fifo_client_allocated) {
+		if (!ep->desc_fifo_in_pipe_mem)
+			dma_free_coherent(ipa_ctx->pdev,
 				  ep->connect.desc.size,
 				  ep->connect.desc.base,
 				  ep->connect.desc.phys_base);
-	else
-		ipa_pipe_mem_free(ep->desc_fifo_pipe_mem_ofst,
+		else
+			ipa_pipe_mem_free(ep->desc_fifo_pipe_mem_ofst,
 				  ep->connect.desc.size);
-
+	}
 desc_mem_alloc_fail:
 	sps_free_endpoint(ep->ep_hdl);
 ipa_cfg_ep_fail:
@@ -376,17 +458,37 @@ int ipa_disconnect(u32 clnt_hdl)
 {
 	int result;
 	struct ipa_ep_context *ep;
+	unsigned long peer_bam;
+	unsigned long base;
+	struct iommu_domain *smmu_domain;
+	struct ipa_disable_force_clear_datapath_req_msg_v01 req = {0};
+	int res;
 
-	if (clnt_hdl >= IPA_NUM_PIPES || ipa_ctx->ep[clnt_hdl].valid == 0) {
+	if (unlikely(!ipa_ctx)) {
+		IPAERR("IPA driver was not initialized\n");
+		return -EINVAL;
+	}
+
+	if (clnt_hdl >= ipa_ctx->ipa_num_pipes ||
+		ipa_ctx->ep[clnt_hdl].valid == 0) {
 		IPAERR("bad parm.\n");
 		return -EINVAL;
 	}
 
 	ep = &ipa_ctx->ep[clnt_hdl];
 
-	if (ep->suspended) {
+	if (!ep->keep_ipa_awake)
 		ipa_inc_client_enable_clks();
-		ep->suspended = false;
+
+	/* Set Disconnect in Progress flag. */
+	spin_lock(&ipa_ctx->disconnect_lock);
+	ep->disconnect_in_progress = true;
+	spin_unlock(&ipa_ctx->disconnect_lock);
+
+	/* Notify uc to stop monitoring holb on USB BAM Producer pipe. */
+	if (IPA_CLIENT_IS_USB_CONS(ep->client)) {
+		ipa_uc_monitor_holb(ep->client, false);
+		IPADBG("Disabling holb monitor for client: %d\n", ep->client);
 	}
 
 	result = ipa_disable_data_path(clnt_hdl);
@@ -399,6 +501,16 @@ int ipa_disconnect(u32 clnt_hdl)
 	result = sps_disconnect(ep->ep_hdl);
 	if (result) {
 		IPAERR("SPS disconnect failed.\n");
+		return -EPERM;
+	}
+
+	if (IPA_CLIENT_IS_CONS(ep->client))
+		peer_bam = ep->connect.destination;
+	else
+		peer_bam = ep->connect.source;
+
+	if (ipa_smmu_unmap_peer_bam(peer_bam)) {
+		IPAERR("fail to iommu unmap peer BAM.\n");
 		return -EPERM;
 	}
 
@@ -426,6 +538,28 @@ int ipa_disconnect(u32 clnt_hdl)
 					  ep->connect.data.size);
 	}
 
+	if (ipa_ctx->smmu_present) {
+		base = ep->connect.desc.iova;
+		smmu_domain = ipa_get_smmu_domain();
+		if (smmu_domain != NULL) {
+			iommu_unmap(smmu_domain,
+				rounddown(base, PAGE_SIZE),
+				roundup(ep->connect.desc.size + base -
+					rounddown(base, PAGE_SIZE), PAGE_SIZE));
+		}
+	}
+
+	if (ipa_ctx->smmu_present) {
+		base = ep->connect.data.iova;
+		smmu_domain = ipa_get_smmu_domain();
+		if (smmu_domain != NULL) {
+			iommu_unmap(smmu_domain,
+				rounddown(base, PAGE_SIZE),
+				roundup(ep->connect.data.size + base -
+					rounddown(base, PAGE_SIZE), PAGE_SIZE));
+		}
+	}
+
 	result = sps_free_endpoint(ep->ep_hdl);
 	if (result) {
 		IPAERR("SPS de-alloc EP failed.\n");
@@ -434,7 +568,22 @@ int ipa_disconnect(u32 clnt_hdl)
 
 	ipa_delete_dflt_flt_rules(clnt_hdl);
 
+	/* If APPS flow control is not enabled, send a message to modem to
+	 * enable flow control honoring.
+	 */
+	if (!ipa_ctx->tethered_flow_control && ep->qmi_request_sent) {
+		/* Send a message to modem to disable flow control honoring. */
+		req.request_id = clnt_hdl;
+		res = qmi_disable_force_clear_datapath_send(&req);
+		if (res) {
+			IPADBG("disable_force_clear_datapath failed %d\n",
+				res);
+		}
+	}
+
+	spin_lock(&ipa_ctx->disconnect_lock);
 	memset(&ipa_ctx->ep[clnt_hdl], 0, sizeof(struct ipa_ep_context));
+	spin_unlock(&ipa_ctx->disconnect_lock);
 
 	ipa_dec_client_disable_clks();
 
@@ -445,79 +594,143 @@ int ipa_disconnect(u32 clnt_hdl)
 EXPORT_SYMBOL(ipa_disconnect);
 
 /**
- * ipa_resume() - low-level IPA client resume
- * @clnt_hdl:	[in] opaque client handle assigned by IPA to client
- *
- * Should be called by the driver of the peripheral that wants to resume IPA
- * connection. Resume IPA connection results in turning on IPA clocks in
- * case they were off as a result of suspend.
- * this api can be called only if a call to ipa_suspend() was
- * made.
- *
- * Returns:	0 on success, negative on failure
- *
- * Note:	Should not be called from atomic context
- */
-int ipa_resume(u32 clnt_hdl)
-{
-	struct ipa_ep_context *ep;
-
-	if (clnt_hdl >= IPA_NUM_PIPES || ipa_ctx->ep[clnt_hdl].valid == 0) {
-		IPAERR("bad parm. clnt_hdl %d\n", clnt_hdl);
-		return -EINVAL;
-	}
-
-	ep = &ipa_ctx->ep[clnt_hdl];
-
-	if (!ep->suspended) {
-		IPAERR("EP not suspended. clnt_hdl %d\n", clnt_hdl);
-		return -EPERM;
-	}
-
-	ipa_inc_client_enable_clks();
-	ep->suspended = false;
-
-	return 0;
-}
-EXPORT_SYMBOL(ipa_resume);
-
-/**
-* ipa_suspend() - low-level IPA client suspend
-* @clnt_hdl:	[in] opaque client handle assigned by IPA to client
-*
-* Should be called by the driver of the peripheral that wants to suspend IPA
-* connection. Suspend IPA connection results in turning off IPA clocks in
-* case that there is no active clients using IPA. Pipes remains connected in
-* case of suspend.
+* ipa_reset_endpoint() - reset an endpoint from BAM perspective
+* @clnt_hdl: [in] IPA client handle
 *
 * Returns:	0 on success, negative on failure
 *
 * Note:	Should not be called from atomic context
 */
-int ipa_suspend(u32 clnt_hdl)
+int ipa_reset_endpoint(u32 clnt_hdl)
 {
+	int res;
 	struct ipa_ep_context *ep;
 
-	if (clnt_hdl >= IPA_NUM_PIPES || ipa_ctx->ep[clnt_hdl].valid == 0) {
-		IPAERR("bad parm. clnt_hdl %d\n", clnt_hdl);
+	if (unlikely(!ipa_ctx)) {
+		IPAERR("IPA driver was not initialized\n");
+		return -EINVAL;
+	}
+
+	if (clnt_hdl >= ipa_ctx->ipa_num_pipes) {
+		IPAERR("Bad parameters.\n");
+		return -EFAULT;
+	}
+	ep = &ipa_ctx->ep[clnt_hdl];
+
+	ipa_inc_client_enable_clks();
+	res = sps_disconnect(ep->ep_hdl);
+	if (res) {
+		IPAERR("sps_disconnect() failed, res=%d.\n", res);
+		goto bail;
+	} else {
+		res = ipa_sps_connect_safe(ep->ep_hdl, &ep->connect,
+			ep->client);
+		if (res) {
+			IPAERR("sps_connect() failed, res=%d.\n", res);
+			goto bail;
+		}
+	}
+
+bail:
+	ipa_dec_client_disable_clks();
+
+	return res;
+}
+EXPORT_SYMBOL(ipa_reset_endpoint);
+
+/**
+ * ipa_sps_connect_safe() - connect endpoint from BAM prespective
+ * @h: [in] sps pipe handle
+ * @connect: [in] sps connect parameters
+ * @ipa_client: [in] ipa client handle representing the pipe
+ *
+ * This function connects a BAM pipe using SPS driver sps_connect() API
+ * and by requesting uC interface to reset the pipe, avoids an IPA HW
+ * limitation that does not allow reseting a BAM pipe during traffic in
+ * IPA TX command queue.
+ *
+ * Returns:	0 on success, negative on failure
+ */
+int ipa_sps_connect_safe(struct sps_pipe *h, struct sps_connect *connect,
+			 enum ipa_client_type ipa_client)
+{
+	int res;
+
+	if (ipa_ctx->ipa_hw_type > IPA_HW_v2_5 || ipa_ctx->skip_uc_pipe_reset) {
+		IPADBG("uC pipe reset is not required\n");
+	} else {
+		res = ipa_uc_reset_pipe(ipa_client);
+		if (res)
+			return res;
+	}
+	return sps_connect(h, connect);
+}
+EXPORT_SYMBOL(ipa_sps_connect_safe);
+/**
+ * ipa_clear_endpoint_delay() - Remove ep delay set on the IPA pipe before
+ * client disconnect.
+ * @clnt_hdl:	[in] opaque client handle assigned by IPA to client
+ *
+ * Should be called by the driver of the peripheral that wants to remove
+ * ep delay on IPA consumer ipe before disconnect in BAM-BAM mode. this api
+ * expects caller to take responsibility to free any needed headers, routing
+ * and filtering tables and rules as needed.
+ *
+ * Returns:	0 on success, negative on failure
+ *
+ * Note:	Should not be called from atomic context
+ */
+int ipa_clear_endpoint_delay(u32 clnt_hdl)
+{
+	struct ipa_ep_context *ep;
+	struct ipa_ep_cfg_ctrl ep_ctrl = {0};
+	struct ipa_enable_force_clear_datapath_req_msg_v01 req = {0};
+	int res;
+
+	if (unlikely(!ipa_ctx)) {
+		IPAERR("IPA driver was not initialized\n");
+		return -EINVAL;
+	}
+
+	if (clnt_hdl >= ipa_ctx->ipa_num_pipes ||
+		ipa_ctx->ep[clnt_hdl].valid == 0) {
+		IPAERR("bad parm.\n");
 		return -EINVAL;
 	}
 
 	ep = &ipa_ctx->ep[clnt_hdl];
 
-	if (ep->suspended) {
-		IPAERR("EP already suspended. clnt_hdl %d\n", clnt_hdl);
-		return -EPERM;
+	if (!ipa_ctx->tethered_flow_control) {
+		IPADBG("APPS flow control is not enabled\n");
+		/* Send a message to modem to disable flow control honoring. */
+		req.request_id = clnt_hdl;
+		req.source_pipe_bitmask = 1 << clnt_hdl;
+		res = qmi_enable_force_clear_datapath_send(&req);
+		if (res) {
+			IPADBG("enable_force_clear_datapath failed %d\n",
+				res);
+		}
+		ep->qmi_request_sent = true;
 	}
 
-	if (IPA_CLIENT_IS_CONS(ep->client) &&
-				ep->cfg.aggr.aggr_en == IPA_ENABLE_AGGR &&
-				ep->cfg.aggr.aggr_time_limit)
-		msleep(ep->cfg.aggr.aggr_time_limit);
+
+	ipa_inc_client_enable_clks();
+	/* Set disconnect in progress flag so further flow control events are
+	 * not honored.
+	 */
+	spin_lock(&ipa_ctx->disconnect_lock);
+	ep->disconnect_in_progress = true;
+	spin_unlock(&ipa_ctx->disconnect_lock);
+
+	/* If flow is disabled at this point, restore the ep state.*/
+	ep_ctrl.ipa_ep_delay = false;
+	ep_ctrl.ipa_ep_suspend = false;
+	ipa_cfg_ep_ctrl(clnt_hdl, &ep_ctrl);
 
 	ipa_dec_client_disable_clks();
-	ep->suspended = true;
+
+	IPADBG("client (ep: %d) removed ep delay\n", clnt_hdl);
 
 	return 0;
 }
-EXPORT_SYMBOL(ipa_suspend);
+EXPORT_SYMBOL(ipa_clear_endpoint_delay);

@@ -17,7 +17,6 @@ config USB_C67X00_HCD
 
 config USB_XHCI_HCD
 	tristate "xHCI HCD (USB 3.0) support"
-	depends on USB_ARCH_HAS_XHCI
 	---help---
 	  The eXtensible Host Controller Interface (xHCI) is standard for USB 3.0
 	  "SuperSpeed" host controller hardware.
@@ -54,7 +53,6 @@ endif # USB_XHCI_HCD
 
 config USB_EHCI_HCD
 	tristate "EHCI HCD (USB 2.0) support"
-	depends on USB_ARCH_HAS_EHCI
 	---help---
 	  The Enhanced Host Controller Interface (EHCI) is standard for USB 2.0
 	  "high speed" (480 Mbit/sec, 60 Mbyte/sec) host controller hardware.
@@ -241,6 +239,15 @@ config USB_EHCI_MSM_HOST4
 	  Enables support for the EHCI Compliant USB Host controller# 4
 	  present on the Qualcomm chipsets.
 
+config USB_EHCI_MSM_UICC
+	tristate "Support for EHCI MSM UICC controller"
+	depends on USB_EHCI_HCD
+	---help---
+	  Enables support for the Full-Speed only EHCI controller that
+	  is used for UICC connectivity on MSM targets. The controller
+	  is configured in serial mode and TLMM block converts the
+	  controller serial lines into USB DP and DM signals.
+
 config USB_EHCI_TEGRA
        boolean "NVIDIA Tegra HCD support"
        depends on ARCH_TEGRA
@@ -340,7 +347,6 @@ endif # USB_EHCI_HCD
 
 config USB_OXU210HP_HCD
 	tristate "OXU210HP HCD support"
-	depends on GENERIC_HARDIRQS
 	---help---
 	  The OXU210HP is an USB host/OTG/device controller. Enable this
 	  option if your board has this chip. If unsure, say N.
@@ -404,7 +410,6 @@ config USB_ISP1362_HCD
 
 config USB_OHCI_HCD
 	tristate "OHCI HCD support"
-	depends on USB_ARCH_HAS_OHCI
 	select ISP1301_OMAP if MACH_OMAP_H2 || MACH_OMAP_H3
 	depends on USB_ISP1301 || !ARCH_LPC32XX
 	---help---
@@ -759,3 +764,16 @@ config USB_HCD_SSB
 	  for ehci and ohci.
 
 	  If unsure, say N.
+
+config USB_ICE40_HCD
+	tristate "ICE40 FPGA based SPI to Inter-Chip USB host controller"
+	depends on USB && SPI
+	help
+	  A driver for ICE40 FPGA based SPI to Inter-Chip USB host
+	  controller. This driver registers as a SPI protocol driver
+	  and interacts with the SPI subsystem on one side and interacts
+	  with the USB core on the other side. Control and Bulk transfers
+	  are supported.
+
+	  To compile this driver a module, choose M here: the module
+	  will be called "ice40-hcd".

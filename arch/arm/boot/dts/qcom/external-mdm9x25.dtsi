@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2013-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -13,6 +13,7 @@
 &soc {
 	mdm0: qcom,mdm0 {
                 compatible = "qcom,ext-mdm9x25";
+		reg = <0xfe805000 0x1000>;
 		cell-index = <0>;
 		#address-cells = <0>;
                 interrupt-parent = <&mdm0>;
@@ -30,13 +31,16 @@
                 qcom,vddmin-modes  = "normal";
                 qcom,vddmin-drive-strength = <8>;
 		qcom,sfr-query;
-		qcom,sysmon-subsys-id = <20>;
 		qcom,support-shutdown;
+		qcom,sysmon-id = <20>;
+		qcom,ssctl-instance-id = <0x10>;
+		qcom,pil-force-shutdown;
 		status = "disabled";
 	};
 
 	mdm1: qcom,mdm1 {
                 compatible = "qcom,ext-mdm9x35";
+		reg = <0xfe805000 0x1000>;
 		cell-index = <0>;
 		#address-cells = <0>;
                 interrupt-parent = <&mdm1>;
@@ -54,8 +58,10 @@
                 qcom,vddmin-modes  = "normal";
                 qcom,vddmin-drive-strength = <8>;
 		qcom,sfr-query;
-		qcom,sysmon-subsys-id = <20>;
 		qcom,support-shutdown;
+		qcom,sysmon-id = <20>;
+		qcom,ssctl-instance-id = <0x10>;
+		qcom,pil-force-shutdown;
 		status = "disabled";
 	};
 };

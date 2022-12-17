@@ -1087,6 +1087,13 @@ static long do_fb_ioctl(struct fb_info *info, unsigned int cmd,
 	void __user *argp = (void __user *)arg;
 	long ret = 0;
 
+	memset(&var, 0, sizeof(var));
+	memset(&fix, 0, sizeof(fix));
+	memset(&con2fb, 0, sizeof(con2fb));
+	memset(&cmap_from, 0, sizeof(cmap_from));
+	memset(&cmap, 0, sizeof(cmap));
+	memset(&event, 0, sizeof(event));
+
 	switch (cmd) {
 	case FBIOGET_VSCREENINFO:
 		if (!lock_fb_info(info))
@@ -1441,6 +1448,7 @@ __releases(&info->lock)
 		goto out;
 	}
 	file->private_data = info;
+	info->file = file;
 	if (info->fbops->fb_open) {
 		res = info->fbops->fb_open(info,1);
 		if (res)
@@ -1465,6 +1473,7 @@ __releases(&info->lock)
 	struct fb_info * const info = file->private_data;
 
 	mutex_lock(&info->lock);
+	info->file = file;
 	if (info->fbops->fb_release)
 		info->fbops->fb_release(info,1);
 	module_put(info->fbops->owner);

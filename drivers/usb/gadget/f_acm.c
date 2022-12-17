@@ -5,7 +5,7 @@
  * Copyright (C) 2008 by David Brownell
  * Copyright (C) 2008 by Nokia Corporation
  * Copyright (C) 2009 by Samsung Electronics
- * Copyright (c) 2011 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2011, 2014-2015 The Linux Foundation. All rights reserved.
  * Author: Michal Nazarewicz (mina86@mina86.com)
  *
  * This software is distributed under the terms of the GNU General
@@ -20,8 +20,8 @@
 #include <linux/module.h>
 #include <linux/device.h>
 #include <linux/err.h>
-#include <mach/usb_gadget_xport.h>
 
+#include "usb_gadget_xport.h"
 #include "u_serial.h"
 #include "gadget_chips.h"
 
@@ -79,7 +79,6 @@ struct f_acm {
 };
 
 static unsigned int no_acm_tty_ports;
-static unsigned int no_acm_sdio_ports;
 static unsigned int no_acm_smd_ports;
 static unsigned int nr_acm_ports;
 static unsigned int acm_next_free_port;
@@ -106,9 +105,8 @@ int acm_port_setup(struct usb_configuration *c)
 {
 	int ret = 0, i;
 
-	pr_debug("%s: no_acm_tty_ports:%u no_acm_sdio_ports: %u nr_acm_ports:%u\n",
-			__func__, no_acm_tty_ports, no_acm_sdio_ports,
-				nr_acm_ports);
+	pr_debug("%s: no_acm_tty_ports:%u nr_acm_ports:%u\n",
+			__func__, no_acm_tty_ports, nr_acm_ports);
 
 	if (no_acm_tty_ports) {
 		for (i = 0; i < no_acm_tty_ports; i++) {
@@ -118,8 +116,6 @@ int acm_port_setup(struct usb_configuration *c)
 				return ret;
 		}
 	}
-	if (no_acm_sdio_ports)
-		ret = gsdio_setup(c->cdev->gadget, no_acm_sdio_ports);
 	if (no_acm_smd_ports)
 		ret = gsmd_setup(c->cdev->gadget, no_acm_smd_ports);
 
@@ -141,16 +137,13 @@ static int acm_port_connect(struct f_acm *acm)
 	port_num = gacm_ports[acm->port_num].client_port_num;
 
 
-	pr_debug("%s: transport:%s f_acm:%p gserial:%p port_num:%d cl_port_no:%d\n",
+	pr_debug("%s: transport:%s f_acm:%pK gserial:%pK port_num:%d cl_port_no:%d\n",
 			__func__, xport_to_str(acm->transport),
 			acm, &acm->port, acm->port_num, port_num);
 
 	switch (acm->transport) {
 	case USB_GADGET_XPORT_TTY:
 		gserial_connect(&acm->port, port_num);
-		break;
-	case USB_GADGET_XPORT_SDIO:
-		gsdio_connect(&acm->port, port_num);
 		break;
 	case USB_GADGET_XPORT_SMD:
 		gsmd_connect(&acm->port, port_num);
@@ -170,16 +163,13 @@ static int acm_port_disconnect(struct f_acm *acm)
 
 	port_num = gacm_ports[acm->port_num].client_port_num;
 
-	pr_debug("%s: transport:%s f_acm:%p gserial:%p port_num:%d cl_pno:%d\n",
+	pr_debug("%s: transport:%s f_acm:%pK gserial:%pK port_num:%d cl_pno:%d\n",
 			__func__, xport_to_str(acm->transport),
 			acm, &acm->port, acm->port_num, port_num);
 
 	switch (acm->transport) {
 	case USB_GADGET_XPORT_TTY:
 		gserial_disconnect(&acm->port);
-		break;
-	case USB_GADGET_XPORT_SDIO:
-		gsdio_disconnect(&acm->port, port_num);
 		break;
 	case USB_GADGET_XPORT_SMD:
 		gsmd_disconnect(&acm->port, port_num);
@@ -392,6 +382,7 @@ static struct usb_string acm_string_defs[] = {
 	[ACM_CTRL_IDX].s = "CDC Abstract Control Model (ACM)",
 	[ACM_DATA_IDX].s = "CDC ACM Data",
 	[ACM_IAD_IDX ].s = "CDC Serial",
+	{  } /* end of list */
 };
 
 static struct usb_gadget_strings acm_string_table = {
@@ -499,6 +490,9 @@ static int acm_setup(struct usb_function *f, const struct usb_ctrlrequest *ctrl)
 		 * that bit, we should return to that no-flow state.
 		 */
 		acm->port_handshake_bits = w_value;
+		pr_debug("%s: USB_CDC_REQ_SET_CONTROL_LINE_STATE: DTR:%d RST:%d\n",
+				__func__, w_value & ACM_CTRL_DTR ? 1 : 0,
+				w_value & ACM_CTRL_RTS ? 1 : 0);
 		if (acm->port.notify_modem) {
 			unsigned port_num =
 				gacm_ports[acm->port_num].client_port_num;
@@ -542,11 +536,12 @@ static int acm_set_alt(struct usb_function *f, unsigned intf, unsigned alt)
 		if (acm->notify->driver_data) {
 			VDBG(cdev, "reset acm control interface %d\n", intf);
 			usb_ep_disable(acm->notify);
-		} else {
-			VDBG(cdev, "init acm ctrl interface %d\n", intf);
+		}
+
+		if (!acm->notify->desc)
 			if (config_ep_by_speed(cdev->gadget, f, acm->notify))
 				return -EINVAL;
-		}
+
 		usb_ep_enable(acm->notify);
 		acm->notify->driver_data = acm;
 
@@ -788,7 +783,7 @@ acm_bind(struct usb_configuration *c, struct usb_function *f)
 	/* allocate notification */
 	acm->notify_req = gs_alloc_req(ep,
 			sizeof(struct usb_cdc_notification) + 2,
-			GFP_KERNEL);
+			cdev->gadget->extra_buf_alloc, GFP_KERNEL);
 	if (!acm->notify_req)
 		goto fail;
 
@@ -832,7 +827,7 @@ fail:
 	if (acm->port.in)
 		acm->port.in->driver_data = NULL;
 
-	ERROR(cdev, "%s/%p: can't bind, err %d\n", f->name, f, status);
+	ERROR(cdev, "%s/%pK: can't bind, err %d\n", f->name, f, status);
 
 	return status;
 }
@@ -999,10 +994,6 @@ int acm_init_port(int port_num, const char *name)
 	switch (transport) {
 	case USB_GADGET_XPORT_TTY:
 		no_acm_tty_ports++;
-		break;
-	case USB_GADGET_XPORT_SDIO:
-		gacm_ports[port_num].client_port_num = no_acm_sdio_ports;
-		no_acm_sdio_ports++;
 		break;
 	case USB_GADGET_XPORT_SMD:
 		gacm_ports[port_num].client_port_num = no_acm_smd_ports;

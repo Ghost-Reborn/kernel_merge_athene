@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2011-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -24,6 +24,7 @@ extern struct bus_type slimbus_type;
 /* Standard values per SLIMbus spec needed by controllers and devices */
 #define SLIM_CL_PER_SUPERFRAME		6144
 #define SLIM_CL_PER_SUPERFRAME_DIV8	(SLIM_CL_PER_SUPERFRAME >> 3)
+#define SLIM_MAX_TXNS			256
 #define SLIM_MAX_CLK_GEAR		10
 #define SLIM_MIN_CLK_GEAR		1
 #define SLIM_CL_PER_SL			4
@@ -155,6 +156,20 @@ struct slim_addrt {
 };
 
 /*
+ * struct slim_val_inf: slimbus value/information element transaction
+ * @start_offset: Specifies starting offset in information/value element map
+ * @num_bytes: number of bytes to be read/written
+ * @wbuf: buffer if this transaction has 'write' component in it
+ * @rbuf: buffer if this transaction has 'read' component in it
+ */
+struct slim_val_inf {
+	u16 start_offset;
+	u8 num_bytes;
+	u8 *wbuf;
+	u8 *rbuf;
+};
+
+/*
  * struct slim_msg_txn: Message to be sent by the controller.
  * Linux framework uses this structure with drivers implementing controller.
  * This structure has packet header, payload and buffer to be filled (if any)
@@ -171,6 +186,7 @@ struct slim_addrt {
  *	(e.g. relevant for mc = SLIM_MSG_MC_REQUEST_INFORMATION)
  * @la: Logical address of the device this message is going to.
  *	(Not used when destination type is broadcast.)
+ * @async: If this transaction is async
  * @rbuf: Buffer to be populated by controller when response is received.
  * @wbuf: Payload of the message. (e.g. channel number for DATA channel APIs)
  * @comp: Completion structure. Used by controller to notify response.
@@ -185,6 +201,7 @@ struct slim_msg_txn {
 	u8			len;
 	u8			tid;
 	u8			la;
+	bool			async;
 	u8			*rbuf;
 	const u8		*wbuf;
 	struct completion	*comp;
@@ -209,13 +226,13 @@ enum slim_port_req {
 };
 
 /*
- * enum slim_port_cfg: Port configuration parameters requested.
- * User can request no configuration, packed data, or MSB aligned data port
+ * enum slim_port_opts: Port options requested.
+ * User can request no configuration, packed data, and/or MSB aligned data port
  */
-enum slim_port_cfg {
-	SLIM_CFG_NONE,
-	SLIM_CFG_PACKED,
-	SLIM_CFG_ALIGN_MSB,
+enum slim_port_opts {
+	SLIM_OPT_NONE = 0,
+	SLIM_OPT_NO_PACK = 1U,
+	SLIM_OPT_ALIGN_MSB = 1U << 1,
 };
 
 /* enum slim_port_flow: Port flow type (inbound/outbound). */
@@ -231,6 +248,16 @@ enum slim_port_err {
 	SLIM_P_UNDERFLOW,
 	SLIM_P_DISCONNECT,
 	SLIM_P_NOT_OWNED,
+};
+
+/*
+ * struct slim_port_cfg: Port config for the manager port
+ * port_opts: port options (bit-map) for this port
+ * watermark: watermark level set for this port
+ */
+struct slim_port_cfg {
+	u32 port_opts;
+	u32 watermark;
 };
 
 /*
@@ -250,7 +277,7 @@ struct slim_port {
 	enum slim_port_err	err;
 	enum slim_port_state	state;
 	enum slim_port_req	req;
-	enum slim_port_cfg	cfg;
+	struct slim_port_cfg	cfg;
 	enum slim_port_flow	flow;
 	struct slim_ch		*ch;
 	struct completion	*xcomp;
@@ -525,6 +552,12 @@ enum slim_clk_state {
  * @port_xfer_status: Called by framework when client calls get_xfer_status
  *	API. Returns how much buffer is actually processed and the port
  *	errors (e.g. overflow/underflow) if any.
+ * @xfer_user_msg: Send user message to specified logical address. Underlying
+ *	controller has to support sending user messages. Returns error if any.
+ * @xfer_bulk_wr: Send bulk of write messages to specified logical address.
+ *	Underlying controller has to support this. Typically useful to transfer
+ *	messages to download firmware, or messages where strict ordering for
+ *	slave is necessary
  */
 struct slim_controller {
 	struct device		dev;
@@ -542,8 +575,9 @@ struct slim_controller {
 	u8			num_dev;
 	struct list_head	devs;
 	struct workqueue_struct *wq;
-	struct slim_msg_txn	**txnt;
+	struct slim_msg_txn	*txnt[SLIM_MAX_TXNS];
 	u8			last_tid;
+	spinlock_t		txn_lock;
 	struct slim_port	*ports;
 	int			nports;
 	struct slim_ich		*chans;
@@ -567,10 +601,17 @@ struct slim_controller {
 	int			(*framer_handover)(struct slim_controller *ctrl,
 				struct slim_framer *new_framer);
 	int			(*port_xfer)(struct slim_controller *ctrl,
-				u8 pn, u8 *iobuf, u32 len,
+				u8 pn, phys_addr_t iobuf, u32 len,
 				struct completion *comp);
 	enum slim_port_err	(*port_xfer_status)(struct slim_controller *ctr,
-				u8 pn, u8 **done_buf, u32 *done_len);
+				u8 pn, phys_addr_t *done_buf, u32 *done_len);
+	int			(*xfer_user_msg)(struct slim_controller *ctrl,
+				u8 la, u8 mt, u8 mc,
+				struct slim_ele_access *msg, u8 *buf, u8 len);
+	int (*xfer_bulk_wr)(struct slim_controller *ctrl,
+			u8 la, u8 mt, u8 mc, struct slim_val_inf msgs[],
+			int n, int (*comp_cb)(void *ctx, int err),
+			void *ctx);
 };
 #define to_slim_controller(d) container_of(d, struct slim_controller, dev)
 
@@ -744,6 +785,39 @@ extern int slim_request_clear_inf_element(struct slim_device *sb,
 extern int slim_xfer_msg(struct slim_controller *ctrl,
 			struct slim_device *sbdev, struct slim_ele_access *msg,
 			u16 mc, u8 *rbuf, const u8 *wbuf, u8 len);
+
+/*
+ * User message:
+ * slim_user_msg: Send user message that is interpreted by destination device
+ * @sb: Client handle sending the message
+ * @la: Destination device for this user message
+ * @mt: Message Type (Soruce-referred, or Destination-referred)
+ * @mc: Message Code
+ * @msg: Message structure (start offset, number of bytes) to be sent
+ * @buf: data buffer to be sent
+ * @len: data buffer size in bytes
+ */
+extern int slim_user_msg(struct slim_device *sb, u8 la, u8 mt, u8 mc,
+				struct slim_ele_access *msg, u8 *buf, u8 len);
+
+/*
+ * Queue bulk of message writes:
+ * slim_bulk_msg_write: Write bulk of messages (e.g. downloading FW)
+ * @sb: Client handle sending these messages
+ * @la: Destination device for these messages
+ * @mt: Message Type
+ * @mc: Message Code
+ * @msgs: List of messages to be written in bulk
+ * @n: Number of messages in the list
+ * @cb: Callback if client needs this to be non-blocking
+ * @ctx: Context for this callback
+ * If supported by controller, this message list will be sent in bulk to the HW
+ * If the client specifies this to be non-blocking, the callback will be
+ * called from atomic context.
+ */
+extern int slim_bulk_msg_write(struct slim_device *sb, u8 mt, u8 mc,
+			struct slim_val_inf msgs[], int n,
+			int (*comp_cb)(void *ctx, int err), void *ctx);
 /* end of message apis */
 
 /* Port management for manager device APIs */
@@ -771,6 +845,19 @@ extern int slim_alloc_mgrports(struct slim_device *sb, enum slim_port_req req,
 extern int slim_dealloc_mgrports(struct slim_device *sb, u32 *hdl, int hsz);
 
 /*
+ * slim_config_mgrports: Configure manager side ports
+ * @sb: device/client handle.
+ * @ph: array of port handles for which this configuration is valid
+ * @nports: Number of ports in ph
+ * @cfg: configuration requested for port(s)
+ * Configure port settings if they are different than the default ones.
+ * Returns success if the config could be applied. Returns -EISCONN if the
+ * port is in use
+ */
+extern int slim_config_mgrports(struct slim_device *sb, u32 *ph, int nports,
+				struct slim_port_cfg *cfg);
+
+/*
  * slim_port_xfer: Schedule buffer to be transferred/received using port-handle.
  * @sb: client handle
  * @ph: port-handle
@@ -783,8 +870,8 @@ extern int slim_dealloc_mgrports(struct slim_device *sb, u32 *hdl, int hsz);
  * Client will call slim_port_get_xfer_status to get error and/or number of
  * bytes transferred if used asynchronously.
  */
-extern int slim_port_xfer(struct slim_device *sb, u32 ph, u8 *iobuf, u32 len,
-				struct completion *comp);
+extern int slim_port_xfer(struct slim_device *sb, u32 ph, phys_addr_t iobuf,
+				u32 len, struct completion *comp);
 
 /*
  * slim_port_get_xfer_status: Poll for port transfers, or get transfer status
@@ -806,7 +893,7 @@ extern int slim_port_xfer(struct slim_device *sb, u32 ph, u8 *iobuf, u32 len,
  * processed from the multiple transfers.
  */
 extern enum slim_port_err slim_port_get_xfer_status(struct slim_device *sb,
-			u32 ph, u8 **done_buf, u32 *done_len);
+			u32 ph, phys_addr_t *done_buf, u32 *done_len);
 
 /*
  * slim_connect_src: Connect source port to channel.

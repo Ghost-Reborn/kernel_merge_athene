@@ -157,6 +157,9 @@ static __always_inline void *kmalloc_large(size_t size, gfp_t flags)
 
 static __always_inline void *kmalloc(size_t size, gfp_t flags)
 {
+	if (IS_ENABLED(CONFIG_FORCE_KMALLOC_FROM_DMA_ZONE))
+		flags |= GFP_DMA;
+
 	if (__builtin_constant_p(size)) {
 		if (size > KMALLOC_MAX_CACHE_SIZE)
 			return kmalloc_large(size, flags);
@@ -194,6 +197,9 @@ kmem_cache_alloc_node_trace(struct kmem_cache *s,
 
 static __always_inline void *kmalloc_node(size_t size, gfp_t flags, int node)
 {
+	if (IS_ENABLED(CONFIG_FORCE_KMALLOC_FROM_DMA_ZONE))
+		flags |= GFP_DMA;
+
 	if (__builtin_constant_p(size) &&
 		size <= KMALLOC_MAX_CACHE_SIZE && !(flags & GFP_DMA)) {
 		int index = kmalloc_index(size);
@@ -207,5 +213,24 @@ static __always_inline void *kmalloc_node(size_t size, gfp_t flags, int node)
 	return __kmalloc_node(size, flags, node);
 }
 #endif
+
+
+/**
+ * virt_to_obj - returns address of the beginning of object.
+ * @s: object's kmem_cache
+ * @slab_page: address of slab page
+ * @x: address within object memory range
+ *
+ * Returns address of the beginning of object
+ */
+static inline void *virt_to_obj(struct kmem_cache *s,
+				const void *slab_page,
+				const void *x)
+{
+	return (void *)x - ((x - slab_page) % s->size);
+}
+
+void object_err(struct kmem_cache *s, struct page *page,
+		u8 *object, char *reason);
 
 #endif /* _LINUX_SLUB_DEF_H */

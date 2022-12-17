@@ -43,6 +43,8 @@ struct gserial {
 	struct usb_ep			*in;
 	struct usb_ep			*out;
 
+	unsigned long			flags;
+
 	/* REVISIT avoid this CDC-ACM support harder ... */
 	struct usb_cdc_line_coding port_line_coding;	/* 9600-8-N-1 etc */
 	u16				serial_state;
@@ -64,7 +66,8 @@ struct gserial {
 };
 
 /* utilities to allocate/free request and buffer */
-struct usb_request *gs_alloc_req(struct usb_ep *ep, unsigned len, gfp_t flags);
+struct usb_request *gs_alloc_req(struct usb_ep *ep, unsigned len,
+		size_t extra_bu_alloc, gfp_t flags);
 void gs_free_req(struct usb_ep *, struct usb_request *req);
 
 /* management of individual TTY ports */
@@ -83,6 +86,8 @@ void gsdio_disconnect(struct gserial *, u8 portno);
 int gsmd_setup(struct usb_gadget *g, unsigned n_ports);
 int gsmd_connect(struct gserial *, u8 port_num);
 void gsmd_disconnect(struct gserial *, u8 portno);
+int gsmd_write(u8 portno, char *buf, unsigned int size);
+
 
 /* functions are bound to configurations by a config or gadget driver */
 int gser_bind_config(struct usb_configuration *c, u8 port_num);

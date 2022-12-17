@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2007 Google, Inc.
- * Copyright (c) 2007-2013, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2007-2014, The Linux Foundation. All rights reserved.
  *
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and
@@ -25,6 +25,7 @@
 #include <linux/mutex.h>
 #include <linux/io.h>
 #include <linux/clk/msm-clk-provider.h>
+#include <trace/events/power.h>
 
 
 #include "clock.h"
@@ -34,12 +35,6 @@ static DEFINE_MUTEX(clk_list_lock);
 
 static struct dentry *debugfs_base;
 static u32 debug_suspend;
-
-struct clk_table {
-	struct list_head node;
-	struct clk_lookup *clocks;
-	size_t num_clocks;
-};
 
 static int clock_debug_rate_set(void *data, u64 val)
 {
@@ -250,6 +245,28 @@ static const struct file_operations fmax_rates_fops = {
 	.release	= seq_release,
 };
 
+static int orphan_list_show(struct seq_file *m, void *unused)
+{
+	struct clk *c, *safe;
+
+	list_for_each_entry_safe(c, safe, &orphan_clk_list, list)
+		seq_printf(m, "%s\n", c->dbg_name);
+
+	return 0;
+}
+
+static int orphan_list_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, orphan_list_show, inode->i_private);
+}
+
+static const struct file_operations orphan_list_fops = {
+	.open		= orphan_list_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= seq_release,
+};
+
 #define clock_debug_output(m, c, fmt, ...)		\
 do {							\
 	if (m)						\
@@ -270,9 +287,9 @@ static int clock_debug_print_clock(struct clk *c, struct seq_file *m)
 	clock_debug_output(m, 0, "\t");
 	do {
 		if (c->vdd_class)
-			clock_debug_output(m, 1, "%s%s:%u:%u [%ld, %lu]", start,
+			clock_debug_output(m, 1, "%s%s:%u:%u [%ld, %d]", start,
 				c->dbg_name, c->prepare_count, c->count,
-				c->rate, c->vdd_class->cur_level);
+				c->rate, find_vdd_level(c, c->rate));
 		else
 			clock_debug_output(m, 1, "%s%s:%u:%u [%ld]", start,
 				c->dbg_name, c->prepare_count, c->count,
@@ -291,17 +308,16 @@ static int clock_debug_print_clock(struct clk *c, struct seq_file *m)
  */
 static void clock_debug_print_enabled_clocks(struct seq_file *m)
 {
-	struct clk_table *table;
-	int i, cnt = 0;
+	struct clk *c;
+	int cnt = 0;
 
 	if (!mutex_trylock(&clk_list_lock)) {
 		pr_err("clock-debug: Clocks are being registered. Cannot print clock state now.\n");
 		return;
 	}
 	clock_debug_output(m, 0, "Enabled clocks:\n");
-	list_for_each_entry(table, &clk_list, node) {
-		for (i = 0; i < table->num_clocks; i++)
-			cnt += clock_debug_print_clock(table->clocks[i].clk, m);
+	list_for_each_entry(c, &clk_list, list) {
+		cnt += clock_debug_print_clock(c, m);
 	}
 	mutex_unlock(&clk_list_lock);
 
@@ -324,6 +340,37 @@ static int enabled_clocks_open(struct inode *inode, struct file *file)
 
 static const struct file_operations enabled_clocks_fops = {
 	.open		= enabled_clocks_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= seq_release,
+};
+
+static int trace_clocks_show(struct seq_file *m, void *unused)
+{
+	struct clk *c;
+	int total_cnt = 0;
+
+	if (!mutex_trylock(&clk_list_lock)) {
+		pr_err("trace_clocks: Clocks are being registered. Cannot trace clock state now.\n");
+		return 1;
+	}
+	list_for_each_entry(c, &clk_list, list) {
+		trace_clock_state(c->dbg_name, c->prepare_count, c->count,
+					c->rate);
+		total_cnt++;
+	}
+	mutex_unlock(&clk_list_lock);
+	clock_debug_output(m, 0, "Total clock count: %d\n", total_cnt);
+
+	return 0;
+}
+
+static int trace_clocks_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, trace_clocks_show, inode->i_private);
+}
+static const struct file_operations trace_clocks_fops = {
+	.open		= trace_clocks_open,
 	.read		= seq_read,
 	.llseek		= seq_lseek,
 	.release	= seq_release,
@@ -387,8 +434,7 @@ static ssize_t clock_parent_write(struct file *filp,
 	struct clk *clock = filp->private_data;
 	char buf[256];
 	char *cmp;
-	struct clk_table *table;
-	int i, ret;
+	int ret;
 	struct clk *parent = NULL;
 
 	cnt = min(cnt, sizeof(buf) - 1);
@@ -398,23 +444,18 @@ static ssize_t clock_parent_write(struct file *filp,
 	cmp = strstrip(buf);
 
 	mutex_lock(&clk_list_lock);
-	list_for_each_entry(table, &clk_list, node) {
-		for (i = 0; i < table->num_clocks; i++)
-			if (!strcmp(cmp, table->clocks[i].clk->dbg_name)) {
-				parent = table->clocks[i].clk;
-				break;
-			}
-		if (parent)
+	list_for_each_entry(parent, &clk_list, list) {
+		if (!strcmp(cmp, parent->dbg_name))
 			break;
 	}
 
-	if (!parent) {
+	if (&parent->list == &clk_list) {
 		ret = -EINVAL;
 		goto err;
 	}
 
 	mutex_unlock(&clk_list_lock);
-	ret = clk_set_parent(clock, table->clocks[i].clk);
+	ret = clk_set_parent(clock, parent);
 	if (ret)
 		return ret;
 
@@ -476,6 +517,151 @@ static int print_hw_open(struct inode *inode, struct file *file)
 static const struct file_operations clock_print_hw_fops = {
 	.open		= print_hw_open,
 	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= seq_release,
+};
+
+
+static struct clk_rate_stats_entry *rate_stats_entry_find(
+	struct clk_rate_stats *stats, unsigned long rate)
+{
+	struct clk_rate_stats_entry *entry_end = stats->entries + stats->size;
+	struct clk_rate_stats_entry *entry;
+
+	for (entry = stats->entries; entry < entry_end; entry++)
+		if (entry->rate >= rate)
+			break;
+
+	if (entry < entry_end && entry->rate == rate)
+		return entry;
+
+	if (stats->size >= CLOCK_RATE_STATE_SIZE_MAX)
+		return NULL;
+
+	/* Shift existing entries to maintain sort by clock rate */
+	while (entry_end > entry) {
+		struct clk_rate_stats_entry *prev = entry_end - 1;
+		*entry_end = *prev;
+		entry_end = prev;
+	}
+
+	entry->rate = rate;
+	entry->time = 0;
+	stats->size++;
+
+	return entry;
+}
+
+static void clock_debug_update_rate_stats_locked(struct clk *c)
+{
+	struct clk_rate_stats *rate_stats = c->rate_stats;
+	unsigned long rate = c->count ? clk_get_rate(c) : 0;
+	struct clk_rate_stats_entry *entry =
+		rate_stats_entry_find(rate_stats, rate);
+	struct timespec cur_time;
+
+	get_monotonic_boottime(&cur_time);
+	if (entry) {
+		struct timespec delta = timespec_sub(cur_time,
+			rate_stats->last_updated);
+		entry->time += delta.tv_sec * MSEC_PER_SEC +
+			       delta.tv_nsec / NSEC_PER_MSEC;
+	}
+	rate_stats->last_updated = cur_time;
+}
+
+void clock_debug_update_rate_stats(struct clk *c)
+{
+	struct clk_rate_stats *rate_stats = c->rate_stats;
+
+	if (unlikely(rate_stats)) {
+		unsigned long flags;
+
+		spin_lock_irqsave(&rate_stats->lock, flags);
+		clock_debug_update_rate_stats_locked(c);
+		spin_unlock_irqrestore(&rate_stats->lock, flags);
+	}
+}
+
+static DEFINE_MUTEX(rate_stats_lock);
+
+static ssize_t rate_stats_write(struct file *file, const char __user *buf,
+			    size_t len, loff_t *offset)
+{
+	struct clk *c = ((struct seq_file *)file->private_data)->private;
+	struct clk_rate_stats *rate_stats = c->rate_stats;
+	int ret = len;
+
+	mutex_lock(&rate_stats_lock);
+
+	if (!rate_stats) {
+		rate_stats = kzalloc(sizeof(struct clk_rate_stats),
+					GFP_KERNEL);
+		if (rate_stats) {
+			spin_lock_init(&rate_stats->lock);
+			c->rate_stats = rate_stats;
+		} else {
+			pr_err("clock: %s: failed to allocate memory for rate stats",
+				c->dbg_name);
+			ret = -ENOMEM;
+		}
+	}
+
+	mutex_unlock(&rate_stats_lock);
+
+	if (rate_stats) {
+		unsigned long flags;
+
+		spin_lock_irqsave(&rate_stats->lock, flags);
+		rate_stats->size = 0;
+		get_monotonic_boottime(&rate_stats->last_updated);
+		spin_unlock_irqrestore(&rate_stats->lock, flags);
+	}
+
+	return ret;
+}
+
+static const struct timespec TIMESPEC_NONE;
+
+static int rate_stats_show(struct seq_file *m, void *unused)
+{
+	struct clk *c = m->private;
+	struct clk_rate_stats *rate_stats_ptr = c->rate_stats;
+	struct clk_rate_stats rate_stats = {.last_updated = TIMESPEC_NONE};
+
+	if (rate_stats_ptr) {
+		unsigned long flags;
+
+		spin_lock_irqsave(&rate_stats_ptr->lock, flags);
+		clock_debug_update_rate_stats_locked(c);
+		rate_stats = *rate_stats_ptr;
+		spin_unlock_irqrestore(&rate_stats_ptr->lock, flags);
+	}
+
+	if (!timespec_equal(&rate_stats.last_updated, &TIMESPEC_NONE)) {
+		struct clk_rate_stats_entry *entry, *entry_end;
+
+		seq_printf(m, "%10s %11s\n", "rate", "time(ms)");
+		entry_end = rate_stats.entries + rate_stats.size;
+		for (entry = rate_stats.entries; entry < entry_end; entry++)
+			seq_printf(m, "%10lu %11lu\n",
+				   entry->rate, entry->time);
+	} else {
+		seq_puts(m, "enable first by writing to rate_stats\n");
+	}
+
+	return 0;
+}
+
+static int rate_stats_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, rate_stats_show, inode->i_private);
+}
+
+static const struct file_operations clock_rate_stats_fops = {
+	.open		= rate_stats_open,
+	.read		= seq_read,
+	.write		= rate_stats_write,
 	.llseek		= seq_lseek,
 	.release	= seq_release,
 };
@@ -544,6 +730,10 @@ static int clock_debug_add(struct clk *clock)
 				&clock_print_hw_fops))
 			goto error;
 
+	if (!debugfs_create_file("rate_stats", S_IRUGO | S_IWUSR, clk_dir,
+				clock, &clock_rate_stats_fops))
+			goto error;
+
 	clock_measure_add(clock);
 
 	return 0;
@@ -579,55 +769,47 @@ static int clock_debug_init(void)
 				&enabled_clocks_fops))
 		return -ENOMEM;
 
+	if (!debugfs_create_file("orphan_list", S_IRUGO, debugfs_base, NULL,
+				&orphan_list_fops))
+		return -ENOMEM;
+
+	if (!debugfs_create_file("trace_clocks", S_IRUGO, debugfs_base, NULL,
+				&trace_clocks_fops))
+		return -ENOMEM;
+
 	return 0;
 }
 
 /**
  * clock_debug_register() - Add additional clocks to clock debugfs hierarchy
- * @table: Table of clocks to create debugfs nodes for
- * @size: Size of @table
- *
+ * @list: List of clocks to create debugfs nodes for
  */
-int clock_debug_register(struct clk_lookup *table, size_t size)
+int clock_debug_register(struct clk *clk)
 {
-	struct clk_table *clk_table, *clk_table_tmp;
-	int i, ret;
+	int ret = 0;
+	struct clk *c;
 
-	mutex_lock(&clk_debug_lock);
+	mutex_lock(&clk_list_lock);
+	if (!list_empty(&clk->list))
+		goto out;
 
 	ret = clock_debug_init();
 	if (ret)
 		goto out;
 
-	clk_table = kmalloc(sizeof(*clk_table), GFP_KERNEL);
-	if (!clk_table) {
-		ret = -ENOMEM;
-		goto out;
-	}
-
-	clk_table->clocks = table;
-	clk_table->num_clocks = size;
-
 	if (IS_ERR_OR_NULL(measure)) {
-		measure = clk_get_sys("debug", "measure");
-		if (!IS_ERR(measure)) {
-			mutex_lock(&clk_list_lock);
-			list_for_each_entry(clk_table_tmp, &clk_list, node) {
-			for (i = 0; i < clk_table_tmp->num_clocks; i++)
-				clock_measure_add(clk_table_tmp->clocks[i].clk);
-			}
-			mutex_unlock(&clk_list_lock);
+		if (clk->flags & CLKFLAG_MEASURE)
+			measure = clk;
+		if (!IS_ERR_OR_NULL(measure)) {
+			list_for_each_entry(c, &clk_list, list)
+				clock_measure_add(c);
 		}
 	}
 
-	mutex_lock(&clk_list_lock);
-	list_add_tail(&clk_table->node, &clk_list);
-	mutex_unlock(&clk_list_lock);
-
-	for (i = 0; i < size; i++)
-		clock_debug_add(table[i].clk);
+	list_add_tail(&clk->list, &clk_list);
+	clock_debug_add(clk);
 out:
-	mutex_unlock(&clk_debug_lock);
+	mutex_unlock(&clk_list_lock);
 	return ret;
 }
 

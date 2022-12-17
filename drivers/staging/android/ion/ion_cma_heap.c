@@ -63,6 +63,7 @@ static int ion_cma_allocate(struct ion_heap *heap, struct ion_buffer *buffer,
 {
 	struct device *dev = heap->priv;
 	struct ion_cma_buffer_info *info;
+	struct zone *zone;
 
 	dev_dbg(dev, "Request buffer allocation len %ld\n", len);
 
@@ -84,22 +85,31 @@ static int ion_cma_allocate(struct ion_heap *heap, struct ion_buffer *buffer,
 		goto err;
 	}
 
+	zone = page_zone(pfn_to_page(PFN_DOWN(info->handle)));
+	mod_zone_page_state(zone, NR_ION_CMA_PAGES, (len >> PAGE_SHIFT));
+
 	info->table = kmalloc(sizeof(struct sg_table), GFP_KERNEL);
 	if (!info->table) {
 		dev_err(dev, "Fail to allocate sg table\n");
-		goto err;
+		goto free_mem;
 	}
 
 	info->is_cached = ION_IS_CACHED(flags);
 
-	ion_cma_get_sgtable(dev,
-			info->table, info->cpu_addr, info->handle, len);
+	if (ion_cma_get_sgtable(dev,
+			info->table, info->cpu_addr, info->handle, len))
+		goto free_table;
 
 	/* keep this for memory release */
 	buffer->priv_virt = info;
-	dev_dbg(dev, "Allocate buffer %p\n", buffer);
+	dev_dbg(dev, "Allocate buffer %pK\n", buffer);
 	return 0;
 
+free_table:
+	kfree(info->table);
+free_mem:
+	dma_free_coherent(dev, len, info->cpu_addr, info->handle);
+	mod_zone_page_state(zone, NR_ION_CMA_PAGES, -(len >> PAGE_SHIFT));
 err:
 	kfree(info);
 	return ION_CMA_ALLOCATE_FAILED;
@@ -109,10 +119,13 @@ static void ion_cma_free(struct ion_buffer *buffer)
 {
 	struct device *dev = buffer->heap->priv;
 	struct ion_cma_buffer_info *info = buffer->priv_virt;
+	struct zone *zone = page_zone(pfn_to_page(PFN_DOWN(info->handle)));
 
-	dev_dbg(dev, "Release buffer %p\n", buffer);
+	dev_dbg(dev, "Release buffer %pK\n", buffer);
 	/* release memory */
 	dma_free_coherent(dev, buffer->size, info->cpu_addr, info->handle);
+	mod_zone_page_state(zone, NR_ION_CMA_PAGES,
+			-(buffer->size >> PAGE_SHIFT));
 	sg_free_table(info->table);
 	/* release sg table */
 	kfree(info->table);
@@ -126,7 +139,7 @@ static int ion_cma_phys(struct ion_heap *heap, struct ion_buffer *buffer,
 	struct device *dev = heap->priv;
 	struct ion_cma_buffer_info *info = buffer->priv_virt;
 
-	dev_dbg(dev, "Return buffer %p physical address 0x%pa\n", buffer,
+	dev_dbg(dev, "Return buffer %pK physical address 0x%pa\n", buffer,
 		&info->handle);
 
 	*addr = info->handle;
@@ -186,7 +199,7 @@ static int ion_cma_print_debug(struct ion_heap *heap, struct seq_file *s,
 		seq_printf(s, "\nMemory Map\n");
 		seq_printf(s, "%16.s %14.s %14.s %14.s\n",
 			   "client", "start address", "end address",
-			   "size (hex)");
+			   "size");
 
 		list_for_each_entry(data, mem_map, node) {
 			const char *client_name = "(null)";
@@ -195,7 +208,7 @@ static int ion_cma_print_debug(struct ion_heap *heap, struct seq_file *s,
 			if (data->client_name)
 				client_name = data->client_name;
 
-			seq_printf(s, "%16.s %14pa %14pa %14lu (%lx)\n",
+			seq_printf(s, "%16.s 0x%14pa 0x%14pa %14lu (0x%lx)\n",
 				   client_name, &data->addr,
 				   &data->addr_end,
 				   data->size, data->size);

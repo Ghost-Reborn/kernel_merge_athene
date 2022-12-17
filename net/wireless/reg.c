@@ -338,6 +338,11 @@ static bool is_user_regdom_saved(void)
 	return true;
 }
 
+static bool is_cfg80211_regdom_intersected(void)
+{
+	return is_intersected_alpha2(get_cfg80211_regdom()->alpha2);
+}
+
 static const struct ieee80211_regdomain *
 reg_copy_regd(const struct ieee80211_regdomain *src_regd)
 {
@@ -465,6 +470,22 @@ static bool reg_is_valid_request(const char *alpha2)
 		return false;
 
 	return alpha2_equal(lr->alpha2, alpha2);
+}
+
+static const struct ieee80211_regdomain *reg_get_regdomain(struct wiphy *wiphy)
+{
+	struct regulatory_request *lr = get_last_request();
+
+	/*
+	 * Follow the driver's regulatory domain, if present, unless a country
+	 * IE has been processed or a user wants to help complaince further
+	 */
+	if (lr->initiator != NL80211_REGDOM_SET_BY_COUNTRY_IE &&
+	    lr->initiator != NL80211_REGDOM_SET_BY_USER &&
+	    wiphy->regd)
+		return get_wiphy_regdom(wiphy);
+
+	return get_cfg80211_regdom();
 }
 
 /* Sanity check on a regulatory rule */
@@ -707,6 +728,8 @@ static u32 map_regdom_flags(u32 rd_flags)
 		channel_flags |= IEEE80211_CHAN_RADAR;
 	if (rd_flags & NL80211_RRF_NO_OFDM)
 		channel_flags |= IEEE80211_CHAN_NO_OFDM;
+	if (rd_flags & NL80211_RRF_NO_OUTDOOR)
+		channel_flags |= IEEE80211_CHAN_INDOOR_ONLY;
 	return channel_flags;
 }
 
@@ -752,18 +775,8 @@ const struct ieee80211_reg_rule *freq_reg_info(struct wiphy *wiphy,
 					       u32 center_freq)
 {
 	const struct ieee80211_regdomain *regd;
-	struct regulatory_request *lr = get_last_request();
 
-	/*
-	 * Follow the driver's regulatory domain, if present, unless a country
-	 * IE has been processed or a user wants to help complaince further
-	 */
-	if (lr->initiator != NL80211_REGDOM_SET_BY_COUNTRY_IE &&
-	    lr->initiator != NL80211_REGDOM_SET_BY_USER &&
-	    wiphy->regd)
-		regd = get_wiphy_regdom(wiphy);
-	else
-		regd = get_cfg80211_regdom();
+	regd = reg_get_regdomain(wiphy);
 
 	return freq_reg_info_regd(wiphy, center_freq, regd);
 }
@@ -876,8 +889,12 @@ static void handle_channel(struct wiphy *wiphy,
 	power_rule = &reg_rule->power_rule;
 	freq_range = &reg_rule->freq_range;
 
+	if (freq_range->max_bandwidth_khz < MHZ_TO_KHZ(10))
+		bw_flags |= IEEE80211_CHAN_NO_10MHZ;
+	if (freq_range->max_bandwidth_khz < MHZ_TO_KHZ(20))
+		bw_flags |= IEEE80211_CHAN_NO_20MHZ;
 	if (freq_range->max_bandwidth_khz < MHZ_TO_KHZ(40))
-		bw_flags = IEEE80211_CHAN_NO_HT40;
+		bw_flags |= IEEE80211_CHAN_NO_HT40;
 	if (freq_range->max_bandwidth_khz < MHZ_TO_KHZ(80))
 		bw_flags |= IEEE80211_CHAN_NO_80MHZ;
 	if (freq_range->max_bandwidth_khz < MHZ_TO_KHZ(160))
@@ -1278,8 +1295,12 @@ static void handle_channel_custom(struct wiphy *wiphy,
 	power_rule = &reg_rule->power_rule;
 	freq_range = &reg_rule->freq_range;
 
+	if (freq_range->max_bandwidth_khz < MHZ_TO_KHZ(10))
+		bw_flags |= IEEE80211_CHAN_NO_10MHZ;
+	if (freq_range->max_bandwidth_khz < MHZ_TO_KHZ(20))
+		bw_flags |= IEEE80211_CHAN_NO_20MHZ;
 	if (freq_range->max_bandwidth_khz < MHZ_TO_KHZ(40))
-		bw_flags = IEEE80211_CHAN_NO_HT40;
+		bw_flags |= IEEE80211_CHAN_NO_HT40;
 	if (freq_range->max_bandwidth_khz < MHZ_TO_KHZ(80))
 		bw_flags |= IEEE80211_CHAN_NO_80MHZ;
 	if (freq_range->max_bandwidth_khz < MHZ_TO_KHZ(160))
@@ -1379,22 +1400,13 @@ get_reg_request_treatment(struct wiphy *wiphy,
 		}
 		return 0;
 	case NL80211_REGDOM_SET_BY_DRIVER:
-		if (lr->initiator == NL80211_REGDOM_SET_BY_CORE) {
-			if (regdom_changes(pending_request->alpha2))
-				return REG_REQ_OK;
-			return REG_REQ_ALREADY_SET;
-		}
 
-		/*
-		 * This would happen if you unplug and plug your card
-		 * back in or if you add a new device for which the previously
-		 * loaded card also agrees on the regulatory domain.
-		 */
-		if (lr->initiator == NL80211_REGDOM_SET_BY_DRIVER &&
-		    !regdom_changes(pending_request->alpha2))
+		if (!regdom_changes(pending_request->alpha2))
 			return REG_REQ_ALREADY_SET;
-
-		return REG_REQ_INTERSECT;
+		if (lr->initiator == NL80211_REGDOM_SET_BY_USER)
+			return REG_REQ_INTERSECT;
+		else
+			return REG_REQ_OK;
 	case NL80211_REGDOM_SET_BY_USER:
 		if (reg_request_cell_base(pending_request))
 			return reg_ignore_cell_hint(pending_request);
@@ -1417,9 +1429,14 @@ get_reg_request_treatment(struct wiphy *wiphy,
 		 */
 		if ((lr->initiator == NL80211_REGDOM_SET_BY_CORE ||
 		     lr->initiator == NL80211_REGDOM_SET_BY_DRIVER ||
-		     lr->initiator == NL80211_REGDOM_SET_BY_USER) &&
-		    regdom_changes(lr->alpha2))
-			return REG_REQ_IGNORE;
+		     lr->initiator == NL80211_REGDOM_SET_BY_USER)) {
+			if (lr->intersect) {
+				if (!is_cfg80211_regdom_intersected())
+					return REG_REQ_IGNORE;
+			} else if (regdom_changes(lr->alpha2)) {
+				return REG_REQ_IGNORE;
+			}
+		}
 
 		if (!regdom_changes(pending_request->alpha2))
 			return REG_REQ_ALREADY_SET;

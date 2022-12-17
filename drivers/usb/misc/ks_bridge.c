@@ -29,6 +29,7 @@
 #include <linux/cdev.h>
 #include <linux/list.h>
 #include <linux/wait.h>
+#include <linux/poll.h>
 
 #define DRIVER_DESC	"USB host ks bridge driver"
 #define DRIVER_VERSION	"1.0"
@@ -291,6 +292,7 @@ static void ksb_tomdm_work(struct work_struct *w)
 
 		urb = usb_alloc_urb(0, GFP_KERNEL);
 		if (!urb) {
+			dbg_log_event(ksb, "TX_URB_MEM_FAIL", -ENOMEM, 0);
 			pr_err_ratelimited("%s: unable to allocate urb",
 					ksb->id_info.name);
 			ksb_free_data_pkt(pkt);
@@ -299,6 +301,7 @@ static void ksb_tomdm_work(struct work_struct *w)
 
 		ret = usb_autopm_get_interface(ksb->ifc);
 		if (ret < 0 && ret != -EAGAIN && ret != -EACCES) {
+			dbg_log_event(ksb, "TX_URB_AUTOPM_FAIL", ret, 0);
 			pr_err_ratelimited("%s: autopm_get failed:%d",
 					ksb->id_info.name, ret);
 			usb_free_urb(urb);
@@ -366,6 +369,8 @@ static ssize_t ksb_fs_write(struct file *fp, const char __user *buf,
 
 	queue_work(ksb->wq, &ksb->to_mdm_work);
 
+	dbg_log_event(ksb, "KS_WRITE", count, 0);
+
 	return count;
 }
 
@@ -391,11 +396,33 @@ static int ksb_fs_open(struct inode *ip, struct file *fp)
 	return 0;
 }
 
+static unsigned int ksb_fs_poll(struct file *file, poll_table *wait)
+{
+	struct ks_bridge	*ksb = file->private_data;
+	unsigned long		flags;
+	int			ret = 0;
+
+	if (!test_bit(USB_DEV_CONNECTED, &ksb->flags))
+		return POLLERR;
+
+	poll_wait(file, &ksb->ks_wait_q, wait);
+	if (!test_bit(USB_DEV_CONNECTED, &ksb->flags))
+		return POLLERR;
+
+	spin_lock_irqsave(&ksb->lock, flags);
+	if (!list_empty(&ksb->to_ks_list))
+		ret = POLLIN | POLLRDNORM;
+	spin_unlock_irqrestore(&ksb->lock, flags);
+
+	return ret;
+}
+
 static int ksb_fs_release(struct inode *ip, struct file *fp)
 {
 	struct ks_bridge	*ksb = fp->private_data;
 
-	dev_dbg(ksb->device, ":%s", ksb->id_info.name);
+	if (test_bit(USB_DEV_CONNECTED, &ksb->flags))
+		dev_dbg(ksb->device, ":%s", ksb->id_info.name);
 	dbg_log_event(ksb, "FS-RELEASE", 0, 0);
 
 	clear_bit(FILE_OPENED, &ksb->flags);
@@ -410,6 +437,7 @@ static const struct file_operations ksb_fops = {
 	.write = ksb_fs_write,
 	.open = ksb_fs_open,
 	.release = ksb_fs_release,
+	.poll = ksb_fs_poll,
 };
 
 static struct ksb_dev_info ksb_fboot_dev[] = {
@@ -449,7 +477,11 @@ static const struct usb_device_id ksb_usb_ids[] = {
 	.driver_info = (unsigned long)&ksb_efs_hsic_dev, },
 	{ USB_DEVICE_INTERFACE_NUMBER(0x5c6, 0x909E, 3),
 	.driver_info = (unsigned long)&ksb_efs_hsic_dev, },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x5c6, 0x909F, 2),
+	.driver_info = (unsigned long)&ksb_efs_hsic_dev, },
 	{ USB_DEVICE_INTERFACE_NUMBER(0x5c6, 0x90A0, 2),
+	.driver_info = (unsigned long)&ksb_efs_hsic_dev, },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x5c6, 0x90A4, 3),
 	.driver_info = (unsigned long)&ksb_efs_hsic_dev, },
 
 	{} /* terminating entry */
@@ -531,9 +563,14 @@ static void ksb_rx_cb(struct urb *urb)
 				&& urb->status != -EPROTO)
 			pr_err_ratelimited("%s: urb failed with err:%d",
 					ksb->id_info.name, urb->status);
-		ksb_free_data_pkt(pkt);
-		goto done;
+
+		if (!urb->actual_length) {
+			ksb_free_data_pkt(pkt);
+			goto done;
+		}
 	}
+
+	usb_mark_last_busy(ksb->udev);
 
 	if (urb->actual_length == 0) {
 		submit_one_urb(ksb, GFP_ATOMIC, pkt);
@@ -662,6 +699,8 @@ ksb_usb_probe(struct usb_interface *ifc, const struct usb_device_id *id)
 	case 0x909C:
 	case 0x909D:
 	case 0x909E:
+	case 0x909F:
+	case 0x90A4:
 		ksb = __ksb[EFS_HSIC_BRIDGE_INDEX];
 		break;
 	case 0x9079:
@@ -793,6 +832,11 @@ static int ksb_usb_suspend(struct usb_interface *ifc, pm_message_t message)
 
 	dbg_log_event(ksb, "SUSPEND", 0, 0);
 
+	if (pm_runtime_autosuspend_expiration(&ksb->udev->dev)) {
+		dbg_log_event(ksb, "SUSP ABORT-TimeCheck", 0, 0);
+		return -EBUSY;
+	}
+
 	usb_kill_anchored_urbs(&ksb->submitted);
 
 	spin_lock_irqsave(&ksb->lock, flags);
@@ -879,6 +923,7 @@ static struct usb_driver ksb_usb_driver = {
 	.disconnect =	ksb_usb_disconnect,
 	.suspend =	ksb_usb_suspend,
 	.resume =	ksb_usb_resume,
+	.reset_resume =	ksb_usb_resume,
 	.id_table =	ksb_usb_ids,
 	.supports_autosuspend = 1,
 };

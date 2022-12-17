@@ -228,7 +228,7 @@ static void ipc_bridge_int_cb(struct urb *urb)
 		}
 		dev->get_encap_resp++;
 		/* Tell runtime pm core that we are busy */
-		usb_autopm_get_interface_no_resume(dev->intf);
+		usb_autopm_get_interface_async(dev->intf);
 		return;
 	default:
 		dev_err(&dev->intf->dev, "unknown data on int ep\n");
@@ -667,6 +667,7 @@ static void ipc_bridge_disconnect(struct usb_interface *intf)
 	mutex_destroy(&dev->write_mutex);
 	usb_free_urb(dev->writeurb);
 	kfree(dev->out_ctlreq);
+	kfree(dev->readbuf);
 	usb_free_urb(dev->readurb);
 	kfree(dev->in_ctlreq);
 	kfree(dev->intbuf);
@@ -681,6 +682,8 @@ static const struct usb_device_id ipc_bridge_ids[] = {
 	{ USB_DEVICE_INTERFACE_NUMBER(0x5c6, 0x908E, 9) },
 	{ USB_DEVICE_INTERFACE_NUMBER(0x5c6, 0x909D, 5) },
 	{ USB_DEVICE_INTERFACE_NUMBER(0x5c6, 0x909E, 7) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x5c6, 0x90A0, 7) },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x5c6, 0x90A4, 9) },
 
 	{} /* terminating entry */
 };
@@ -692,6 +695,7 @@ static struct usb_driver ipc_bridge_driver = {
 	.disconnect = ipc_bridge_disconnect,
 	.suspend = ipc_bridge_suspend,
 	.resume = ipc_bridge_resume,
+	.reset_resume = ipc_bridge_resume,
 	.id_table = ipc_bridge_ids,
 	.supports_autosuspend = 1,
 };

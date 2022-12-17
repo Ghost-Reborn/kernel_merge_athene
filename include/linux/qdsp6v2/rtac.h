@@ -1,4 +1,4 @@
-/* Copyright (c) 2011, 2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2011, 2013-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -23,6 +23,7 @@ enum {
 	ADM_RTAC_CAL,
 	ASM_RTAC_CAL,
 	VOICE_RTAC_CAL,
+	AFE_RTAC_CAL,
 	MAX_RTAC_BLOCKS
 };
 
@@ -34,9 +35,9 @@ struct rtac_cal_mem_map_data {
 };
 
 struct rtac_cal_data {
-	uint32_t		size;
-	uint32_t		kvaddr;
-	uint32_t		paddr;
+	size_t			size;
+	void			*kvaddr;
+	phys_addr_t		paddr;
 };
 
 struct rtac_cal_block_data {
@@ -44,11 +45,12 @@ struct rtac_cal_block_data {
 	struct rtac_cal_data		cal_data;
 };
 
-void rtac_add_adm_device(u32 port_id, u32 copp_id, u32 path_id, u32 popp_id);
+void rtac_add_adm_device(u32 port_id, u32 copp_id, u32 path_id, u32 popp_id,
+			u32 app_type, u32 acdb_dev_id);
 void rtac_remove_adm_device(u32 port_id, u32 copp_id);
 void rtac_remove_popp_from_adm_devices(u32 popp_id);
 void rtac_add_voice(u32 cvs_handle, u32 cvp_handle, u32 rx_afe_port,
-	u32 tx_afe_port, u32 session_id);
+	u32 tx_afe_port, u32 rx_acdb_id, u32 tx_acdb_id, u32 session_id);
 void rtac_remove_voice(u32 cvs_handle);
 void rtac_set_adm_handle(void *handle);
 bool rtac_make_adm_callback(uint32_t *payload, u32 payload_size);
@@ -61,5 +63,6 @@ void rtac_set_voice_handle(u32 mode, void *handle);
 bool rtac_make_voice_callback(u32 mode, uint32_t *payload, u32 payload_size);
 void rtac_copy_voice_payload_to_user(void *payload, u32 payload_size);
 int rtac_clear_mapping(uint32_t cal_type);
-
+bool rtac_make_afe_callback(uint32_t *payload, u32 payload_size);
+void rtac_set_afe_handle(void *handle);
 #endif

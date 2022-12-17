@@ -2,7 +2,7 @@
  * drivers/serial/msm_serial.c - driver for msm7k serial device and console
  *
  * Copyright (C) 2007 Google, Inc.
- * Copyright (c) 2010-2013, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2010-2014, The Linux Foundation. All rights reserved.
  *
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and
@@ -49,9 +49,8 @@
 #include <linux/wakelock.h>
 #include <linux/types.h>
 #include <asm/byteorder.h>
-#include <mach/board.h>
-#include <mach/msm_serial_hs_lite.h>
-#include <mach/msm_bus.h>
+#include <linux/platform_data/qcom-serial_hs_lite.h>
+#include <linux/msm-bus.h>
 #include "msm_serial_hs_hwreg.h"
 
 /*
@@ -85,7 +84,7 @@ struct msm_hsl_port {
 	unsigned int            *gsbi_mapbase;
 	unsigned int            *mapped_gsbi;
 	unsigned int            old_snap_state;
-	unsigned int		ver_id;
+	unsigned long		ver_id;
 	int			tx_timeout;
 	struct mutex		clk_mutex;
 	enum uart_core_type	uart_type;
@@ -151,7 +150,7 @@ static const unsigned int regmap[][UARTDM_LAST] = {
 
 static struct of_device_id msm_hsl_match_table[] = {
 	{	.compatible = "qcom,msm-lsuart-v14",
-		.data = (void *)UARTDM_VERSION_14
+		.data = (void *)UARTDM_VERSION_14,
 	},
 	{}
 };
@@ -1395,7 +1394,7 @@ static void dump_hsl_regs(struct uart_port *port)
 /*
  *  Wait for transmitter & holding register to empty
  *  Derived from wait_for_xmitr in 8250 serial driver by Russell King  */
-static void wait_for_xmitr(struct uart_port *port)
+static inline void wait_for_xmitr(struct uart_port *port)
 {
 	struct msm_hsl_port *msm_hsl_port = UART_TO_MSM(port);
 	unsigned int vid = msm_hsl_port->ver_id;
@@ -1769,7 +1768,7 @@ static int msm_serial_hsl_probe(struct platform_device *pdev)
 	if (!match) {
 		msm_hsl_port->ver_id = UARTDM_VERSION_11_13;
 	} else {
-		msm_hsl_port->ver_id = (unsigned int)match->data;
+		msm_hsl_port->ver_id = (unsigned long)match->data;
 		/*
 		 * BLSP based UART configuration is available with
 		 * UARTDM v14 Revision. Hence set uart_type as UART_BLSP.

@@ -5,7 +5,7 @@
  *		       & Marcus Metzler <marcus@convergence.de>
  *			 for convergence integrated media GmbH
  *
- * Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -523,6 +523,7 @@ static inline int dvb_dmx_swfilter_payload(struct dvb_demux_feed *feed,
 	int p;
 	int ccok;
 	u8 cc;
+	int ret;
 
 	if (count == 0)
 		return -1;
@@ -544,20 +545,24 @@ static inline int dvb_dmx_swfilter_payload(struct dvb_demux_feed *feed,
 		feed->pusi_seen = 1;
 		feed->peslen = 0;
 		feed->pes_tei_counter = 0;
-		feed->pes_ts_packets_num = 0;
 		feed->pes_cont_err_counter = 0;
+		feed->pes_ts_packets_num = 0;
 	}
 
 	if (feed->pusi_seen == 0)
 		return 0;
 
-	feed->pes_ts_packets_num++;
-	feed->pes_cont_err_counter += !ccok;
-	feed->pes_tei_counter += (buf[1] & 0x80) ? 1 : 0;
+	ret = feed->cb.ts(&buf[p], count, NULL, 0, &feed->feed.ts, DMX_OK);
 
-	feed->peslen += count;
+	/* Verify TS packet was copied successfully */
+	if (!ret) {
+		feed->pes_cont_err_counter += !ccok;
+		feed->pes_tei_counter += (buf[1] & 0x80) ? 1 : 0;
+		feed->pes_ts_packets_num++;
+		feed->peslen += count;
+	}
 
-	return feed->cb.ts(&buf[p], count, NULL, 0, &feed->feed.ts, DMX_OK);
+	return ret;
 }
 
 static int dvb_dmx_swfilter_sectionfilter(struct dvb_demux_feed *feed,
@@ -1430,7 +1435,7 @@ static inline void dvb_dmx_swfilter_packet_type(struct dvb_demux_feed *feed,
 
 		if (feed->type == DMX_TYPE_SEC)
 			dvb_dmx_notify_section_event(feed, &dmx_data_ready, 0);
-		else
+		else if (feed->feed.ts.is_filtering)
 			feed->data_ready_cb.ts(&feed->feed.ts, &dmx_data_ready);
 	}
 
@@ -2540,6 +2545,49 @@ static int dmx_ts_set_tsp_out_format(
 	return 0;
 }
 
+/**
+ * dvbdmx_ts_reset_pes_state() - Reset the current PES length and PES counters
+ *
+ * @feed: dvb demux feed object
+ */
+void dvbdmx_ts_reset_pes_state(struct dvb_demux_feed *feed)
+{
+	unsigned long flags;
+
+	/*
+	 * Reset PES state.
+	 * PUSI seen indication is kept so we can get partial PES.
+	 */
+	spin_lock_irqsave(&feed->demux->lock, flags);
+
+	feed->peslen = 0;
+	feed->pes_tei_counter = 0;
+	feed->pes_cont_err_counter = 0;
+	feed->pes_ts_packets_num = 0;
+
+	spin_unlock_irqrestore(&feed->demux->lock, flags);
+}
+EXPORT_SYMBOL(dvbdmx_ts_reset_pes_state);
+
+static int dvbdmx_ts_flush_buffer(struct dmx_ts_feed *ts_feed, size_t length)
+{
+	struct dvb_demux_feed *feed = (struct dvb_demux_feed *)ts_feed;
+	struct dvb_demux *demux = feed->demux;
+	int ret = 0;
+
+	if (mutex_lock_interruptible(&demux->mutex))
+		return -ERESTARTSYS;
+
+	dvbdmx_ts_reset_pes_state(feed);
+
+	if ((feed->ts_type & TS_DECODER) && demux->flush_decoder_buffer)
+		/* Call decoder specific flushing if one exists */
+		ret = demux->flush_decoder_buffer(feed, length);
+
+	mutex_unlock(&demux->mutex);
+	return ret;
+}
+
 static int dvbdmx_allocate_ts_feed(struct dmx_demux *dmx,
 				   struct dmx_ts_feed **ts_feed,
 				   dmx_ts_cb callback)
@@ -2597,6 +2645,7 @@ static int dvbdmx_allocate_ts_feed(struct dmx_demux *dmx,
 	(*ts_feed)->ts_insertion_terminate = NULL;
 	(*ts_feed)->ts_insertion_insert_buffer =
 		dvbdmx_ts_insertion_insert_buffer;
+	(*ts_feed)->flush_buffer = dvbdmx_ts_flush_buffer;
 
 	if (!(feed->filter = dvb_dmx_filter_alloc(demux))) {
 		feed->state = DMX_STATE_FREE;
@@ -2632,7 +2681,7 @@ static int dvbdmx_release_ts_feed(struct dmx_demux *dmx,
 
 	feed->state = DMX_STATE_FREE;
 	feed->filter->state = DMX_STATE_FREE;
-
+	ts_feed->priv = NULL;
 	dvb_demux_feed_del(feed);
 
 	feed->pid = 0xffff;
@@ -2894,6 +2943,7 @@ static int dmx_section_feed_release_filter(struct dmx_section_feed *feed,
 		f->next = f->next->next;
 	}
 
+	filter->priv = NULL;
 	dvbdmxfilter->state = DMX_STATE_FREE;
 	spin_unlock_irq(&dvbdmx->lock);
 	mutex_unlock(&dvbdmx->mutex);
@@ -3013,6 +3063,7 @@ static int dvbdmx_allocate_section_feed(struct dmx_demux *demux,
 	(*feed)->set_cipher_ops = dmx_section_set_cipher_ops;
 	(*feed)->oob_command = dvbdmx_section_feed_oob_cmd;
 	(*feed)->get_scrambling_bits = dvbdmx_section_get_scrambling_bits;
+	(*feed)->flush_buffer = NULL;
 
 	mutex_unlock(&dvbdmx->mutex);
 	return 0;
@@ -3035,7 +3086,7 @@ static int dvbdmx_release_section_feed(struct dmx_demux *demux,
 	dvbdmxfeed->buffer = NULL;
 #endif
 	dvbdmxfeed->state = DMX_STATE_FREE;
-
+	feed->priv = NULL;
 	dvb_demux_feed_del(dvbdmxfeed);
 
 	dvbdmxfeed->pid = 0xffff;

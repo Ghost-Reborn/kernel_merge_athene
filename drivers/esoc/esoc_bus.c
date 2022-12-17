@@ -101,6 +101,19 @@ static int esoc_clink_match_id(struct device *dev, void *id)
 	return 0;
 }
 
+static int esoc_clink_match_node(struct device *dev, void *id)
+{
+	struct esoc_clink *esoc_clink = to_esoc_clink(dev);
+	struct device_node *node = id;
+
+	if (esoc_clink->np == node) {
+		if (!try_module_get(esoc_clink->owner))
+			return 0;
+		return 1;
+	}
+	return 0;
+}
+
 void esoc_for_each_dev(void *data, int (*fn)(struct device *dev, void *))
 {
 	int ret;
@@ -123,12 +136,36 @@ struct esoc_clink *get_esoc_clink(int id)
 }
 EXPORT_SYMBOL(get_esoc_clink);
 
+struct esoc_clink *get_esoc_clink_by_node(struct device_node *node)
+{
+	struct esoc_clink *esoc_clink;
+	struct device *dev;
+
+	dev = bus_find_device(&esoc_bus_type, NULL, node,
+						esoc_clink_match_node);
+	if (IS_ERR(dev))
+		return NULL;
+	esoc_clink = to_esoc_clink(dev);
+	return esoc_clink;
+}
+
 void put_esoc_clink(struct esoc_clink *esoc_clink)
 {
 	module_put(esoc_clink->owner);
 }
 EXPORT_SYMBOL(put_esoc_clink);
 
+bool esoc_req_eng_enabled(struct esoc_clink *esoc_clink)
+{
+	return !esoc_clink->req_eng ? false : true;
+}
+EXPORT_SYMBOL(esoc_req_eng_enabled);
+
+bool esoc_cmd_eng_enabled(struct esoc_clink *esoc_clink)
+{
+	return !esoc_clink->cmd_eng ? false : true;
+}
+EXPORT_SYMBOL(esoc_cmd_eng_enabled);
 /* ssr operations */
 int esoc_clink_register_ssr(struct esoc_clink *esoc_clink)
 {
@@ -142,6 +179,7 @@ int esoc_clink_register_ssr(struct esoc_clink *esoc_clink)
 		return PTR_ERR(subsys_name);
 	snprintf(subsys_name, len, "esoc%d", esoc_clink->id);
 	esoc_clink->subsys.name = subsys_name;
+	esoc_clink->dev.of_node = esoc_clink->np;
 	esoc_clink->subsys.dev = &esoc_clink->dev;
 	esoc_clink->subsys_dev = subsys_register(&esoc_clink->subsys);
 	if (IS_ERR(esoc_clink->subsys_dev)) {
@@ -176,6 +214,7 @@ void esoc_clink_evt_notify(enum esoc_evt evt, struct esoc_clink *esoc_clink)
 	unsigned long flags;
 
 	spin_lock_irqsave(&esoc_clink->notify_lock, flags);
+	notify_esoc_clients(esoc_clink, evt);
 	if (esoc_clink->req_eng && esoc_clink->req_eng->handle_clink_evt)
 		esoc_clink->req_eng->handle_clink_evt(evt, esoc_clink->req_eng);
 	if (esoc_clink->cmd_eng && esoc_clink->cmd_eng->handle_clink_evt)
@@ -279,6 +318,7 @@ int esoc_clink_register_req_eng(struct esoc_clink *esoc_clink,
 		return -EINVAL;
 	esoc_clink->req_eng = eng;
 	eng->esoc_clink = esoc_clink;
+	esoc_clink_evt_notify(ESOC_REQ_ENG_ON, esoc_clink);
 	return 0;
 }
 EXPORT_SYMBOL(esoc_clink_register_req_eng);
@@ -290,6 +330,7 @@ int esoc_clink_register_cmd_eng(struct esoc_clink *esoc_clink,
 		return -EBUSY;
 	esoc_clink->cmd_eng = eng;
 	eng->esoc_clink = esoc_clink;
+	esoc_clink_evt_notify(ESOC_CMD_ENG_ON, esoc_clink);
 	return 0;
 }
 EXPORT_SYMBOL(esoc_clink_register_cmd_eng);
@@ -298,6 +339,7 @@ void esoc_clink_unregister_req_eng(struct esoc_clink *esoc_clink,
 						struct esoc_eng *eng)
 {
 	esoc_clink->req_eng = NULL;
+	esoc_clink_evt_notify(ESOC_REQ_ENG_OFF, esoc_clink);
 }
 EXPORT_SYMBOL(esoc_clink_unregister_req_eng);
 
@@ -305,6 +347,7 @@ void esoc_clink_unregister_cmd_eng(struct esoc_clink *esoc_clink,
 						struct esoc_eng *eng)
 {
 	esoc_clink->cmd_eng = NULL;
+	esoc_clink_evt_notify(ESOC_CMD_ENG_OFF, esoc_clink);
 }
 EXPORT_SYMBOL(esoc_clink_unregister_cmd_eng);
 

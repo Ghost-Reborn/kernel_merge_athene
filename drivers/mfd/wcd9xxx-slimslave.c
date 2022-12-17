@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2017, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -62,6 +62,10 @@ int wcd9xxx_init_slimslave(struct wcd9xxx *wcd9xxx, u8 wcd9xxx_pgd_la,
 		goto err;
 	}
 
+	if (!rx_num || rx_num > wcd9xxx->num_rx_port) {
+		pr_err("%s: invalid rx num %d\n", __func__, rx_num);
+		return -EINVAL;
+	}
 	if (wcd9xxx->rx_chs) {
 		wcd9xxx->num_rx_port = rx_num;
 		for (i = 0; i < rx_num; i++) {
@@ -84,6 +88,10 @@ int wcd9xxx_init_slimslave(struct wcd9xxx *wcd9xxx, u8 wcd9xxx_pgd_la,
 			wcd9xxx->num_rx_port);
 	}
 
+	if (!tx_num || tx_num > wcd9xxx->num_tx_port) {
+		pr_err("%s: invalid tx num %d\n", __func__, tx_num);
+		return -EINVAL;
+	}
 	if (wcd9xxx->tx_chs) {
 		wcd9xxx->num_tx_port = tx_num;
 		for (i = 0; i < tx_num; i++) {
@@ -105,7 +113,6 @@ int wcd9xxx_init_slimslave(struct wcd9xxx *wcd9xxx, u8 wcd9xxx_pgd_la,
 		pr_err("Not able to allocate memory for %d slimbus tx ports\n",
 			wcd9xxx->num_tx_port);
 	}
-
 	return 0;
 err:
 	return ret;
@@ -198,23 +205,38 @@ int wcd9xxx_cfg_slim_sch_rx(struct wcd9xxx *wcd9xxx,
 	int ret;
 	struct slim_ch prop;
 	struct wcd9xxx_ch *rx;
+	int size = ARRAY_SIZE(ch_h);
 
 	/* Configure slave interface device */
 
 	list_for_each_entry(rx, wcd9xxx_ch_list, list) {
 		payload |= 1 << rx->shift;
-		ch_h[ch_cnt] = rx->ch_h;
-		ch_cnt++;
-		pr_debug("list ch->ch_h %d ch->sph %d\n", rx->ch_h, rx->sph);
+		if (ch_cnt < size) {
+			ch_h[ch_cnt] = rx->ch_h;
+			ch_cnt++;
+			pr_debug("list ch->ch_h %d ch->sph %d\n",
+				 rx->ch_h, rx->sph);
+		} else {
+			pr_err("%s: allocated channel number %u is out of max rangae %d\n",
+			       __func__, ch_cnt,
+			       size);
+			ret = EINVAL;
+			goto err;
+		}
 	}
 	pr_debug("%s: ch_cnt[%d] rate=%d WATER_MARK_VAL %d\n",
 		 __func__, ch_cnt, rate, WATER_MARK_VAL);
 	/* slim_define_ch api */
 	prop.prot = SLIM_AUTO_ISO;
-	prop.baser = SLIM_RATE_4000HZ;
+	if (rate == 44100) {
+		prop.baser = SLIM_RATE_11025HZ;
+		prop.ratem = (rate/11025);
+	} else {
+		prop.baser = SLIM_RATE_4000HZ;
+		prop.ratem = (rate/4000);
+	}
 	prop.dataf = SLIM_CH_DATAF_NOT_DEFINED;
 	prop.auxf = SLIM_CH_AUXF_NOT_APPLICABLE;
-	prop.ratem = (rate/4000);
 	prop.sampleszbits = bit_width;
 
 	pr_debug("Before slim_define_ch:\n"
@@ -230,10 +252,10 @@ int wcd9xxx_cfg_slim_sch_rx(struct wcd9xxx *wcd9xxx,
 
 	list_for_each_entry(rx, wcd9xxx_ch_list, list) {
 		codec_port = rx->port;
-		pr_debug("%s: codec_port %d rx 0x%x, payload %d\n"
+		pr_debug("%s: codec_port %d rx 0x%pK, payload %d\n"
 			 "sh_ch.rx_port_ch_reg_base0 0x%x\n"
 			 "sh_ch.port_rx_cfg_reg_base 0x%x\n",
-			 __func__, codec_port, (u32)rx, payload,
+			 __func__, codec_port, rx, payload,
 			 sh_ch.rx_port_ch_reg_base,
 			sh_ch.port_rx_cfg_reg_base);
 
@@ -301,13 +323,22 @@ int wcd9xxx_cfg_slim_sch_tx(struct wcd9xxx *wcd9xxx,
 	u16 codec_port;
 	int ret = 0;
 	struct wcd9xxx_ch *tx;
+	int size = ARRAY_SIZE(ch_h);
 
 	struct slim_ch prop;
 
 	list_for_each_entry(tx, wcd9xxx_ch_list, list) {
 		payload |= 1 << tx->shift;
-		ch_h[ch_cnt] = tx->ch_h;
-		ch_cnt++;
+		if (ch_cnt < size) {
+			ch_h[ch_cnt] = tx->ch_h;
+			ch_cnt++;
+		} else {
+			pr_err("%s: allocated channel number %u is out of max rangae %d\n",
+			       __func__, ch_cnt,
+			       size);
+			ret = EINVAL;
+			goto err;
+		}
 	}
 
 	/* slim_define_ch api */
@@ -316,7 +347,7 @@ int wcd9xxx_cfg_slim_sch_tx(struct wcd9xxx *wcd9xxx,
 	prop.dataf = SLIM_CH_DATAF_NOT_DEFINED;
 	prop.auxf = SLIM_CH_AUXF_NOT_APPLICABLE;
 	prop.ratem = (rate/4000);
-	prop.sampleszbits = 16;
+	prop.sampleszbits = bit_width;
 	ret = slim_define_ch(wcd9xxx->slim, &prop, ch_h, ch_cnt,
 			     true, grph);
 	if (ret < 0) {
@@ -325,11 +356,12 @@ int wcd9xxx_cfg_slim_sch_tx(struct wcd9xxx *wcd9xxx,
 		goto err;
 	}
 
-	pr_debug("%s: ch_cnt[%d] rate[%d]\n", __func__, ch_cnt, rate);
+	pr_debug("%s: ch_cnt[%d] rate[%d] bitwidth[%u]\n", __func__, ch_cnt,
+		 rate, bit_width);
 	list_for_each_entry(tx, wcd9xxx_ch_list, list) {
 		codec_port = tx->port;
-		pr_debug("%s: codec_port %d rx 0x%x, payload 0x%x\n",
-			 __func__, codec_port, (u32)tx, payload);
+		pr_debug("%s: codec_port %d tx 0x%pK, payload 0x%x\n",
+			 __func__, codec_port, tx, payload);
 		/* write to interface device */
 		ret = wcd9xxx_interface_reg_write(wcd9xxx,
 				SB_PGD_TX_PORT_MULTI_CHANNEL_0(codec_port),
@@ -498,28 +530,38 @@ EXPORT_SYMBOL_GPL(wcd9xxx_rx_vport_validation);
 
 
 /* This function is called with mutex acquired */
-int wcd9xxx_tx_vport_validation(u32 vtable, u32 port_id,
-				struct wcd9xxx_codec_dai_data *codec_dai)
+int wcd9xxx_tx_vport_validation(u32 table, u32 port_id,
+				struct wcd9xxx_codec_dai_data *codec_dai,
+				u32 num_codec_dais)
 {
 	struct wcd9xxx_ch *ch;
 	int ret = 0;
 	u32 index;
-	u32 size = sizeof(vtable) * 8;
-	pr_debug("%s: vtable 0x%x port_id %u size %d\n", __func__,
+	unsigned long vtable = table;
+	u32 size = sizeof(table) * BITS_PER_BYTE;
+
+	pr_debug("%s: vtable 0x%lx port_id %u size %d\n", __func__,
 		 vtable, port_id, size);
-	for_each_set_bit(index, (unsigned long *)&vtable, size) {
-		list_for_each_entry(ch,
-				    &codec_dai[index].wcd9xxx_ch_list,
-				    list) {
-			pr_debug("%s: index %u ch->port %u vtable 0x%x\n",
-				 __func__, index, ch->port, vtable);
-			if (ch->port == port_id) {
-				pr_err("%s: TX%u is used by AIF%u_CAP Mixer\n",
-					__func__, port_id + 1,
-					(index + 1)/2);
-				ret = -EINVAL;
-				break;
+	for_each_set_bit(index, &vtable, size) {
+		if (index < num_codec_dais) {
+			list_for_each_entry(ch,
+					&codec_dai[index].wcd9xxx_ch_list,
+					list) {
+				pr_debug("%s: index %u ch->port %u vtable 0x%lx\n",
+						__func__, index, ch->port,
+						vtable);
+				if (ch->port == port_id) {
+					pr_err("%s: TX%u is used by AIF%u_CAP Mixer\n",
+							__func__, port_id + 1,
+							(index + 1)/2);
+					ret = -EINVAL;
+					break;
+				}
 			}
+		} else {
+			pr_err("%s: Invalid index %d of codec dai",
+					__func__, index);
+			ret = -EINVAL;
 		}
 		if (ret)
 			break;

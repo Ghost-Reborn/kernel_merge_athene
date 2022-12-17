@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2013-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -144,11 +144,12 @@ static int emac_set_settings(struct net_device *netdev,
 	u32 advertised, old;
 	int retval = 0;
 	bool autoneg;
+	bool if_running = netif_running(adpt->netdev);
 
 	emac_info(adpt, link, "ethtool cmd autoneg %d, speed %d, duplex %d\n",
 		  ecmd->autoneg, ecmd->speed, ecmd->duplex);
 
-	while (CHK_AND_SET_ADPT_FLAG(STATE_RESETTING))
+	while (TEST_N_SET_FLAG(adpt, ADPT_STATE_RESETTING))
 		msleep(20); /* Reset might take few 10s of ms */
 
 	old = hw->autoneg_advertised;
@@ -163,7 +164,7 @@ static int emac_set_settings(struct net_device *netdev,
 			if (ecmd->duplex != DUPLEX_FULL) {
 				emac_warn(adpt, hw,
 					  "1000M half is invalid\n");
-				CLI_ADPT_FLAG(STATE_RESETTING);
+				CLR_FLAG(adpt, ADPT_STATE_RESETTING);
 				return -EINVAL;
 			}
 			advertised = EMAC_LINK_SPEED_1GB_FULL;
@@ -183,6 +184,13 @@ static int emac_set_settings(struct net_device *netdev,
 	if ((hw->autoneg == autoneg) && (hw->autoneg_advertised == advertised))
 		goto done;
 
+	/* If there is no EPHY, the EMAC internal PHY may get reset in
+	 * emac_setup_phy_link_speed. Reset the MAC to avoid the memory
+	 * corruption.
+	 */
+	if (adpt->no_ephy && if_running)
+		emac_down(adpt, EMAC_HW_CTRL_RESET_MAC);
+
 	retval = emac_setup_phy_link_speed(hw, advertised, autoneg,
 					   !hw->disable_fc_autoneg);
 	if (retval) {
@@ -190,19 +198,14 @@ static int emac_set_settings(struct net_device *netdev,
 					  !hw->disable_fc_autoneg);
 	}
 
-	if (netif_running(adpt->netdev)) {
-		/* If there is no EPHY, the EMAC internal PHY may get reset in
-		 * emac_setup_phy_link_speed. Reset the MAC to avoid the memory
-		 * corruption.
-		 */
-		if (adpt->no_ephy) {
-			emac_down(adpt, EMAC_HW_CTRL_RESET_MAC);
+	if (if_running) {
+		/* If there is no EPHY, bring up the interface */
+		if (adpt->no_ephy)
 			emac_up(adpt);
-		}
 	}
 
 done:
-	CLI_ADPT_FLAG(STATE_RESETTING);
+	CLR_FLAG(adpt, ADPT_STATE_RESETTING);
 	return retval;
 }
 
@@ -212,8 +215,7 @@ static void emac_get_pauseparam(struct net_device *netdev,
 	struct emac_adapter *adpt = netdev_priv(netdev);
 	struct emac_hw *hw = &adpt->hw;
 
-	if (hw->disable_fc_autoneg ||
-	    hw->cur_fc_mode == emac_fc_none)
+	if (hw->disable_fc_autoneg)
 		pause->autoneg = 0;
 	else
 		pause->autoneg = 1;
@@ -237,7 +239,7 @@ static int emac_set_pauseparam(struct net_device *netdev,
 	bool disable_fc_autoneg;
 	int retval = 0;
 
-	while (CHK_AND_SET_ADPT_FLAG(STATE_RESETTING))
+	while (TEST_N_SET_FLAG(adpt, ADPT_STATE_RESETTING))
 		msleep(20); /* Reset might take few 10s of ms */
 
 	req_fc_mode        = hw->req_fc_mode;
@@ -248,7 +250,7 @@ static int emac_set_pauseparam(struct net_device *netdev,
 	else
 		disable_fc_autoneg = false;
 
-	if ((pause->rx_pause && pause->tx_pause) || pause->autoneg)
+	if (pause->rx_pause && pause->tx_pause)
 		req_fc_mode = emac_fc_full;
 	else if (pause->rx_pause && !pause->tx_pause)
 		req_fc_mode = emac_fc_rx_pause;
@@ -257,7 +259,7 @@ static int emac_set_pauseparam(struct net_device *netdev,
 	else if (!pause->rx_pause && !pause->tx_pause)
 		req_fc_mode = emac_fc_none;
 	else {
-		CLI_ADPT_FLAG(STATE_RESETTING);
+		CLR_FLAG(adpt, ADPT_STATE_RESETTING);
 		return -EINVAL;
 	}
 
@@ -265,14 +267,16 @@ static int emac_set_pauseparam(struct net_device *netdev,
 	    (hw->disable_fc_autoneg != disable_fc_autoneg)) {
 		hw->req_fc_mode = req_fc_mode;
 		hw->disable_fc_autoneg = disable_fc_autoneg;
-		if (!hw->disable_fc_autoneg)
-			retval = emac_setup_phy_link(hw, hw->autoneg_advertised,
-						     true, true);
+		if (!adpt->no_ephy)
+			retval = emac_setup_phy_link(hw,
+						     hw->autoneg_advertised,
+						     hw->autoneg,
+						     !disable_fc_autoneg);
 		if (!retval)
 			emac_hw_config_fc(hw);
 	}
 
-	CLI_ADPT_FLAG(STATE_RESETTING);
+	CLR_FLAG(adpt, ADPT_STATE_RESETTING);
 	return retval;
 }
 

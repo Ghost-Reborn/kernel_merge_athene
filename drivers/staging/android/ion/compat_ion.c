@@ -25,7 +25,7 @@
 struct compat_ion_allocation_data {
 	compat_size_t len;
 	compat_size_t align;
-	compat_uint_t heap_mask;
+	compat_uint_t heap_id_mask;
 	compat_uint_t flags;
 	compat_int_t handle;
 };
@@ -35,9 +35,14 @@ struct compat_ion_custom_data {
 	compat_ulong_t arg;
 };
 
+struct compat_ion_handle_data {
+	compat_int_t handle;
+};
+
 #define COMPAT_ION_IOC_ALLOC	_IOWR(ION_IOC_MAGIC, 0, \
 				      struct compat_ion_allocation_data)
-#define COMPAT_ION_IOC_FREE	_IOWR(ION_IOC_MAGIC, 1, struct ion_handle_data)
+#define COMPAT_ION_IOC_FREE	_IOWR(ION_IOC_MAGIC, 1, \
+				      struct compat_ion_handle_data)
 #define COMPAT_ION_IOC_CUSTOM	_IOWR(ION_IOC_MAGIC, 6, \
 				      struct compat_ion_custom_data)
 
@@ -54,11 +59,24 @@ static int compat_get_ion_allocation_data(
 	err |= put_user(s, &data->len);
 	err |= get_user(s, &data32->align);
 	err |= put_user(s, &data->align);
-	err |= get_user(u, &data32->heap_mask);
-	err |= put_user(u, &data->heap_mask);
+	err |= get_user(u, &data32->heap_id_mask);
+	err |= put_user(u, &data->heap_id_mask);
 	err |= get_user(u, &data32->flags);
 	err |= put_user(u, &data->flags);
 	err |= get_user(i, &data32->handle);
+	err |= put_user(i, &data->handle);
+
+	return err;
+}
+
+static int compat_get_ion_handle_data(
+			struct compat_ion_handle_data __user *data32,
+			struct ion_handle_data __user *data)
+{
+	compat_int_t i;
+	int err;
+
+	err = get_user(i, &data32->handle);
 	err |= put_user(i, &data->handle);
 
 	return err;
@@ -77,8 +95,8 @@ static int compat_put_ion_allocation_data(
 	err |= put_user(s, &data32->len);
 	err |= get_user(s, &data->align);
 	err |= put_user(s, &data32->align);
-	err |= get_user(u, &data->heap_mask);
-	err |= put_user(u, &data32->heap_mask);
+	err |= get_user(u, &data->heap_id_mask);
+	err |= put_user(u, &data32->heap_id_mask);
 	err |= get_user(u, &data->flags);
 	err |= put_user(u, &data32->flags);
 	err |= get_user(i, &data->handle);
@@ -132,8 +150,8 @@ long compat_ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	}
 	case COMPAT_ION_IOC_FREE:
 	{
-		struct compat_ion_allocation_data __user *data32;
-		struct ion_allocation_data __user *data;
+		struct compat_ion_handle_data __user *data32;
+		struct ion_handle_data __user *data;
 		int err;
 
 		data32 = compat_ptr(arg);
@@ -141,7 +159,7 @@ long compat_ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		if (data == NULL)
 			return -EFAULT;
 
-		err = compat_get_ion_allocation_data(data32, data);
+		err = compat_get_ion_handle_data(data32, data);
 		if (err)
 			return err;
 

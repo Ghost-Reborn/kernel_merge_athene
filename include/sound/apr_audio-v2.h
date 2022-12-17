@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2016, The Linux Foundation. All rights reserved.
 *
 * This program is free software; you can redistribute it and/or modify
 * it under the terms of the GNU General Public License version 2 and
@@ -16,6 +16,18 @@
 
 #include <linux/qdsp6v2/apr.h>
 
+/* size of header needed for passing data out of band */
+#define APR_CMD_OB_HDR_SZ  12
+
+/* size of header needed for getting data */
+#define APR_CMD_GET_HDR_SZ 16
+
+struct param_outband {
+	size_t       size;
+	void        *kvaddr;
+	phys_addr_t  paddr;
+};
+
 #define ADSP_ADM_VERSION    0x00070000
 
 #define ADM_CMD_SHARED_MEM_MAP_REGIONS    0x00010322
@@ -23,17 +35,20 @@
 #define ADM_CMD_SHARED_MEM_UNMAP_REGIONS 0x00010324
 
 #define ADM_CMD_MATRIX_MAP_ROUTINGS_V5 0x00010325
-
+#define ADM_CMD_STREAM_DEVICE_MAP_ROUTINGS_V5 0x0001033D
 /* Enumeration for an audio Rx matrix ID.*/
 #define ADM_MATRIX_ID_AUDIO_RX              0
 
 #define ADM_MATRIX_ID_AUDIO_TX              1
 
+#define ADM_MATRIX_ID_COMPRESSED_AUDIO_RX   2
 /* Enumeration for an audio Tx matrix ID.*/
 #define ADM_MATRIX_ID_AUDIOX              1
 
 #define ADM_MAX_COPPS 5
 
+/* make sure this matches with msm_audio_calibration */
+#define SP_V2_NUM_MAX_SPKR 2
 
 /*  Session map node structure.
 *	Immediately following this structure are num_copps
@@ -413,7 +428,65 @@ struct adm_cmd_rsp_get_pp_params_v5 {
 	/* Status message (error code).*/
 } __packed;
 
-/* Allows a client to control the gains on various session-to-COPP paths.
+/* Structure for holding soft stepping volume parameters. */
+
+/*
+ * Payload of the #ASM_PARAM_ID_SOFT_VOL_STEPPING_PARAMETERS
+ * parameters used by the Volume Control module.
+ */
+
+struct audproc_softvolume_params {
+	u32 period;
+	u32 step;
+	u32 rampingcurve;
+} __packed;
+
+struct audproc_volume_ctrl_master_gain {
+	struct adm_cmd_set_pp_params_v5 params;
+	struct adm_param_data_v5 data;
+	/* Linear gain in Q13 format. */
+	uint16_t                  master_gain;
+	/* Clients must set this field to zero. */
+	uint16_t                  reserved;
+} __packed;
+
+struct audproc_soft_step_volume_params {
+	struct adm_cmd_set_pp_params_v5 params;
+	struct adm_param_data_v5 data;
+/*
+ * Period in milliseconds.
+ * Supported values: 0 to 15000
+ */
+	uint32_t                  period;
+/*
+ * Step in microseconds.
+ * Supported values: 0 to 15000000
+ */
+	uint32_t                  step;
+/*
+ * Ramping curve type.
+ * Supported values:
+ * - #AUDPROC_PARAM_SVC_RAMPINGCURVE_LINEAR
+ * - #AUDPROC_PARAM_SVC_RAMPINGCURVE_EXP
+ * - #AUDPROC_PARAM_SVC_RAMPINGCURVE_LOG
+ */
+	uint32_t                  ramping_curve;
+} __packed;
+
+struct audproc_enable_param_t {
+	struct adm_cmd_set_pp_params_inband_v5 pp_params;
+	/*
+	 * Specifies whether the Audio processing module is enabled.
+	 * This parameter is generic/common parameter to configure or
+	 * determine the state of any audio processing module.
+
+	 * @values 0 : Disable 1: Enable
+	 */
+	uint32_t                  enable;
+};
+
+/*
+ * Allows a client to control the gains on various session-to-COPP paths.
  */
 #define ADM_CMD_MATRIX_RAMP_GAINS_V5                                 0x0001032C
 
@@ -787,7 +860,18 @@ struct adm_cmd_connect_afe_port_v5 {
 #define AFE_PORT_ID_SECONDARY_PCM_RX        0x100C
 #define AFE_PORT_ID_SECONDARY_PCM_TX        0x100D
 #define AFE_PORT_ID_MULTICHAN_HDMI_RX       0x100E
+#define AFE_PORT_ID_SECONDARY_MI2S_RX_SD1	0x1010
+/* ID of the senary MI2S Rx port. */
+#define AFE_PORT_ID_SENARY_MI2S_RX		0x1018
+/* ID of the senary MI2S Tx port. */
+#define AFE_PORT_ID_SENARY_MI2S_TX		0x1019
+
 #define AFE_PORT_ID_SPDIF_RX                0x5000
+/* ID of the Quinary MI2S Rx port. */
+#define AFE_PORT_ID_QUINARY_MI2S_RX		0x1016
+/* ID of the Quinary MI2S Tx port. */
+#define AFE_PORT_ID_QUINARY_MI2S_TX		0x1017
+#define AFE_PORT_ID_MI2S_HDMI_RX	AFE_PORT_ID_QUINARY_MI2S_RX
 #define  AFE_PORT_ID_RT_PROXY_PORT_001_RX   0x2000
 #define  AFE_PORT_ID_RT_PROXY_PORT_001_TX   0x2001
 #define AFE_PORT_ID_INTERNAL_BT_SCO_RX      0x3000
@@ -2124,6 +2208,22 @@ struct afe_param_id_device_hw_delay_cfg {
 	uint32_t    delay_in_us;
 } __packed;
 
+#define AFE_PARAM_ID_SET_TOPOLOGY    0x0001025A
+#define AFE_API_VERSION_TOPOLOGY_V1 0x1
+
+struct afe_param_id_set_topology_cfg {
+	/*
+	 * Minor version used for tracking afe topology id configuration.
+	 * @values #AFE_API_VERSION_TOPOLOGY_V1
+	 */
+	u32		minor_version;
+	/*
+	 * Id of the topology for the afe session.
+	 * @values Any valid AFE topology ID
+	 */
+	u32		topology_id;
+} __packed;
+
 union afe_port_config {
 	struct afe_param_id_pcm_cfg               pcm;
 	struct afe_param_id_i2s_cfg               i2s;
@@ -2134,6 +2234,7 @@ union afe_port_config {
 	struct afe_param_id_pseudo_port_cfg       pseudo_port;
 	struct afe_param_id_device_hw_delay_cfg   hw_delay;
 	struct afe_param_id_spdif_cfg             spdif;
+	struct afe_param_id_set_topology_cfg      topology;
 } __packed;
 
 struct afe_audioif_config_command_no_payload {
@@ -2317,12 +2418,10 @@ u32                  mem_map_handle;
  * stream.
  */
 struct afe_port_cmd_get_param_v2 {
-
-	struct apr_hdr hdr;
-u16                  port_id;
+	u16 port_id;
 /* Port interface and direction (Rx or Tx) to start. */
 
-	u16                  payload_size;
+	u16 payload_size;
 /* Maximum data size of the parameter ID/module ID combination.
  * This is a multiple of four bytes
  * Supported values: > 0
@@ -2353,12 +2452,12 @@ u16                  port_id;
  */
 
 
-	u32                  module_id;
+	u32 module_id;
 /* ID of the module to be queried.
  * Supported values: Valid module ID
  */
 
-	u32                  param_id;
+	u32 param_id;
 /* ID of the parameter to be queried.
  * Supported values: Valid parameter ID
  */
@@ -2381,6 +2480,32 @@ struct afe_port_cmdrsp_get_param_v2 {
 	u32                  status;
 } __packed;
 
+#define AFE_PARAM_ID_LPASS_CORE_SHARED_CLOCK_CONFIG	0x0001028C
+#define AFE_API_VERSION_LPASS_CORE_SHARED_CLK_CONFIG	0x1
+/*
+ * Payload of the AFE_PARAM_ID_LPASS_CORE_SHARED_CLOCK_CONFIG parameter used by
+ * AFE_MODULE_AUDIO_DEV_INTERFACE.
+*/
+struct afe_param_id_lpass_core_shared_clk_cfg {
+	u32	lpass_core_shared_clk_cfg_minor_version;
+/*
+ * Minor version used for lpass core shared clock configuration
+ * Supported value: AFE_API_VERSION_LPASS_CORE_SHARED_CLK_CONFIG
+ */
+	u32	enable;
+/*
+ * Specifies whether the lpass core shared clock is
+ * enabled (1) or disabled (0).
+ */
+} __packed;
+
+struct afe_lpass_core_shared_clk_config_command {
+	struct apr_hdr		   hdr;
+	struct afe_port_cmd_set_param_v2 param;
+	struct afe_port_param_data_v2    pdata;
+	struct afe_param_id_lpass_core_shared_clk_cfg clk_cfg;
+} __packed;
+
 /* adsp_afe_service_commands.h */
 
 #define ADSP_MEMORY_MAP_EBI_POOL      0
@@ -2398,12 +2523,18 @@ struct afe_port_cmdrsp_get_param_v2 {
 */
 #define ADSP_MEMORY_MAP_PHYSICAL_MEMORY 0
 
+#define NULL_POPP_TOPOLOGY				0x00010C68
 #define NULL_COPP_TOPOLOGY				0x00010312
-#define DEFAULT_COPP_TOPOLOGY				0x00010be3
-#define DEFAULT_POPP_TOPOLOGY				0x00010be4
+#define DEFAULT_COPP_TOPOLOGY				0x00010BE3
+#define DEFAULT_POPP_TOPOLOGY				0x00010BE4
+#define COMPRESSED_PASSTHROUGH_DEFAULT_TOPOLOGY         0x0001076B
 #define VPM_TX_SM_ECNS_COPP_TOPOLOGY			0x00010F71
 #define VPM_TX_DM_FLUENCE_COPP_TOPOLOGY			0x00010F72
 #define VPM_TX_QMIC_FLUENCE_COPP_TOPOLOGY		0x00010F75
+#define VPM_TX_DM_RFECNS_COPP_TOPOLOGY			0x00010F86
+#define VPM_TX_MOT_COPP_TOPOLOGY			0x1000E004
+#define ADM_CMD_COPP_OPEN_TOPOLOGY_ID_DTS_HPX		0x10015002
+#define ADM_CMD_COPP_OPEN_TOPOLOGY_ID_AUDIOSPHERE	0x10028000
 
 /* Memory map regions command payload used by the
  * #ASM_CMD_SHARED_MEM_MAP_REGIONS ,#ADM_CMD_SHARED_MEM_MAP_REGIONS
@@ -2568,6 +2699,51 @@ struct asm_amrwbplus_cfg {
 	u32  amr_lsf_idx;
 } __packed;
 
+struct asm_flac_cfg {
+	u32 sample_rate;
+	u32 ext_sample_rate;
+	u32 min_frame_size;
+	u32 max_frame_size;
+	u16 stream_info_present;
+	u16 min_blk_size;
+	u16 max_blk_size;
+	u16 ch_cfg;
+	u16 sample_size;
+	u16 md5_sum;
+};
+
+struct asm_alac_cfg {
+	u32 frame_length;
+	u8 compatible_version;
+	u8 bit_depth;
+	u8 pb;
+	u8 mb;
+	u8 kb;
+	u8 num_channels;
+	u16 max_run;
+	u32 max_frame_bytes;
+	u32 avg_bit_rate;
+	u32 sample_rate;
+	u32 channel_layout_tag;
+};
+
+struct asm_vorbis_cfg {
+	u32 bit_stream_fmt;
+};
+
+struct asm_ape_cfg {
+	u16 compatible_version;
+	u16 compression_level;
+	u32 format_flags;
+	u32 blocks_per_frame;
+	u32 final_frame_blocks;
+	u32 total_frames;
+	u16 bits_per_sample;
+	u16 num_channels;
+	u32 sample_rate;
+	u32 seek_table_present;
+};
+
 struct asm_softpause_params {
 	u32 enable;
 	u32 period;
@@ -2637,9 +2813,7 @@ struct asm_softvolume_params {
 
 #define ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2 0x00010DA5
 
-#define ASM_STREAM_POSTPROC_TOPO_ID_DEFAULT 0x00010BE4
-
-#define ASM_STREAM_POSTPROC_TOPO_ID_NONE 0x00010C68
+#define ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V3 0x00010DDC
 
 #define ASM_MEDIA_FMT_EVRCB_FS 0x00010BEF
 
@@ -2708,6 +2882,51 @@ struct asm_multi_channel_pcm_fmt_blk_v2 {
  */
 } __packed;
 
+struct asm_multi_channel_pcm_fmt_blk_v3 {
+	uint16_t                num_channels;
+/*
+ * Number of channels
+ * Supported values: 1 to 8
+ */
+
+	uint16_t                bits_per_sample;
+/*
+ * Number of bits per sample per channel
+ * Supported values: 16, 24
+ */
+
+	uint32_t                sample_rate;
+/*
+ * Number of samples per second
+ * Supported values: 2000 to 48000, 96000,192000 Hz
+ */
+
+	uint16_t                is_signed;
+/* Flag that indicates that PCM samples are signed (1) */
+
+	uint16_t                sample_word_size;
+/*
+ * Size in bits of the word that holds a sample of a channel.
+ * Supported values: 12,24,32
+ */
+
+	uint8_t                 channel_mapping[8];
+/*
+ * Each element, i, in the array describes channel i inside the buffer where
+ * 0 <= i < num_channels. Unused channels are set to 0.
+ */
+} __packed;
+
+/*
+ * Payload of the multichannel PCM configuration parameters in
+ * the ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V3 media format.
+ */
+struct asm_multi_channel_pcm_fmt_blk_param_v3 {
+	struct apr_hdr hdr;
+	struct asm_data_cmd_media_fmt_update_v2 fmt_blk;
+	struct asm_multi_channel_pcm_fmt_blk_v3 param;
+} __packed;
+
 struct asm_stream_cmd_set_encdec_param {
 	u32                  param_id;
 	/* ID of the parameter. */
@@ -2743,8 +2962,69 @@ struct asm_dec_ddp_endp_param_v2 {
 	int endp_param_value;
 } __packed;
 
+
+/*
+ * Payload of the multichannel PCM encoder configuration parameters in
+ * the ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V3 media format.
+ */
+
+struct asm_multi_channel_pcm_enc_cfg_v3 {
+	struct apr_hdr hdr;
+	struct asm_stream_cmd_set_encdec_param encdec;
+	struct asm_enc_cfg_blk_param_v2 encblk;
+	uint16_t num_channels;
+	/*
+	 * Number of PCM channels.
+	 * @values
+	 * - 0 -- Native mode
+	 * - 1 -- 8 channels
+	 * Native mode indicates that encoding must be performed with the number
+	 * of channels at the input.
+	 */
+	uint16_t  bits_per_sample;
+	/*
+	 * Number of bits per sample per channel.
+	 * @values 16, 24
+	 */
+	uint32_t  sample_rate;
+	/*
+	 * Number of samples per second.
+	 * @values 0, 8000 to 48000 Hz
+	 * A value of 0 indicates the native sampling rate. Encoding is
+	 * performed at the input sampling rate.
+	 */
+	uint16_t  is_signed;
+	/*
+	 * Flag that indicates the PCM samples are signed (1). Currently, only
+	 * signed PCM samples are supported.
+	 */
+	uint16_t    sample_word_size;
+	/*
+	 * The size in bits of the word that holds a sample of a channel.
+	 * @values 16, 24, 32
+	 * 16-bit samples are always placed in 16-bit words:
+	 * sample_word_size = 1.
+	 * 24-bit samples can be placed in 32-bit words or in consecutive
+	 * 24-bit words.
+	 * - If sample_word_size = 32, 24-bit samples are placed in the
+	 * most significant 24 bits of a 32-bit word.
+	 * - If sample_word_size = 24, 24-bit samples are placed in
+	 * 24-bit words. @tablebulletend
+	 */
+	uint8_t   channel_mapping[8];
+	/*
+	 * Channel mapping array expected at the encoder output.
+	 *  Channel[i] mapping describes channel i inside the buffer, where
+	 *  0 @le i < num_channels. All valid used channels must be present at
+	 *  the beginning of the array.
+	 * If Native mode is set for the channels, this field is ignored.
+	 * @values See Section @xref{dox:PcmChannelDefs}
+	 */
+};
+
 /* @brief Multichannel PCM encoder configuration structure used
- * in the #ASM_STREAM_CMD_OPEN_READ_V2 command.
+ * in the #ASM_STREAM_CMD_OPEN_READ_V2(for AVS2.6 image) OR
+ * ASM_PARAM_ID_ENCDEC_ENC_CFG_BLK_V2(FOR AVS2.7 image) command.
  */
 
 struct asm_multi_channel_pcm_enc_cfg_v2 {
@@ -2912,6 +3192,124 @@ struct asm_aac_enc_cfg_v2 {
  * sampling rate at the input.
  * The sampling rate must not change during encoding.
  */
+
+} __packed;
+
+struct asm_vorbis_fmt_blk_v2 {
+	struct apr_hdr hdr;
+	struct asm_data_cmd_media_fmt_update_v2 fmtblk;
+	u32          bit_stream_fmt;
+/* Bit stream format.
+ * Supported values:
+ * - 0 -- Raw bitstream
+ * - 1 -- Transcoded bitstream
+ *
+ * Transcoded bitstream containing the size of the frame as the first
+ * word in each frame.
+ */
+
+} __packed;
+
+struct asm_flac_fmt_blk_v2 {
+	struct apr_hdr hdr;
+	struct asm_data_cmd_media_fmt_update_v2 fmtblk;
+
+	u16 is_stream_info_present;
+/* Specifies whether stream information is present in the FLAC format
+ * block.
+ *
+ * Supported values:
+ * - 0 -- Stream information is not present in this message
+ * - 1 -- Stream information is present in this message
+ *
+ * When set to 1, the FLAC bitstream was successfully parsed by the
+ * client, and other fields in the FLAC format block can be read by the
+ * decoder to get metadata stream information.
+ */
+
+	u16 num_channels;
+/* Number of channels for decoding.
+ * Supported values: 1 to 2
+ */
+
+	u16 min_blk_size;
+/* Minimum block size (in samples) used in the stream. It must be less
+ * than or equal to max_blk_size.
+ */
+
+	u16 max_blk_size;
+/* Maximum block size (in samples) used in the stream. If the
+ * minimum block size equals the maximum block size, a fixed block
+ * size stream is implied.
+ */
+
+	u16 md5_sum[8];
+/* MD5 signature array of the unencoded audio data. This allows the
+ * decoder to determine if an error exists in the audio data, even when
+ * the error does not result in an invalid bitstream.
+ */
+
+	u32 sample_rate;
+/* Number of samples per second.
+ * Supported values: 8000 to 48000 Hz
+ */
+
+	u32 min_frame_size;
+/* Minimum frame size used in the stream.
+ * Supported values:
+ * - > 0 bytes
+ * - 0 -- The value is unknown
+ */
+
+	u32 max_frame_size;
+/* Maximum frame size used in the stream.
+ * Supported values:
+ * -- > 0 bytes
+ * -- 0 . The value is unknown
+ */
+
+	u16 sample_size;
+/* Bits per sample.Supported values: 8, 16 */
+
+	u16 reserved;
+/* Clients must set this field to zero
+ */
+
+} __packed;
+
+struct asm_alac_fmt_blk_v2 {
+	struct apr_hdr hdr;
+	struct asm_data_cmd_media_fmt_update_v2 fmtblk;
+
+	u32 frame_length;
+	u8 compatible_version;
+	u8 bit_depth;
+	u8 pb;
+	u8 mb;
+	u8 kb;
+	u8 num_channels;
+	u16 max_run;
+	u32 max_frame_bytes;
+	u32 avg_bit_rate;
+	u32 sample_rate;
+	u32 channel_layout_tag;
+
+} __packed;
+
+struct asm_ape_fmt_blk_v2 {
+	struct apr_hdr hdr;
+	struct asm_data_cmd_media_fmt_update_v2 fmtblk;
+
+	u16 compatible_version;
+	u16 compression_level;
+	u32 format_flags;
+	u32 blocks_per_frame;
+	u32 final_frame_blocks;
+	u32 total_frames;
+	u16 bits_per_sample;
+	u16 num_channels;
+	u32 sample_rate;
+	u32 seek_table_present;
 
 } __packed;
 
@@ -3106,7 +3504,8 @@ struct asm_v13k_enc_cfg {
 #define ASM_MEDIA_FMT_EVRC_FS                   0x00010BEE
 
 /*  EVRC encoder configuration structure used in the
- * #ASM_STREAM_CMD_OPEN_READ_V2 command.
+ * #ASM_PARAM_ID_ENCDEC_ENC_CFG_BLK_V2(for AVS2.6 image)
+ * #ASM_STREAM_CMD_OPEN_READ_V2(for AVS2.7 image) command.
  */
 struct asm_evrc_enc_cfg {
 	struct apr_hdr hdr;
@@ -3315,10 +3714,17 @@ struct asm_amrwbplus_fmt_blk_v2 {
 
 } __packed;
 
-#define ASM_MEDIA_FMT_AC3_DEC                   0x00010BF6
-#define ASM_MEDIA_FMT_EAC3_DEC                   0x00010C3C
+#define ASM_MEDIA_FMT_AC3			0x00010DEE
+#define ASM_MEDIA_FMT_EAC3			0x00010DEF
+#define ASM_MEDIA_FMT_AC3_DEC                0x00010BF6
+#define ASM_MEDIA_FMT_EAC3_DEC               0x00010C3C
 #define ASM_MEDIA_FMT_DTS                    0x00010D88
 #define ASM_MEDIA_FMT_MP2                    0x00010DE9
+#define ASM_MEDIA_FMT_FLAC                   0x00010C16
+#define ASM_MEDIA_FMT_ALAC                   0x00012F31
+#define ASM_MEDIA_FMT_VORBIS                 0x00010C15
+#define ASM_MEDIA_FMT_APE                    0x00012F32
+
 
 /* Media format ID for adaptive transform acoustic coding. This
  * ID is used by the #ASM_STREAM_CMD_OPEN_WRITE_COMPRESSED command
@@ -4056,6 +4462,8 @@ struct asm_stream_cmd_open_write_v3 {
  * - #ASM_MEDIA_FMT_SBC
  * - #ASM_MEDIA_FMT_WMA_V10PRO_V2
  * - #ASM_MEDIA_FMT_WMA_V9_V2
+ * - #ASM_MEDIA_FMT_AC3
+ * - #ASM_MEDIA_FMT_EAC3
  * - #ASM_MEDIA_FMT_AC3_DEC
  * - #ASM_MEDIA_FMT_EAC3_DEC
  * - #ASM_MEDIA_FMT_G711_ALAW_FS
@@ -4064,11 +4472,82 @@ struct asm_stream_cmd_open_write_v3 {
  * - #ASM_MEDIA_FMT_FR_FS
  * - #ASM_MEDIA_FMT_VORBIS
  * - #ASM_MEDIA_FMT_FLAC
+ * - #ASM_MEDIA_FMT_ALAC
+ * - #ASM_MEDIA_FMT_APE
  * - #ASM_MEDIA_FMT_EXAMPLE
  */
 } __packed;
 
-#define ASM_STREAM_CMD_OPEN_READ_V2                 0x00010D8C
+#define ASM_STREAM_CMD_OPEN_PULL_MODE_WRITE    0x00010DD9
+
+/* Bitmask for the stream_perf_mode subfield. */
+#define ASM_BIT_MASK_STREAM_PERF_FLAG_PULL_MODE_WRITE 0xE0000000UL
+
+/* Bitmask for the stream_perf_mode subfield. */
+#define ASM_SHIFT_STREAM_PERF_FLAG_PULL_MODE_WRITE 29
+
+#define ASM_STREAM_CMD_OPEN_PUSH_MODE_READ  0x00010DDA
+
+#define ASM_BIT_MASK_STREAM_PERF_FLAG_PUSH_MODE_READ 0xE0000000UL
+
+#define ASM_SHIFT_STREAM_PERF_FLAG_PUSH_MODE_READ 29
+
+#define ASM_DATA_EVENT_WATERMARK 0x00010DDB
+
+struct asm_shared_position_buffer {
+	volatile uint32_t               frame_counter;
+/* Counter used to handle interprocessor synchronization issues.
+ * When frame_counter is 0: read_index, wall_clock_us_lsw, and
+ * wall_clock_us_msw are invalid.
+ * Supported values: >= 0.
+ */
+
+	volatile uint32_t               index;
+/* Index in bytes from where the aDSP is reading/writing.
+ * Supported values: 0 to circular buffer size - 1
+ */
+
+	volatile uint32_t               wall_clock_us_lsw;
+/* Lower 32 bits of the 64-bit wall clock time in microseconds when the
+ * read index was updated.
+ * Supported values: >= 0
+ */
+
+	volatile uint32_t               wall_clock_us_msw;
+/* Upper 32 bits of the 64 bit wall clock time in microseconds when the
+ * read index was updated
+ * Supported values: >= 0
+ */
+} __packed;
+
+struct asm_shared_watermark_level {
+	uint32_t                watermark_level_bytes;
+} __packed;
+
+struct asm_stream_cmd_open_shared_io {
+	struct apr_hdr          hdr;
+	uint32_t                mode_flags;
+	uint16_t                endpoint_type;
+	uint16_t                topo_bits_per_sample;
+	uint32_t                topo_id;
+	uint32_t                fmt_id;
+	uint32_t                shared_pos_buf_phy_addr_lsw;
+	uint32_t                shared_pos_buf_phy_addr_msw;
+	uint16_t                shared_pos_buf_mem_pool_id;
+	uint16_t                shared_pos_buf_num_regions;
+	uint32_t                shared_pos_buf_property_flag;
+	uint32_t                shared_circ_buf_start_phy_addr_lsw;
+	uint32_t                shared_circ_buf_start_phy_addr_msw;
+	uint32_t                shared_circ_buf_size;
+	uint16_t                shared_circ_buf_mem_pool_id;
+	uint16_t                shared_circ_buf_num_regions;
+	uint32_t                shared_circ_buf_property_flag;
+	uint32_t                num_watermark_levels;
+	struct asm_multi_channel_pcm_fmt_blk_v3         fmt;
+	struct avs_shared_map_region_payload            map_region_pos_buf;
+	struct avs_shared_map_region_payload            map_region_circ_buf;
+	struct asm_shared_watermark_level watermark[0];
+} __packed;
 
 #define ASM_STREAM_CMD_OPEN_READ_V3                 0x00010DB4
 
@@ -4083,6 +4562,9 @@ struct asm_stream_cmd_open_write_v3 {
 
 /* Absolute timestamp is identified by this value.*/
 #define ASM_ABSOLUTEIMESTAMP      1
+
+/* Bit value for Low Latency Tx stream subfield */
+#define ASM_LOW_LATENCY_TX_STREAM_SESSION			1
 
 /* Bit shift for the stream_perf_mode subfield. */
 #define ASM_SHIFT_STREAM_PERF_MODE_FLAG_IN_OPEN_READ              29
@@ -4223,6 +4705,7 @@ struct asm_stream_cmd_open_readwrite_v2 {
  * - #ASM_MEDIA_FMT_WMA_V10PRO_V2
  * - #ASM_MEDIA_FMT_WMA_V9_V2
  * - #ASM_MEDIA_FMT_AMR_WB_PLUS_V2
+ * - #ASM_MEDIA_FMT_AC3
  * - #ASM_MEDIA_FMT_AC3_DEC
  * - #ASM_MEDIA_FMT_G711_ALAW_FS
  * - #ASM_MEDIA_FMT_G711_MLAW_FS
@@ -4839,6 +5322,8 @@ struct asm_stream_cmd_open_write_compressed {
  * Supported values:
  * - #ASM_MEDIA_FMT_AC3_DEC
  * - #ASM_MEDIA_FMT_EAC3_DEC
+ * - #ASM_MEDIA_FMT_AC3
+ * - #ASM_MEDIA_FMT_EAC3
  * - #ASM_MEDIA_FMT_DTS
  * - #ASM_MEDIA_FMT_ATRAC
  * - #ASM_MEDIA_FMT_MAT
@@ -4923,6 +5408,8 @@ struct asm_stream_cmd_open_read_compressed {
 								0x0001070E
 #define ADM_CMD_COPP_OPENOPOLOGY_ID_SPEAKER_STEREO_IIR_AUDIO_COPP_MBDRCV2\
 								0x0001070F
+#define ADM_CMD_COPP_OPENOPOLOGY_ID_SPEAKER_STEREO_AUDIO_COPP_MBDRC_V3 \
+								0x11000000
 #define ADM_CMD_COPP_OPENOPOLOGY_ID_SPEAKER_MCH_PEAK_VOL \
 								0x0001031B
 #define ADM_CMD_COPP_OPENOPOLOGY_ID_MIC_MONO_AUDIO_COPP  0x00010315
@@ -5591,6 +6078,65 @@ struct adm_qensemble_param_set_new_angle {
  */
 } __packed;
 
+
+#define ADM_CMD_GET_PP_TOPO_MODULE_LIST				0x00010349
+#define ADM_CMDRSP_GET_PP_TOPO_MODULE_LIST			0x00010350
+#define AUDPROC_PARAM_ID_ENABLE					0x00010904
+ /*
+  * Payload of the ADM_CMD_GET_PP_TOPO_MODULE_LIST command.
+  */
+struct adm_cmd_get_pp_topo_module_list_t {
+	struct apr_hdr hdr;
+	/* Lower 32 bits of the 64-bit parameter data payload address. */
+	uint32_t                  data_payload_addr_lsw;
+	/*
+	 * Upper 32 bits of the 64-bit parameter data payload address.
+	 *
+	 *
+	 * The size of the shared memory, if specified, must be large enough to
+	 * contain the entire parameter data payload, including the module ID,
+	 * parameter ID, parameter size, and parameter values.
+	 */
+	uint32_t                  data_payload_addr_msw;
+	/*
+	 *  Unique identifier for an address.
+	 *
+	 * This memory map handle is returned by the aDSP through the
+	 * #ADM_CMD_SHARED_MEM_MAP_REGIONS command.
+	 *
+	 * @values
+	 * - Non-NULL -- On acknowledgment, the parameter data payloads begin at
+	 * the address specified (out-of-band)
+	 * - NULL -- The acknowledgment's payload contains the parameter data
+	 * (in-band) @tablebulletend
+	 */
+	uint32_t                  mem_map_handle;
+	/*
+	 * Maximum data size of the list of modules. This
+	 * field is a multiple of 4 bytes.
+	 */
+	uint16_t                  param_max_size;
+	/* This field must be set to zero. */
+	uint16_t                  reserved;
+} __packed;
+
+/*
+ * Payload of the ADM_CMDRSP_GET_PP_TOPO_MODULE_LIST message, which returns
+ * module ids in response to an ADM_CMD_GET_PP_TOPO_MODULE_LIST command.
+ * Immediately following this structure is the acknowledgement <b>module id
+ * data variable payload</b> containing the pre/postprocessing module id
+ * values. For an in-band scenario, the variable payload depends on the size
+ * of the parameter.
+ */
+struct adm_cmd_rsp_get_pp_topo_module_list_t {
+	/* Status message (error code). */
+	uint32_t                  status;
+} __packed;
+
+struct audproc_topology_module_id_info_t {
+	uint32_t	num_modules;
+} __packed;
+
 /* end_addtogroup audio_pp_module_ids */
 
 /* @ingroup audio_pp_module_ids
@@ -5598,6 +6144,7 @@ struct adm_qensemble_param_set_new_angle {
  * This module supports the following parameter IDs:
  * - #ASM_PARAM_ID_VOL_CTRL_MASTER_GAIN
  * - #ASM_PARAM_ID_VOL_CTRL_LR_CHANNEL_GAIN
+ * - #ASM_PARAM_ID_MULTICHANNEL_GAIN
  * - #ASM_PARAM_ID_VOL_CTRL_MUTE_CONFIG
  * - #ASM_PARAM_ID_SOFT_VOL_STEPPING_PARAMETERS
  * - #ASM_PARAM_ID_SOFT_PAUSE_PARAMETERS
@@ -5605,6 +6152,8 @@ struct adm_qensemble_param_set_new_angle {
  * - #ASM_PARAM_ID_MULTICHANNEL_MUTE
  */
 #define ASM_MODULE_ID_VOL_CTRL   0x00010BFE
+#define ASM_MODULE_ID_VOL_CTRL2  0x00010910
+#define AUDPROC_MODULE_ID_VOL_CTRL ASM_MODULE_ID_VOL_CTRL
 
 /* @addtogroup audio_pp_param_ids */
 /* ID of the master gain parameter used by the #ASM_MODULE_ID_VOL_CTRL
@@ -5615,12 +6164,14 @@ struct adm_qensemble_param_set_new_angle {
  * @inputtable{Audio_Postproc_ASM_PARAM_ID_VOL_CTRL_MASTER_GAIN.tex}
  */
 #define ASM_PARAM_ID_VOL_CTRL_MASTER_GAIN    0x00010BFF
+#define AUDPROC_PARAM_ID_VOL_CTRL_MASTER_GAIN ASM_PARAM_ID_VOL_CTRL_MASTER_GAIN
 
 /* ID of the left/right channel gain parameter used by the
  * #ASM_MODULE_ID_VOL_CTRL module.
  * @messagepayload
  * @structure{asm_volume_ctrl_lr_chan_gain}
  * @tablespace
+ * @inputtable{Audio_Postproc_ASM_PARAM_ID_MULTICHANNEL_GAIN.tex}
  * @inputtable{Audio_Postproc_ASM_PARAM_ID_VOL_CTRL_LR_CHANNEL_GAIN.tex}
  */
 #define ASM_PARAM_ID_VOL_CTRL_LR_CHANNEL_GAIN     0x00010C00
@@ -5643,6 +6194,8 @@ struct adm_qensemble_param_set_new_angle {
  * ERS.tex}
  */
 #define ASM_PARAM_ID_SOFT_VOL_STEPPING_PARAMETERS  0x00010C29
+#define AUDPROC_PARAM_ID_SOFT_VOL_STEPPING_PARAMETERS\
+			ASM_PARAM_ID_SOFT_VOL_STEPPING_PARAMETERS
 
 /* ID of the soft pause parameters used by the #ASM_MODULE_ID_VOL_CTRL
  * module.
@@ -5823,12 +6376,10 @@ struct asm_soft_pause_params {
  */
 
 
-struct asm_volume_ctrl_channelype_gain_pair {
-	struct apr_hdr	hdr;
-	struct asm_stream_cmd_set_pp_params_v2 param;
-	struct asm_stream_param_data_v2 data;
-	uint8_t                   channelype;
-/*< Channel type for which the gain setting is to be applied.
+struct asm_volume_ctrl_channeltype_gain_pair {
+	uint8_t                   channeltype;
+/*
+ *< Channel type for which the gain setting is to be applied.
  * Supported values:
  * - #PCM_CHANNEL_L
  * - #PCM_CHANNEL_R
@@ -5858,7 +6409,8 @@ struct asm_volume_ctrl_channelype_gain_pair {
 	/*< Clients must set this field to zero. */
 
 	uint32_t                  gain;
-/*< Gain value for this channel in Q28 format.
+/*
+ *< Gain value for this channel in Q28 format.
  * Supported values: Any
  */
 } __packed;
@@ -5877,14 +6429,14 @@ struct asm_volume_ctrl_multichannel_gain {
 	struct asm_stream_cmd_set_pp_params_v2 param;
 	struct asm_stream_param_data_v2 data;
 	uint32_t                  num_channels;
-/*< Number of channels for which gain values are provided. Any
+/*
+ *< Number of channels for which gain values are provided. Any
  * channels present in the data for which gain is not provided are
  * set to unity gain.
  * Supported values: 1 to 8
  */
 
-
-	struct asm_volume_ctrl_channelype_gain_pair
+	struct asm_volume_ctrl_channeltype_gain_pair
 		gain_data[VOLUME_CONTROL_MAX_CHANNELS];
 	/*< Array of channel type/gain pairs.*/
 } __packed;
@@ -6129,6 +6681,18 @@ struct asm_iir_filter_config_params {
  */
 #define ASM_PARAM_ID_MBDRC_CONFIG_PARAMS_IMPROVED_FILTBANK_V2 \
 								0x0001070C
+
+#define ASM_MODULE_ID_MBDRCV3					0x0001090B
+/*
+ * ID of the MMBDRC module version 3 pre/postprocessing block.
+ * This module differs from MBDRCv2 (#ASM_MODULE_ID_MBDRCV2) in
+ * that it supports both 16- and 24-bit data.
+ * This module supports the following parameter ID:
+ * - #ASM_PARAM_ID_MBDRC_ENABLE
+ * - #ASM_PARAM_ID_MBDRC_CONFIG_PARAMS
+ * - #ASM_PARAM_ID_MBDRC_CONFIG_PARAMS_V3
+ * - #ASM_PARAM_ID_MBDRC_FILTER_XOVER_FREQS
+ */
 
 /* Structure for the enable parameter for an MBDRC module. */
 
@@ -6450,6 +7014,21 @@ struct asm_eq_params {
 */
 #define AUDPROC_PARAM_ID_BASS_BOOST_STRENGTH                     0x000108A4
 
+/** ID of the PBE module.
+    This module supports the following parameter IDs:
+    - #AUDPROC_PARAM_ID_PBE_ENABLE
+    - #AUDPROC_PARAM_ID_PBE_PARAM_CONFIG
+*/
+#define AUDPROC_MODULE_ID_PBE                                    0x00010C2A
+/** ID of the Bass Boost enable parameter used by
+    AUDPROC_MODULE_ID_BASS_BOOST.
+*/
+#define AUDPROC_PARAM_ID_PBE_ENABLE                              0x00010C2B
+/** ID of the Bass Boost mode parameter used by
+    AUDPROC_MODULE_ID_BASS_BOOST.
+*/
+#define AUDPROC_PARAM_ID_PBE_PARAM_CONFIG                        0x00010C49
+
 /** ID of the Virtualizer module. This module supports the
     following parameter IDs:
     - #AUDPROC_PARAM_ID_VIRTUALIZER_ENABLE
@@ -6632,7 +7211,7 @@ struct asm_eq_params {
 /* Set Q6 topologies */
 #define ASM_CMD_ADD_TOPOLOGIES				0x00010DBE
 #define ADM_CMD_ADD_TOPOLOGIES				0x00010335
-
+#define AFE_CMD_ADD_TOPOLOGIES				0x000100f8
 /* structure used for both ioctls */
 struct cmd_set_topologies {
 	struct apr_hdr hdr;
@@ -6654,8 +7233,10 @@ struct cmd_set_topologies {
  */
 
 #define AFE_MODULE_FB_SPKR_PROT_RX 0x0001021C
+#define AFE_MODULE_FB_SPKR_PROT_V2_RX 0x0001025F
 
 #define AFE_PARAM_ID_FBSP_MODE_RX_CFG 0x0001021D
+#define AFE_PARAM_ID_FBSP_PTONE_RAMP_CFG 0x00010260
 
 struct asm_fbsp_mode_rx_cfg {
 	uint32_t minor_version;
@@ -6672,25 +7253,31 @@ struct asm_fbsp_mode_rx_cfg {
  */
 
 #define AFE_MODULE_FB_SPKR_PROT_VI_PROC 0x00010226
+#define AFE_MODULE_FB_SPKR_PROT_VI_PROC_V2 0x0001026A
 
 #define AFE_PARAM_ID_SPKR_CALIB_VI_PROC_CFG 0x0001022A
+#define AFE_PARAM_ID_SPKR_CALIB_VI_PROC_CFG_V2  0x0001026B
 
 struct asm_spkr_calib_vi_proc_cfg {
 	uint32_t minor_version;
-	int32_t	r0_cali_q24;
-	int16_t	t0_cali_q6;
-	int16_t	reserved;
+	uint32_t operation_mode;
+	uint32_t r0_t0_selection_flag[SP_V2_NUM_MAX_SPKR];
+	int32_t r0_cali_q24[SP_V2_NUM_MAX_SPKR];
+	int16_t	t0_cali_q6[SP_V2_NUM_MAX_SPKR];
+	uint32_t quick_calib_flag;
 } __packed;
 
 #define AFE_PARAM_ID_CALIB_RES_CFG 0x0001022B
+#define AFE_PARAM_ID_CALIB_RES_CFG_V2 0x0001026E
 
 struct asm_calib_res_cfg {
 	uint32_t minor_version;
-	int32_t	r0_cali_q24;
+	int32_t	r0_cali_q24[SP_V2_NUM_MAX_SPKR];
 	uint32_t th_vi_ca_state;
 } __packed;
 
 #define AFE_PARAM_ID_FEEDBACK_PATH_CFG 0x0001022C
+#define AFE_MODULE_FEEDBACK 0x00010257
 
 struct asm_feedback_path_cfg {
 	uint32_t minor_version;
@@ -6721,6 +7308,7 @@ struct afe_spkr_prot_config_command {
 } __packed;
 
 struct afe_spkr_prot_get_vi_calib {
+	struct apr_hdr hdr;
 	struct afe_port_cmd_get_param_v2 get_param;
 	struct afe_port_param_data_v2 pdata;
 	struct asm_calib_res_cfg res_cfg;
@@ -6743,18 +7331,19 @@ struct afe_spkr_prot_calib_get_resp {
 #define SRS_TRUMEDIA_PARAMS_WOWHD			0x10005012
 #define SRS_TRUMEDIA_PARAMS_CSHP			0x10005013
 #define SRS_TRUMEDIA_PARAMS_HPF				0x10005014
-#define SRS_TRUMEDIA_PARAMS_PEQ				0x10005015
+#define SRS_TRUMEDIA_PARAMS_AEQ				0x10005015
 #define SRS_TRUMEDIA_PARAMS_HL				0x10005016
+#define SRS_TRUMEDIA_PARAMS_GEQ				0x10005017
 
 #define SRS_ID_GLOBAL	0x00000001
 #define SRS_ID_WOWHD	0x00000002
 #define SRS_ID_CSHP	0x00000003
 #define SRS_ID_HPF	0x00000004
-#define SRS_ID_PEQ	0x00000005
-#define SRS_ID_HL	0x00000006
+#define SRS_ID_AEQ	0x00000005
+#define SRS_ID_HL		0x00000006
+#define SRS_ID_GEQ	0x00000007
 
 #define SRS_CMD_UPLOAD		0x7FFF0000
-#define SRS_PARAM_INDEX_MASK	0x80000000
 #define SRS_PARAM_OFFSET_MASK	0x3FFF0000
 #define SRS_PARAM_VALUE_MASK	0x0000FFFF
 
@@ -6767,6 +7356,7 @@ struct srs_trumedia_params_GLOBAL {
 	uint8_t                  v6;
 	uint8_t                  v7;
 	uint8_t                  v8;
+	uint16_t                 v9;
 } __packed;
 
 struct srs_trumedia_params_WOWHD {
@@ -6783,58 +7373,88 @@ struct srs_trumedia_params_WOWHD {
 	uint16_t				v10;
 	uint16_t				v11;
 	uint32_t				v12[16];
+	uint32_t	v13[16];
+	uint32_t	v14[16];
+	uint32_t	v15[16];
+	uint32_t	v16;
+	uint16_t	v17;
+	uint16_t	v18;
 } __packed;
 
 struct srs_trumedia_params_CSHP {
-	uint32_t				v1;
-	uint16_t				v2;
-	uint16_t				v3;
-	uint16_t				v4;
-	uint16_t				v5;
-	uint16_t				v6;
-	uint16_t				v____A1;
-	uint32_t				v7;
-	uint16_t				v8;
-	uint16_t				v9;
-	uint32_t				v10[16];
+	uint32_t		v1;
+	uint16_t		v2;
+	uint16_t		v3;
+	uint16_t		v4;
+	uint16_t		v5;
+	uint16_t		v6;
+	uint16_t		v____A1;
+	uint32_t		v7;
+	uint16_t		v8;
+	uint16_t		v9;
+	uint32_t		v10[16];
 } __packed;
 
 struct srs_trumedia_params_HPF {
-	uint32_t				v1;
-	uint32_t				v2[26];
+	uint32_t		v1;
+	uint32_t		v2[26];
 } __packed;
 
-struct srs_trumedia_params_PEQ {
-	uint32_t				v1;
-	uint16_t				v2;
-	uint16_t				v3;
-	uint16_t				v4;
-	uint16_t				v____A1;
-	uint32_t				v5[26];
-	uint32_t				v6[26];
+struct srs_trumedia_params_AEQ {
+	uint32_t		v1;
+	uint16_t		v2;
+	uint16_t		v3;
+	uint16_t		v4;
+	uint16_t		v____A1;
+	uint32_t	v5[74];
+	uint32_t	v6[74];
+	uint16_t	v7[2048];
 } __packed;
 
 struct srs_trumedia_params_HL {
-	uint16_t				v1;
-	uint16_t				v2;
-	uint16_t				v3;
-	uint16_t				v____A1;
-	int32_t					v4;
-	uint32_t				v5;
-	uint16_t				v6;
-	uint16_t				v____A2;
-	uint32_t				v7;
+	uint16_t		v1;
+	uint16_t		v2;
+	uint16_t		v3;
+	uint16_t		v____A1;
+	int32_t			v4;
+	uint32_t		v5;
+	uint16_t		v6;
+	uint16_t		v____A2;
+	uint32_t		v7;
 } __packed;
 
+struct srs_trumedia_params_GEQ {
+	int16_t		v1[10];
+} __packed;
 struct srs_trumedia_params {
 	struct srs_trumedia_params_GLOBAL	global;
 	struct srs_trumedia_params_WOWHD	wowhd;
 	struct srs_trumedia_params_CSHP		cshp;
 	struct srs_trumedia_params_HPF		hpf;
-	struct srs_trumedia_params_PEQ		peq;
+	struct srs_trumedia_params_AEQ		aeq;
 	struct srs_trumedia_params_HL		hl;
+	struct srs_trumedia_params_GEQ		geq;
 } __packed;
 /* SRS TruMedia end */
+
+#define AUDPROC_PARAM_ID_ENABLE		0x00010904
+#define ASM_STREAM_POSTPROC_TOPO_ID_SA_PLUS 0x1000FFFF
+/* DTS Eagle */
+#define AUDPROC_MODULE_ID_DTS_HPX_PREMIX 0x0001077C
+#define AUDPROC_MODULE_ID_DTS_HPX_POSTMIX 0x0001077B
+#define ASM_STREAM_POSTPROC_TOPO_ID_DTS_HPX 0x00010DED
+#define ASM_STREAM_POSTPROC_TOPO_ID_HPX_PLUS  0x10015000
+#define ASM_STREAM_POSTPROC_TOPO_ID_HPX_MASTER  0x10015001
+struct asm_dts_eagle_param {
+	struct apr_hdr	hdr;
+	struct asm_stream_cmd_set_pp_params_v2 param;
+	struct asm_stream_param_data_v2 data;
+} __packed;
+
+struct asm_dts_eagle_param_get {
+	struct apr_hdr	hdr;
+	struct asm_stream_cmd_get_pp_params_v2 param;
+} __packed;
 
 /* LSM Specific */
 #define VW_FEAT_DIM					(39)
@@ -6849,22 +7469,32 @@ struct srs_trumedia_params {
 #define LSM_SESSION_CMD_OPEN_TX				(0x00012A82)
 #define LSM_SESSION_CMD_CLOSE_TX			(0x00012A88)
 #define LSM_SESSION_CMD_SET_PARAMS			(0x00012A83)
+#define LSM_SESSION_CMD_SET_PARAMS_V2			(0x00012A8F)
 #define LSM_SESSION_CMD_REGISTER_SOUND_MODEL		(0x00012A84)
 #define LSM_SESSION_CMD_DEREGISTER_SOUND_MODEL		(0x00012A85)
 #define LSM_SESSION_CMD_START				(0x00012A86)
 #define LSM_SESSION_CMD_STOP				(0x00012A87)
+#define LSM_SESSION_CMD_EOB				(0x00012A89)
+#define LSM_SESSION_CMD_READ				(0x00012A8A)
+#define LSM_SESSION_CMD_OPEN_TX_V2			(0x00012A8B)
+#define LSM_CMD_ADD_TOPOLOGIES				(0x00012A8C)
 
 #define LSM_SESSION_EVENT_DETECTION_STATUS		(0x00012B00)
+#define LSM_SESSION_EVENT_DETECTION_STATUS_V2		(0x00012B01)
+#define LSM_DATA_EVENT_READ_DONE			(0x00012B02)
+#define LSM_DATA_EVENT_STATUS				(0x00012B03)
 
 #define LSM_MODULE_ID_VOICE_WAKEUP			(0x00012C00)
 #define LSM_PARAM_ID_ENDPOINT_DETECT_THRESHOLD		(0x00012C01)
 #define LSM_PARAM_ID_OPERATION_MODE			(0x00012C02)
 #define LSM_PARAM_ID_GAIN				(0x00012C03)
 #define LSM_PARAM_ID_CONNECT_TO_PORT			(0x00012C04)
-#define LSM_PARAM_ID_KEYWORD_DETECT_SENSITIVITY		(0x00012C05)
-#define LSM_PARAM_ID_USER_DETECT_SENSITIVITY		(0x00012C06)
 #define LSM_PARAM_ID_FEATURE_COMPENSATION_DATA		(0x00012C07)
-
+#define LSM_PARAM_ID_MIN_CONFIDENCE_LEVELS		(0x00012C07)
+#define LSM_MODULE_ID_LAB				(0x00012C08)
+#define LSM_PARAM_ID_LAB_ENABLE				(0x00012C09)
+#define LSM_PARAM_ID_LAB_CONFIG				(0x00012C0A)
+#define LSM_MODULE_ID_FRAMEWORK				(0x00012C0E)
 
 /* HW MAD specific */
 #define AFE_MODULE_HW_MAD				(0x00010230)
@@ -6883,6 +7513,7 @@ struct srs_trumedia_params {
 #define AFE_PARAM_ID_CDC_SLIMBUS_SLAVE_CFG		(0x00010235)
 #define AFE_PARAM_ID_CDC_REG_CFG			(0x00010236)
 #define AFE_PARAM_ID_CDC_REG_CFG_INIT			(0x00010237)
+#define AFE_PARAM_ID_CDC_REG_PAGE_CFG                   (0x00010296)
 
 #define AFE_MAX_CDC_REGISTERS_TO_CONFIG			(20)
 
@@ -6991,9 +7622,11 @@ struct afe_param_id_clip_bank_sel {
 /* Operation needs more data or resources. */
 #define ADSP_ENEEDMORE    0x00000012
 /* Operation does not have memory. */
-#define ADSP_ENOMEMORY     0x00000014
+#define ADSP_ENOMEMORY    0x00000014
 /* Item does not exist. */
-#define ADSP_ENOTEXIST      0x00000015
+#define ADSP_ENOTEXIST    0x00000015
+/* Max count for adsp error code sent to HLOS*/
+#define ADSP_ERR_MAX      (ADSP_ENOTEXIST + 1)
 /* Operation is finished. */
 #define ADSP_ETERMINATED    0x00011174
 
@@ -7003,6 +7636,7 @@ struct afe_param_id_clip_bank_sel {
 
 /* Supported OSR clock values */
 #define Q6AFE_LPASS_OSR_CLK_12_P288_MHZ		0xBB8000
+#define Q6AFE_LPASS_OSR_CLK_9_P600_MHZ		0x927C00
 #define Q6AFE_LPASS_OSR_CLK_8_P192_MHZ		0x7D0000
 #define Q6AFE_LPASS_OSR_CLK_6_P144_MHZ		0x5DC000
 #define Q6AFE_LPASS_OSR_CLK_4_P096_MHZ		0x3E8000
@@ -7024,6 +7658,7 @@ struct afe_param_id_clip_bank_sel {
 #define Q6AFE_LPASS_IBIT_CLK_1_P024_MHZ		 0xFA000
 #define Q6AFE_LPASS_IBIT_CLK_768_KHZ		 0xBB800
 #define Q6AFE_LPASS_IBIT_CLK_512_KHZ		 0x7D000
+#define Q6AFE_LPASS_IBIT_CLK_256_KHZ		 0x3E800
 #define Q6AFE_LPASS_IBIT_CLK_DISABLE		     0x0
 
 /* Supported LPASS CLK sources */
@@ -7039,6 +7674,154 @@ enum afe_lpass_clk_mode {
 	Q6AFE_LPASS_MODE_CLK2_VALID,
 	Q6AFE_LPASS_MODE_BOTH_VALID,
 } __packed;
+
+/* Clock ID Enumeration Define. */
+/* Clock ID for Primary I2S IBIT */
+#define Q6AFE_LPASS_CLK_ID_PRI_MI2S_IBIT                          0x100
+/* Clock ID for Primary I2S EBIT */
+#define Q6AFE_LPASS_CLK_ID_PRI_MI2S_EBIT                          0x101
+/* Clock ID for Secondary I2S IBIT */
+#define Q6AFE_LPASS_CLK_ID_SEC_MI2S_IBIT                          0x102
+/* Clock ID for Secondary I2S EBIT */
+#define Q6AFE_LPASS_CLK_ID_SEC_MI2S_EBIT                          0x103
+/* Clock ID for Tertiary I2S IBIT */
+#define Q6AFE_LPASS_CLK_ID_TER_MI2S_IBIT                          0x104
+/* Clock ID for Tertiary I2S EBIT */
+#define Q6AFE_LPASS_CLK_ID_TER_MI2S_EBIT                          0x105
+/* Clock ID for Quartnery I2S IBIT */
+#define Q6AFE_LPASS_CLK_ID_QUAD_MI2S_IBIT                         0x106
+/* Clock ID for Quartnery I2S EBIT */
+#define Q6AFE_LPASS_CLK_ID_QUAD_MI2S_EBIT                         0x107
+/* Clock ID for Speaker I2S IBIT */
+#define Q6AFE_LPASS_CLK_ID_SPEAKER_I2S_IBIT                       0x108
+/* Clock ID for Speaker I2S EBIT */
+#define Q6AFE_LPASS_CLK_ID_SPEAKER_I2S_EBIT                       0x109
+/* Clock ID for Speaker I2S OSR */
+#define Q6AFE_LPASS_CLK_ID_SPEAKER_I2S_OSR                        0x10A
+
+/* Clock ID for QUINARY  I2S IBIT */
+#define Q6AFE_LPASS_CLK_ID_QUI_MI2S_IBIT			0x10B
+/* Clock ID for QUINARY  I2S EBIT */
+#define Q6AFE_LPASS_CLK_ID_QUI_MI2S_EBIT			0x10C
+/* Clock ID for SENARY  I2S IBIT */
+#define Q6AFE_LPASS_CLK_ID_SEN_MI2S_IBIT			0x10D
+/* Clock ID for SENARY  I2S EBIT */
+#define Q6AFE_LPASS_CLK_ID_SEN_MI2S_EBIT			0x10E
+
+/* Clock ID for Primary PCM IBIT */
+#define Q6AFE_LPASS_CLK_ID_PRI_PCM_IBIT                           0x200
+/* Clock ID for Primary PCM EBIT */
+#define Q6AFE_LPASS_CLK_ID_PRI_PCM_EBIT                           0x201
+/* Clock ID for Secondary PCM IBIT */
+#define Q6AFE_LPASS_CLK_ID_SEC_PCM_IBIT                           0x202
+/* Clock ID for Secondary PCM EBIT */
+#define Q6AFE_LPASS_CLK_ID_SEC_PCM_EBIT                           0x203
+/* Clock ID for Tertiary PCM IBIT */
+#define Q6AFE_LPASS_CLK_ID_TER_PCM_IBIT                           0x204
+/* Clock ID for Tertiary PCM EBIT */
+#define Q6AFE_LPASS_CLK_ID_TER_PCM_EBIT                           0x205
+/* Clock ID for Quartery PCM IBIT */
+#define Q6AFE_LPASS_CLK_ID_QUAD_PCM_IBIT                          0x206
+/* Clock ID for Quartery PCM EBIT */
+#define Q6AFE_LPASS_CLK_ID_QUAD_PCM_EBIT                          0x207
+
+/** Clock ID for Primary TDM IBIT */
+#define Q6AFE_LPASS_CLK_ID_PRI_TDM_IBIT                           0x200
+/** Clock ID for Primary TDM EBIT */
+#define Q6AFE_LPASS_CLK_ID_PRI_TDM_EBIT                           0x201
+/** Clock ID for Secondary TDM IBIT */
+#define Q6AFE_LPASS_CLK_ID_SEC_TDM_IBIT                           0x202
+/** Clock ID for Secondary TDM EBIT */
+#define Q6AFE_LPASS_CLK_ID_SEC_TDM_EBIT                           0x203
+/** Clock ID for Tertiary TDM IBIT */
+#define Q6AFE_LPASS_CLK_ID_TER_TDM_IBIT                           0x204
+/** Clock ID for Tertiary TDM EBIT */
+#define Q6AFE_LPASS_CLK_ID_TER_TDM_EBIT                           0x205
+/** Clock ID for Quartery TDM IBIT */
+#define Q6AFE_LPASS_CLK_ID_QUAD_TDM_IBIT                          0x206
+/** Clock ID for Quartery TDM EBIT */
+#define Q6AFE_LPASS_CLK_ID_QUAD_TDM_EBIT                          0x207
+
+/* Clock ID for MCLK1 */
+#define Q6AFE_LPASS_CLK_ID_MCLK_1                                 0x300
+/* Clock ID for MCLK2 */
+#define Q6AFE_LPASS_CLK_ID_MCLK_2                                 0x301
+/* Clock ID for MCLK3 */
+#define Q6AFE_LPASS_CLK_ID_MCLK_3                                 0x302
+/* Clock ID for Internal Digital Codec Core */
+#define Q6AFE_LPASS_CLK_ID_INTERNAL_DIGITAL_CODEC_CORE            0x303
+
+/* Clock ID for AHB HDMI input */
+#define Q6AFE_LPASS_CLK_ID_AHB_HDMI_INPUT                         0x400
+
+/* Clock ID for SPDIF core */
+#define Q6AFE_LPASS_CLK_ID_SPDIF_CORE                             0x500
+
+
+/* Clock attribute for invalid use (reserved for internal usage) */
+#define Q6AFE_LPASS_CLK_ATTRIBUTE_INVALID		0x0
+/* Clock attribute for no couple case */
+#define Q6AFE_LPASS_CLK_ATTRIBUTE_COUPLE_NO		0x1
+/* Clock attribute for dividend couple case */
+#define Q6AFE_LPASS_CLK_ATTRIBUTE_COUPLE_DIVIDEND	0x2
+/* Clock attribute for divisor couple case */
+#define Q6AFE_LPASS_CLK_ATTRIBUTE_COUPLE_DIVISOR	0x3
+/* Clock attribute for invert and no couple case */
+#define Q6AFE_LPASS_CLK_ATTRIBUTE_INVERT_COUPLE_NO	0x4
+/* Clock set API version */
+#define Q6AFE_LPASS_CLK_CONFIG_API_VERSION		0x1
+
+struct afe_clk_set {
+	/*
+	 * Minor version used for tracking clock set.
+	 *	@values #AFE_API_VERSION_CLOCK_SET
+	 */
+	uint32_t clk_set_minor_version;
+
+	/*
+	 * Clock ID
+	 *	@values
+	 *	- 0x100 to 0x10A - MSM8996
+	 *	- 0x200 to 0x207 - MSM8996
+	 *	- 0x300 to 0x302 - MSM8996 @tablebulletend
+	 */
+	uint32_t clk_id;
+
+	/*
+	 * Clock frequency  (in Hertz) to be set.
+	 *	@values
+	 *	- >= 0 for clock frequency to set @tablebulletend
+	 */
+	uint32_t clk_freq_in_hz;
+
+	/* Use to specific divider for two clocks if needed.
+	 *	Set to Q6AFE_LPASS_CLK_ATTRIBUTE_COUPLE_NO for no divider
+	 *	relation clocks
+	 *	@values
+	 *	- #Q6AFE_LPASS_CLK_ATTRIBUTE_COUPLE_NO
+	 *	- #Q6AFE_LPASS_CLK_ATTRIBUTE_COUPLE_DIVIDEND
+	 *	- #Q6AFE_LPASS_CLK_ATTRIBUTE_COUPLE_DIVISOR @tablebulletend
+	 */
+	uint16_t clk_attri;
+
+	/*
+	 * Specifies the root clock source.
+	 *	Currently, only Q6AFE_LPASS_CLK_ROOT_DEFAULT is valid
+	 *	@values
+	 *	- 0 @tablebulletend
+	 */
+	uint16_t clk_root;
+
+	/*
+	 * for enable and disable clock.
+	 *	"clk_freq_in_hz", "clk_attri", and "clk_root"
+	 *	are ignored in disable clock case.
+	 *	@values
+	 *	- 0 -- Disabled
+	 *	- 1 -- Enabled  @tablebulletend
+	 */
+	uint32_t enable;
+};
 
 struct afe_clk_cfg {
 /* Minor version used for tracking the version of the I2S
@@ -7077,7 +7860,8 @@ struct afe_clk_cfg {
 
 /* This param id is used to configure I2S clk */
 #define AFE_PARAM_ID_LPAIF_CLK_CONFIG	0x00010238
-
+#define AFE_MODULE_CLOCK_SET		0x0001028F
+#define AFE_PARAM_ID_CLOCK_SET		0x00010290
 
 struct afe_lpass_clk_config_command {
 	struct apr_hdr			 hdr;
@@ -7185,6 +7969,7 @@ enum afe_config_type {
 	AFE_AANC_VERSION,
 	AFE_CDC_CLIP_REGISTERS_CONFIG,
 	AFE_CLIP_BANK_SEL,
+	AFE_CDC_REGISTER_PAGE_CONFIG,
 	AFE_MAX_CONFIG_TYPES,
 };
 
@@ -7216,6 +8001,21 @@ struct afe_param_cdc_reg_cfg {
 	uint16_t reg_offset_scale;
 } __packed;
 
+#define AFE_API_VERSION_CDC_REG_PAGE_CFG   1
+
+enum {
+	AFE_CDC_REG_PAGE_ASSIGN_PROC_ID_0 = 0,
+	AFE_CDC_REG_PAGE_ASSIGN_PROC_ID_1,
+	AFE_CDC_REG_PAGE_ASSIGN_PROC_ID_2,
+	AFE_CDC_REG_PAGE_ASSIGN_PROC_ID_3,
+};
+
+struct afe_param_cdc_reg_page_cfg {
+	uint32_t minor_version;
+	uint32_t enable;
+	uint32_t proc_id;
+} __packed;
+
 struct afe_param_cdc_reg_cfg_data {
 	uint32_t num_registers;
 	struct afe_param_cdc_reg_cfg *reg_data;
@@ -7226,6 +8026,13 @@ struct afe_svc_cmd_set_param {
 	uint32_t payload_address_lsw;
 	uint32_t payload_address_msw;
 	uint32_t mem_map_handle;
+} __packed;
+
+struct afe_svc_param_data {
+	uint32_t module_id;
+	uint32_t param_id;
+	uint16_t param_size;
+	uint16_t reserved;
 } __packed;
 
 struct afe_param_hw_mad_ctrl {
@@ -7259,6 +8066,13 @@ struct afe_param_cdc_reg_cfg_payload {
 	struct afe_param_cdc_reg_cfg  reg_cfg;
 } __packed;
 
+struct afe_lpass_clk_config_command_v2 {
+	struct apr_hdr			hdr;
+	struct afe_svc_cmd_set_param	param;
+	struct afe_svc_param_data	pdata;
+	struct afe_clk_set		clk_cfg;
+} __packed;
+
 /*
  * reg_data's size can be up to AFE_MAX_CDC_REGISTERS_TO_CONFIG
  */
@@ -7279,6 +8093,13 @@ struct afe_svc_cmd_sb_slave_cfg {
 	struct afe_svc_cmd_set_param param;
 	struct afe_port_param_data_v2 pdata;
 	struct afe_param_cdc_slimbus_slave_cfg sb_slave_cfg;
+} __packed;
+
+struct afe_svc_cmd_cdc_reg_page_cfg {
+	struct apr_hdr hdr;
+	struct afe_svc_cmd_set_param param;
+	struct afe_port_param_data_v2 pdata;
+	struct afe_param_cdc_reg_page_cfg cdc_reg_page_cfg;
 } __packed;
 
 struct afe_svc_cmd_cdc_aanc_version {
@@ -7305,6 +8126,7 @@ struct afe_port_cmd_set_aanc_acdb_table {
 
 /* Dolby DAP topology */
 #define DOLBY_ADM_COPP_TOPOLOGY_ID	0x0001033B
+#define DS2_ADM_COPP_TOPOLOGY_ID	0x1301033B
 
 /* RMS value from DSP */
 #define RMS_MODULEID_APPI_PASSTHRU  0x10009011
@@ -7332,8 +8154,363 @@ struct afe_svc_cmd_set_clip_bank_selection {
 /* Ultrasound supported formats */
 #define US_POINT_EPOS_FORMAT_V2 0x0001272D
 #define US_RAW_FORMAT_V2        0x0001272C
-#define US_PROX_FORMAT_V2       0x0001272E
+#define US_PROX_FORMAT_V4       0x0001273B
 #define US_RAW_SYNC_FORMAT      0x0001272F
 #define US_GES_SYNC_FORMAT      0x00012730
 
+#define AFE_MODULE_GROUP_DEVICE	0x00010254
+#define AFE_PARAM_ID_GROUP_DEVICE_CFG	0x00010255
+#define AFE_PARAM_ID_GROUP_DEVICE_ENABLE 0x00010256
+#define AFE_GROUP_DEVICE_ID_SECONDARY_MI2S_RX	0x1102
+
+/*  Payload of the #AFE_PARAM_ID_GROUP_DEVICE_CFG
+ * parameter, which configures max of 8 AFE ports
+ * into a group.
+ * The fixed size of this structure is sixteen bytes.
+ */
+struct afe_group_device_group_cfg {
+	u32 minor_version;
+	u16 group_id;
+	u16 num_channels;
+	u16 port_id[8];
+} __packed;
+
+
+/*  Payload of the #AFE_PARAM_ID_GROUP_DEVICE_ENABLE
+ * parameter, which enables or
+ * disables any module.
+ * The fixed size of this structure is four bytes.
+ */
+
+struct afe_group_device_enable {
+	u16 group_id;
+	/* valid value is AFE_GROUP_DEVICE_ID_SECONDARY_MI2S_RX */
+	u16 enable;
+/* Enables (1) or disables (0) the module. */
+} __packed;
+
+struct afe_port_group_create {
+	struct apr_hdr hdr;
+	struct afe_svc_cmd_set_param param;
+	struct afe_port_param_data_v2 pdata;
+	union {
+		struct afe_group_device_group_cfg group_cfg;
+		struct afe_group_device_enable group_enable;
+	} __packed data;
+} __packed;
+
+/* Command for Matrix or Stream Router */
+#define ASM_SESSION_CMD_SET_MTMX_STRTR_PARAMS_V2    0x00010DCE
+/* Module for AVSYNC */
+#define ASM_SESSION_MTMX_STRTR_MODULE_ID_AVSYNC    0x00010DC6
+
+/* Parameter used by #ASM_SESSION_MTMX_STRTR_MODULE_ID_AVSYNC to specify the
+ * render window start value. This parameter is supported only for a Set
+ * command (not a Get command) in the Rx direction
+ * (#ASM_SESSION_CMD_SET_MTMX_STRTR_PARAMS_V2).
+ * Render window start is a value (session time minus timestamp, or ST-TS)
+ * below which frames are held, and after which frames are immediately
+ * rendered.
+ */
+#define ASM_SESSION_MTMX_STRTR_PARAM_RENDER_WINDOW_START_V2 0x00010DD1
+
+/* Parameter used by #ASM_SESSION_MTMX_STRTR_MODULE_ID_AVSYNC to specify the
+ * render window end value. This parameter is supported only for a Set
+ * command (not a Get command) in the Rx direction
+ * (#ASM_SESSION_CMD_SET_MTMX_STRTR_PARAMS_V2). Render window end is a value
+ * (session time minus timestamp) above which frames are dropped, and below
+ * which frames are immediately rendered.
+ */
+#define ASM_SESSION_MTMX_STRTR_PARAM_RENDER_WINDOW_END_V2   0x00010DD2
+
+/* Generic payload of the window parameters in the
+ * #ASM_SESSION_MTMX_STRTR_MODULE_ID_AVSYNC module.
+ * This payload is supported only for a Set command
+ * (not a Get command) on the Rx path.
+ */
+struct asm_session_mtmx_strtr_param_window_v2_t {
+	u32    window_lsw;
+	/* Lower 32 bits of the render window start value. */
+
+	u32    window_msw;
+	/* Upper 32 bits of the render window start value.
+
+	 * The 64-bit number formed by window_lsw and window_msw specifies a
+	 * signed 64-bit window value in microseconds. The sign extension is
+	 * necessary. This value is used by the following parameter IDs:
+	 * #ASM_SESSION_MTMX_STRTR_PARAM_RENDER_WINDOW_START_V2
+	 * #ASM_SESSION_MTMX_STRTR_PARAM_RENDER_WINDOW_END_V2
+	 * #ASM_SESSION_MTMX_STRTR_PARAM_STAT_WINDOW_START_V2
+	 * #ASM_SESSION_MTMX_STRTR_PARAM_STAT_WINDOW_END_V2
+	 * The value depends on which parameter ID is used.
+	 * The aDSP honors the windows at a granularity of 1 ms.
+	 */
+};
+
+struct asm_session_cmd_set_mtmx_strstr_params_v2 {
+	uint32_t                  data_payload_addr_lsw;
+	/* Lower 32 bits of the 64-bit data payload address. */
+
+	uint32_t                  data_payload_addr_msw;
+	/* Upper 32 bits of the 64-bit data payload address.
+	 * If the address is not sent (NULL), the message is in the payload.
+	 * If the address is sent (non-NULL), the parameter data payloads
+	 * begin at the specified address.
+	 */
+
+	uint32_t                  mem_map_handle;
+	/* Unique identifier for an address. This memory map handle is returned
+	 * by the aDSP through the #ASM_CMD_SHARED_MEM_MAP_REGIONS command.
+	 * values
+	 * - NULL -- Parameter data payloads are within the message payload
+	 * (in-band).
+	 * - Non-NULL -- Parameter data payloads begin at the address specified
+	 * in the data_payload_addr_lsw and data_payload_addr_msw fields
+	 * (out-of-band).
+	 */
+
+	uint32_t                  data_payload_size;
+	/* Actual size of the variable payload accompanying the message, or in
+	 * shared memory. This field is used for parsing the parameter payload.
+	 * values > 0 bytes
+	 */
+
+	uint32_t                  direction;
+	/* Direction of the entity (matrix mixer or stream router) on which
+	 * the parameter is to be set.
+	 * values
+	 * - 0 -- Rx (for Rx stream router or Rx matrix mixer)
+	 * - 1 -- Tx (for Tx stream router or Tx matrix mixer)
+	 */
+};
+
+struct asm_mtmx_strtr_params {
+	struct apr_hdr  hdr;
+	struct asm_session_cmd_set_mtmx_strstr_params_v2 param;
+	struct asm_stream_param_data_v2 data;
+	u32 window_lsw;
+	u32 window_msw;
+} __packed;
+
+
+
+/* Command for Matrix or Stream Router */
+#define ASM_SESSION_CMD_SET_MTMX_STRTR_PARAMS_V2    0x00010DCE
+/* Module for AVSYNC */
+#define ASM_SESSION_MTMX_STRTR_MODULE_ID_AVSYNC    0x00010DC6
+
+/* Parameter used by #ASM_SESSION_MTMX_STRTR_MODULE_ID_AVSYNC to specify the
+ * render window start value. This parameter is supported only for a Set
+ * command (not a Get command) in the Rx direction
+ * (#ASM_SESSION_CMD_SET_MTMX_STRTR_PARAMS_V2).
+ * Render window start is a value (session time minus timestamp, or ST-TS)
+ * below which frames are held, and after which frames are immediately
+ * rendered.
+ */
+#define ASM_SESSION_MTMX_STRTR_PARAM_RENDER_WINDOW_START_V2 0x00010DD1
+
+/* Parameter used by #ASM_SESSION_MTMX_STRTR_MODULE_ID_AVSYNC to specify the
+ * render window end value. This parameter is supported only for a Set
+ * command (not a Get command) in the Rx direction
+ * (#ASM_SESSION_CMD_SET_MTMX_STRTR_PARAMS_V2). Render window end is a value
+ * (session time minus timestamp) above which frames are dropped, and below
+ * which frames are immediately rendered.
+ */
+#define ASM_SESSION_MTMX_STRTR_PARAM_RENDER_WINDOW_END_V2   0x00010DD2
+
+/* Generic payload of the window parameters in the
+ * #ASM_SESSION_MTMX_STRTR_MODULE_ID_AVSYNC module.
+ * This payload is supported only for a Set command
+ * (not a Get command) on the Rx path.
+ */
+
+#define ASM_SESSION_CMD_GET_MTMX_STRTR_PARAMS_V2 0x00010DCF
+#define ASM_SESSION_CMDRSP_GET_MTMX_STRTR_PARAMS_V2 0x00010DD0
+
+#define ASM_SESSION_MTMX_STRTR_PARAM_SESSION_TIME_V3 0x00012F0B
+#define ASM_SESSION_MTMX_STRTR_PARAM_STIME_TSTMP_FLG_BMASK (0x80000000UL)
+
+struct asm_session_cmd_get_mtmx_strstr_params_v2 {
+	uint32_t                  data_payload_addr_lsw;
+	/* Lower 32 bits of the 64-bit data payload address. */
+
+	uint32_t                  data_payload_addr_msw;
+	/*
+	 * Upper 32 bits of the 64-bit data payload address.
+	 * If the address is not sent (NULL), the message is in the payload.
+	 * If the address is sent (non-NULL), the parameter data payloads
+	 * begin at the specified address.
+	 */
+
+	uint32_t                  mem_map_handle;
+	/*
+	 * Unique identifier for an address. This memory map handle is returned
+	 * by the aDSP through the #ASM_CMD_SHARED_MEM_MAP_REGIONS command.
+	 * values
+	 * - NULL -- Parameter data payloads are within the message payload
+	 * (in-band).
+	 * - Non-NULL -- Parameter data payloads begin at the address specified
+	 * in the data_payload_addr_lsw and data_payload_addr_msw fields
+	 * (out-of-band).
+	 */
+	uint32_t                  direction;
+	/*
+	 * Direction of the entity (matrix mixer or stream router) on which
+	 * the parameter is to be set.
+	 * values
+	 * - 0 -- Rx (for Rx stream router or Rx matrix mixer)
+	 * - 1 -- Tx (for Tx stream router or Tx matrix mixer)
+	 */
+	uint32_t                  module_id;
+	/* Unique module ID. */
+
+	uint32_t                  param_id;
+	/* Unique parameter ID. */
+
+	uint32_t                  param_max_size;
+};
+
+struct asm_session_mtmx_strtr_param_session_time_v3_t {
+	uint32_t                  session_time_lsw;
+	/* Lower 32 bits of the current session time in microseconds */
+
+	uint32_t                  session_time_msw;
+	/*
+	 * Upper 32 bits of the current session time in microseconds.
+	 * The 64-bit number formed by session_time_lsw and session_time_msw
+	 * is treated as signed.
+	 */
+
+	uint32_t                  absolute_time_lsw;
+	/*
+	 * Lower 32 bits of the 64-bit absolute time in microseconds.
+	 * This is the time when the sample corresponding to the
+	 * session_time_lsw is rendered to the hardware. This absolute
+	 * time can be slightly in the future or past.
+	 */
+
+	uint32_t                  absolute_time_msw;
+	/*
+	 * Upper 32 bits of the 64-bit absolute time in microseconds.
+	 * This is the time when the sample corresponding to the
+	 * session_time_msw is rendered to hardware. This absolute
+	 * time can be slightly in the future or past. The 64-bit number
+	 * formed by absolute_time_lsw and absolute_time_msw is treated as
+	 * unsigned.
+	 */
+
+	uint32_t                  time_stamp_lsw;
+	/* Lower 32 bits of the last processed timestamp in microseconds */
+
+	uint32_t                  time_stamp_msw;
+	/*
+	 * Upper 32 bits of the last processed timestamp in microseconds.
+	 * The 64-bit number formed by time_stamp_lsw and time_stamp_lsw
+	 * is treated as unsigned.
+	 */
+
+	uint32_t                  flags;
+	/*
+	 * Keeps track of any additional flags needed.
+	 * @values{for bit 31}
+	 * - 0 -- Uninitialized/invalid
+	 * - 1 -- Valid
+	 * All other bits are reserved; clients must set them to zero.
+	 */
+};
+
+union asm_session_mtmx_strtr_data_type {
+	struct asm_session_mtmx_strtr_param_session_time_v3_t session_time;
+};
+
+struct asm_mtmx_strtr_get_params {
+	struct apr_hdr hdr;
+	struct asm_session_cmd_get_mtmx_strstr_params_v2 param_info;
+} __packed;
+
+struct asm_mtmx_strtr_get_params_cmdrsp {
+	uint32_t err_code;
+	struct asm_stream_param_data_v2 param_info;
+	union asm_session_mtmx_strtr_data_type param_data;
+} __packed;
+
+
+
+#define AUDPROC_MODULE_ID_RESAMPLER 0x00010719
+
+enum {
+	LEGACY_PCM = 0,
+	COMPRESSED_PASSTHROUGH,
+	COMPRESSED_PASSTHROUGH_CONVERT,
+};
+
+#define AUDPROC_MODULE_ID_COMPRESSED_MUTE                0x00010770
+#define AUDPROC_PARAM_ID_COMPRESSED_MUTE                 0x00010771
+
+struct adm_set_compressed_device_mute {
+	struct adm_cmd_set_pp_params_v5 command;
+	struct adm_param_data_v5 params;
+	u32    mute_on;
+} __packed;
+
+#define AUDPROC_MODULE_ID_COMPRESSED_LATENCY             0x0001076E
+#define AUDPROC_PARAM_ID_COMPRESSED_LATENCY              0x0001076F
+
+struct adm_set_compressed_device_latency {
+	struct adm_cmd_set_pp_params_v5 command;
+	struct adm_param_data_v5 params;
+	u32    latency;
+} __packed;
+
+#define VOICEPROC_MODULE_ID_GENERIC_TX                      0x00010EF6
+#define VOICEPROC_PARAM_ID_FLUENCE_SOUNDFOCUS               0x00010E37
+#define VOICEPROC_PARAM_ID_FLUENCE_SOURCETRACKING           0x00010E38
+#define MAX_SECTORS                                         8
+#define MAX_NOISE_SOURCE_INDICATORS                         3
+#define MAX_POLAR_ACTIVITY_INDICATORS                       360
+
+struct sound_focus_param {
+	uint16_t start_angle[MAX_SECTORS];
+	uint8_t enable[MAX_SECTORS];
+	uint16_t gain_step;
+} __packed;
+
+struct source_tracking_param {
+	uint8_t vad[MAX_SECTORS];
+	uint16_t doa_speech;
+	uint16_t doa_noise[MAX_NOISE_SOURCE_INDICATORS];
+	uint8_t polar_activity[MAX_POLAR_ACTIVITY_INDICATORS];
+} __packed;
+
+struct adm_param_fluence_soundfocus_t {
+	uint16_t start_angles[MAX_SECTORS];
+	uint8_t enables[MAX_SECTORS];
+	uint16_t gain_step;
+	uint16_t reserved;
+} __packed;
+
+struct adm_set_fluence_soundfocus_param {
+	struct adm_cmd_set_pp_params_v5 params;
+	struct adm_param_data_v5 data;
+	struct adm_param_fluence_soundfocus_t soundfocus_data;
+} __packed;
+
+struct adm_param_fluence_sourcetracking_t {
+	uint8_t vad[MAX_SECTORS];
+	uint16_t doa_speech;
+	uint16_t doa_noise[MAX_NOISE_SOURCE_INDICATORS];
+	uint8_t polar_activity[MAX_POLAR_ACTIVITY_INDICATORS];
+} __packed;
+
+#define AUDPROC_MODULE_ID_AUDIOSPHERE               0x00010916
+#define AUDPROC_PARAM_ID_AUDIOSPHERE_ENABLE         0x00010917
+#define AUDPROC_PARAM_ID_AUDIOSPHERE_STRENGTH       0x00010918
+#define AUDPROC_PARAM_ID_AUDIOSPHERE_CONFIG_MODE    0x00010919
+
+#define AUDPROC_PARAM_ID_AUDIOSPHERE_COEFFS_STEREO_INPUT         0x0001091A
+#define AUDPROC_PARAM_ID_AUDIOSPHERE_COEFFS_MULTICHANNEL_INPUT   0x0001091B
+#define AUDPROC_PARAM_ID_AUDIOSPHERE_DESIGN_STEREO_INPUT         0x0001091C
+#define AUDPROC_PARAM_ID_AUDIOSPHERE_DESIGN_MULTICHANNEL_INPUT   0x0001091D
+
+#define AUDPROC_PARAM_ID_AUDIOSPHERE_OPERATING_INPUT_MEDIA_INFO  0x0001091E
 #endif /*_APR_AUDIO_V2_H_ */

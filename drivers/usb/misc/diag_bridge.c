@@ -25,7 +25,7 @@
 #include <linux/uaccess.h>
 #include <linux/usb.h>
 #include <linux/debugfs.h>
-#include <mach/diag_bridge.h>
+#include <linux/usb/diag_bridge.h>
 
 #define DRIVER_DESC	"USB host diag bridge driver"
 #define DRIVER_VERSION	"1.0"
@@ -603,8 +603,15 @@ static const struct usb_device_id diag_bridge_ids[] = {
 	/* 909E, ifc#1 refers to diag client interface */
 	{ USB_DEVICE_INTERFACE_NUMBER(0x5c6, 0x909E, 1),
 	.driver_info =  DEV_ID(1), },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x5c6, 0x909F, 0),
+	.driver_info =	DEV_ID(0), },
 	{ USB_DEVICE_INTERFACE_NUMBER(0x5c6, 0x90A0, 0),
 	.driver_info =  DEV_ID(0), },
+	{ USB_DEVICE_INTERFACE_NUMBER(0x5c6, 0x90A4, 0),
+	.driver_info =	DEV_ID(0), },
+	/* 909E, ifc#1 refers to diag client interface */
+	{ USB_DEVICE_INTERFACE_NUMBER(0x5c6, 0x90A4, 1),
+	.driver_info =	DEV_ID(1), },
 
 	{} /* terminating entry */
 };
@@ -616,6 +623,7 @@ static struct usb_driver diag_bridge_driver = {
 	.disconnect =	diag_bridge_disconnect,
 	.suspend =	diag_bridge_suspend,
 	.resume =	diag_bridge_resume,
+	.reset_resume =	diag_bridge_resume,
 	.id_table =	diag_bridge_ids,
 	.supports_autosuspend = 1,
 };

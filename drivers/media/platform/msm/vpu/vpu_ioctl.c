@@ -19,6 +19,7 @@
 #include "vpu_configuration.h"
 #include "vpu_translate.h"
 #include "vpu_channel.h"
+#include "vpu_ipc.h"
 
 #ifdef CONFIG_MSM_VPU_IN_VCAP
 extern int vpu_init_port_vcap(struct vpu_dev_session *session,
@@ -41,6 +42,9 @@ extern int vpu_init_port_mdss(struct vpu_dev_session *session,
 		    (session)->port_info[port].port_ops.priv) : 0)
 /*
  * Events/Callbacks handling
+ *
+ * Notify events of given type ID.
+ * If data is not null then it points to a payload of predefined size (<=64).
  */
 static void __prepare_v4l2_event(struct v4l2_event *event,
 		u32 type, u8 *data, u32 size)
@@ -54,7 +58,7 @@ static void __prepare_v4l2_event(struct v4l2_event *event,
 		memcpy(event->u.data, data, size);
 }
 
-void notify_vpu_event_client(struct vpu_client *client,
+static void notify_vpu_event_client(struct vpu_client *client,
 		u32 type, u8 *data, u32 size)
 {
 	struct v4l2_event event = {0};
@@ -65,7 +69,7 @@ void notify_vpu_event_client(struct vpu_client *client,
 	v4l2_event_queue_fh(&client->vfh, &event);
 }
 
-void notify_vpu_event_session(struct vpu_dev_session *session,
+static void notify_vpu_event_session(struct vpu_dev_session *session,
 		u32 type, u8 *data, u32 size)
 {
 	struct v4l2_event event = {0};
@@ -76,6 +80,28 @@ void notify_vpu_event_session(struct vpu_dev_session *session,
 	__prepare_v4l2_event(&event, type, data, size);
 	list_for_each_entry_safe(clnt, n,
 				      &session->clients_list, clients_entry)
+		v4l2_event_queue_fh(&clnt->vfh, &event);
+}
+
+static void notify_vpu_event_system(struct vpu_dev_core *core,
+		u32 type, u8 *data, u32 size)
+{
+	struct v4l2_event event = {0};
+	struct vpu_client *clnt, *n;
+	int i;
+	if (!core)
+		return;
+
+	__prepare_v4l2_event(&event, type, data, size);
+
+	for (i = 0; i < VPU_NUM_SESSIONS; i++) {
+		list_for_each_entry_safe(clnt, n,
+				&core->sessions[i]->clients_list, clients_entry)
+			v4l2_event_queue_fh(&clnt->vfh, &event);
+	}
+
+	list_for_each_entry_safe(clnt, n,
+				      &core->unattached_list, clients_entry)
 		v4l2_event_queue_fh(&clnt->vfh, &event);
 }
 
@@ -146,16 +172,23 @@ static void __sys_buffer_callback_handler(u32 sid, struct vpu_buffer *pbuf,
 		return;
 	}
 
-	port = get_port_number(pbuf->vb.vb2_queue->type);
 	session = vb2_get_drv_priv(pbuf->vb.vb2_queue);
+	port = get_queue_port_number(pbuf->vb.vb2_queue);
+	if (port < 0) {
+		pr_warn("Invalid callback buffer queue\n");
+		return;
+	}
 
 	if (data) {
-		pr_debug("ERROR (%d) buffer callback port %d buff %d\n",
-				data, port, pbuf->vb.v4l2_buf.index);
+		pr_debug("%s (%d) buffer callback session %d port %d buff %d\n",
+			data == VPU_STS_EFRAMEUNPROCESSED ?
+					"Unprocessed" : "Error",
+			data, session->id, port, pbuf->vb.v4l2_buf.index);
+
 		vb2_buffer_done(&pbuf->vb, VB2_BUF_STATE_ERROR);
 	} else {
-		pr_debug("GOOD buffer callback for port %d buff %d\n",
-				port, pbuf->vb.v4l2_buf.index);
+		pr_debug("Good buffer callback session %d port %d buff %d\n",
+			session->id, port, pbuf->vb.v4l2_buf.index);
 
 		/* update bytesused */
 		port_info = &session->port_info[port];
@@ -175,47 +208,34 @@ static void __sys_buffer_callback_handler(u32 sid, struct vpu_buffer *pbuf,
  * Dynamic switch (on/off) of VPU hardware on first/last global client.
  * Function must be called with core->lock mutex held.
  */
-static int __dynamic_vpu_hw_switch(struct vpu_dev_core *core, int on)
+static int __vpu_hw_switch(struct vpu_dev_core *core, int on)
 {
 	int ret = 0;
 
 	if (on) {
 		if (core->global_client_count++ == 0) {
 
+			pr_debug("Starting up VPU hardware\n");
 			ret = vpu_hw_sys_start(__sys_event_callback_handler,
 					__sys_buffer_callback_handler,
 					(void *)core);
 			if (ret) {
-				pr_err("failed to start IPC system\n");
+				pr_err("failed to start VPU hardware\n");
 				core->global_client_count--;
-				goto exit_hfi_init;
-			}
-
-			ret = attach_vpu_iommus(&core->resources);
-			if (ret) {
-				pr_err("could not attach VPU IOMMUs\n");
-				core->global_client_count--;
-				goto err_stop_sys;
 			}
 		}
 
 	} else { /* off */
-		if (--core->global_client_count == 0)
-			goto hfi_deinit;
+		if (--core->global_client_count == 0) {
+			pr_debug("Shutting down VPU hardware\n");
+			vpu_hw_sys_stop(0);
+		}
 	}
 
-	goto exit_hfi_init; /* hfi system stays on */
-
-hfi_deinit:
-	pr_debug("Shutting down hfi IPC\n");
-	detach_vpu_iommus(&core->resources);
-err_stop_sys:
-	vpu_hw_sys_stop(0);
-exit_hfi_init:
 	return ret;
 }
 
-static void __vpu_streamoff_port(struct vpu_dev_session *session, int port)
+static void __vpu_streamoff_port(struct vpu_dev_session *session, int port_type)
 {
 	/* Stop end-to-end session streaming on first streamoff */
 	if (session->streaming_state == ALL_STREAMING) {
@@ -224,7 +244,7 @@ static void __vpu_streamoff_port(struct vpu_dev_session *session, int port)
 		pr_debug("Session streaming stopped\n");
 		session->commit_state = 0;
 	}
-	session->streaming_state &= ~(0x1 << port);
+	session->streaming_state &= ~(0x1 << port_type);
 }
 
 static struct vpu_client *__create_client(struct vpu_dev_core *core,
@@ -251,7 +271,7 @@ static struct vpu_client *__create_client(struct vpu_dev_core *core,
 	INIT_LIST_HEAD(&client->clients_entry);
 
 	/* Initialize HFI on first client open */
-	ret = __dynamic_vpu_hw_switch(core, 1);
+	ret = __vpu_hw_switch(core, 1);
 	if (ret) {
 		devm_kfree(core->dev, client);
 		goto err_client_create;
@@ -314,7 +334,7 @@ int vpu_close_client(struct vpu_client *client)
 		vpu_detach_client(client);
 
 	mutex_lock(&client->core->lock);
-	__dynamic_vpu_hw_switch(client->core, 0);
+	__vpu_hw_switch(client->core, 0);
 	list_del_init(&client->clients_entry); /* remove from unattached list */
 	mutex_unlock(&client->core->lock);
 
@@ -324,20 +344,17 @@ int vpu_close_client(struct vpu_client *client)
 	return 0;
 }
 
-int vpu_attach_client(struct vpu_client *client, int session_num)
+static int __vpu_attach_client(struct vpu_client *client,
+		struct vpu_dev_session *session)
 {
 	struct vpu_dev_core *core;
-	struct vpu_dev_session *session;
 	int ret = 0;
-	if (!client || session_num < 0 || session_num >= VPU_NUM_SESSIONS) {
-		pr_err("invalid session attach # %d\n", session_num);
+
+	if (!client)
 		return -EINVAL;
-	}
-
 	core = client->core;
-	session = core->sessions[session_num];
 
-	pr_debug("Attach client %p to session %d\n", client, session_num);
+	pr_debug("Attach client %p to session %d\n", client, session->id);
 
 	if (client->session == session) {
 		return 0; /* client already attached to this session */
@@ -348,8 +365,6 @@ int vpu_attach_client(struct vpu_client *client, int session_num)
 
 	if (session->client_count >= VPU_MAX_CLIENTS_PER_SESSION)
 		return -EBUSY;
-
-	mutex_lock(&session->lock);
 
 	if (session->client_count++ == 0) {
 
@@ -367,15 +382,17 @@ int vpu_attach_client(struct vpu_client *client, int session_num)
 			pr_err("could not open IPC channel\n");
 			goto err_deinit_controller;
 		}
+
+		notify_vpu_event_system(core, VPU_EVENT_SESSION_CREATED,
+				(u8 *)&session->id, sizeof(session->id));
 	}
 
 	/* remove from unattached_list and add to session's clients list */
 	list_del_init(&client->clients_entry);
 	list_add_tail(&client->clients_entry, &session->clients_list);
 	client->session = session;
-	mutex_unlock(&session->lock);
 
-	pr_debug("Attach to session %d successful\n", session_num);
+	pr_debug("Attach to session %d successful\n", session->id);
 	return 0;
 
 err_deinit_controller:
@@ -383,7 +400,87 @@ err_deinit_controller:
 	session->controller = NULL;
 err_dec_count:
 	session->client_count--;
+	return ret;
+}
+
+int vpu_create_session(struct vpu_client *client)
+{
+	struct vpu_dev_core *core;
+	struct vpu_dev_session *session;
+	int ret, i;
+
+	if (!client)
+		return -EINVAL;
+	core = client->core;
+
+	/* find an inactive session */
+	for (i = 0; i < VPU_NUM_SESSIONS; i++) {
+		session = core->sessions[i];
+
+		mutex_lock(&session->lock);
+
+		if (session->client_count > 0) {
+			mutex_unlock(&session->lock);
+		} else {
+			ret = __vpu_attach_client(client, session);
+			if (ret)
+				pr_err("Failed attach, ret = %d\n", ret);
+			else
+				ret = session->id; /* return session number */
+			mutex_unlock(&session->lock);
+
+			return ret;
+		}
+	}
+
+	pr_warn("No idle sessions available\n");
+	return -EBUSY;
+}
+
+int vpu_join_session(struct vpu_client *client, int session_num)
+{
+	struct vpu_dev_core *core;
+	struct vpu_dev_session *session;
+	int ret = -ENODEV;
+
+	if (!client || session_num < 0 || session_num >= VPU_NUM_SESSIONS) {
+		pr_err("invalid session # %d\n", session_num);
+		return -EINVAL;
+	}
+
+	core = client->core;
+	session = core->sessions[session_num];
+
+	mutex_lock(&session->lock);
+
+	if (session->client_count == 0)
+		pr_err("Session %d is not created yet\n", session_num);
+	else
+		ret = __vpu_attach_client(client, session);
+
 	mutex_unlock(&session->lock);
+
+	return ret;
+}
+
+int vpu_attach_session_deprecated(struct vpu_client *client, int session_num)
+{
+	struct vpu_dev_core *core;
+	struct vpu_dev_session *session;
+	int ret;
+
+	if (!client || session_num < 0 || session_num >= VPU_NUM_SESSIONS) {
+		pr_err("invalid session # %d\n", session_num);
+		return -EINVAL;
+	}
+
+	core = client->core;
+	session = core->sessions[session_num];
+
+	mutex_lock(&session->lock);
+	ret = __vpu_attach_client(client, session);
+	mutex_unlock(&session->lock);
+
 	return ret;
 }
 
@@ -413,25 +510,35 @@ void vpu_detach_client(struct vpu_client *client)
 		/* close hw session on last detach */
 		vpu_hw_session_close(session->id);
 
-		/* detach tunneling ports */
-		for (port = 0; port < NUM_VPU_PORTS; ++port)
+		/* ports cleanup */
+		for (port = 0; port < NUM_VPU_PORTS; ++port) {
+			/* detach tunneling ports */
 			call_port_op(session, port, detach);
+
+			memset(&session->port_info[port], 0,
+					sizeof(session->port_info[port]));
+		}
 
 		/* reset session state and configuration data */
 		deinit_vpu_controller(session->controller);
 		session->controller = NULL;
 
-		memset(&session->port_info[INPUT_PORT], 0,
-				sizeof(session->port_info[INPUT_PORT]));
-		memset(&session->port_info[OUTPUT_PORT], 0,
-				sizeof(session->port_info[OUTPUT_PORT]));
-
 		session->streaming_state = 0;
 		session->commit_state = 0;
+		session->dual_output = false;
+
+		notify_vpu_event_system(client->core,
+				VPU_EVENT_SESSION_FREED,
+				(u8 *)&session->id, sizeof(session->id));
 	}
 
 	list_del_init(&client->clients_entry); /* remove from attached list */
 	client->session = NULL;
+
+	/* notify remaining session clients of the new client count */
+	notify_vpu_event_session(session, VPU_EVENT_SESSION_CLIENT_EXITED,
+		(u8 *)&session->client_count, sizeof(session->client_count));
+
 	mutex_unlock(&session->lock);
 
 	/* add back to global unattached list */
@@ -444,8 +551,8 @@ void vpu_detach_client(struct vpu_client *client)
 int vpu_enum_fmt(struct v4l2_fmtdesc *f)
 {
 	const struct vpu_format_desc *fmt;
-	int port = get_port_number(f->type);
-	if (port < 0)
+	int port_type = get_port_type(f->type);
+	if (port_type < 0)
 		return -EINVAL;
 
 	fmt = query_supported_formats(f->index);
@@ -469,21 +576,23 @@ int vpu_get_fmt(struct vpu_client *client, struct v4l2_format *f)
 	if (!session)
 		return -EPERM;
 
-	port = get_port_number(f->type);
+	port = get_port_number(client, f->type);
 	if (port < 0)
 		return -EINVAL;
 
 	if (port == INPUT_PORT) {
-		ret = vpu_hw_session_g_input_params(session->id, &in_param);
+		ret = vpu_hw_session_g_input_params(session->id,
+				translate_port_id(port), &in_param);
 		translate_input_format_to_api(&in_param, f);
 		f->fmt.pix_mp.colorspace =
-			session->port_info[INPUT_PORT].format.colorspace;
+			session->port_info[port].format.colorspace;
 
 	} else {
-		ret = vpu_hw_session_g_output_params(session->id, &out_param);
+		ret = vpu_hw_session_g_output_params(session->id,
+				translate_port_id(port), &out_param);
 		translate_output_format_to_api(&out_param, f);
 		f->fmt.pix_mp.colorspace =
-			session->port_info[OUTPUT_PORT].format.colorspace;
+			session->port_info[port].format.colorspace;
 	}
 
 	return ret;
@@ -539,9 +648,9 @@ int vpu_set_fmt(struct vpu_client *client, struct v4l2_format *f)
 		pr_err("invalid session\n");
 		return -EPERM;
 	}
-	port = get_port_number(f->type);
+	port = get_port_number(client, f->type);
 	if (port < 0) {
-		pr_err("invalid port (%d)\n", port);
+		pr_err("invalid buffer type (%d)\n", f->type);
 		return -EINVAL;
 	}
 
@@ -583,11 +692,16 @@ static int __vpu_get_framerate(struct vpu_client *client, u32 *framerate,
 	struct vpu_dev_session *session = client ? client->session : 0;
 	int ret = 0;
 
+	if (!session)
+		return -EPERM;
+
 	if (port == INPUT_PORT) {
-		ret = vpu_hw_session_g_input_params(session->id, &in_param);
+		ret = vpu_hw_session_g_input_params(session->id,
+				translate_port_id(port), &in_param);
 		*framerate = in_param.frame_rate;
 	} else {
-		ret = vpu_hw_session_g_output_params(session->id, &out_param);
+		ret = vpu_hw_session_g_output_params(session->id,
+				translate_port_id(port), &out_param);
 		*framerate = out_param.frame_rate;
 	}
 
@@ -599,6 +713,9 @@ static int __vpu_set_framerate(struct vpu_client *client, u32 framerate,
 {
 	struct vpu_dev_session *session = client ? client->session : 0;
 	int ret = 0;
+
+	if (!session)
+		return -EPERM;
 
 	mutex_lock(&session->lock);
 	session->port_info[port].framerate = framerate;
@@ -619,16 +736,18 @@ int vpu_get_region_of_intereset(struct vpu_client *client,
 	if (!session)
 		return -EPERM;
 
-	port = get_port_number(crop->type);
+	port = get_port_number(client, crop->type);
 	if (port < 0)
 		return -EINVAL;
 
 	if (port == INPUT_PORT) {
-		ret = vpu_hw_session_g_input_params(session->id, &in_param);
+		ret = vpu_hw_session_g_input_params(session->id,
+				translate_port_id(port), &in_param);
 		translate_roi_rect_to_api(&in_param.region_interest,
 				&crop->c);
 	} else {
-		ret = vpu_hw_session_g_output_params(session->id, &out_param);
+		ret = vpu_hw_session_g_output_params(session->id,
+				translate_port_id(port), &out_param);
 		translate_roi_rect_to_api(&out_param.dest_rect,
 				&crop->c);
 	}
@@ -640,7 +759,9 @@ int vpu_set_region_of_intereset(struct vpu_client *client,
 		const struct v4l2_crop *crop)
 {
 	struct vpu_dev_session *session = client ? client->session : 0;
-	int ret = 0, port = get_port_number(crop->type);
+	int ret = 0, port;
+
+	port = get_port_number(client, crop->type);
 
 	if (!session)
 		return -EPERM;
@@ -674,7 +795,7 @@ int vpu_set_input(struct vpu_client *client, unsigned int i)
 
 	/* Changing input/output only allowed if port is not streaming */
 	mutex_lock(&session->lock);
-	if (session->streaming_state & (0x1 << INPUT_PORT)) {
+	if (session->streaming_state & (0x1 << PORT_TYPE_INPUT)) {
 		ret = -EBUSY;
 		goto exit_s_input;
 	}
@@ -706,44 +827,50 @@ exit_s_input:
 
 int vpu_get_output(struct vpu_client *client, unsigned int *i)
 {
+	int port;
 	if (!client || !client->session)
 		return -EPERM;
-	*i = client->session->port_info[OUTPUT_PORT].destination;
+
+	port = client->uses_output2 ? OUTPUT_PORT2 : OUTPUT_PORT;
+
+	*i = client->session->port_info[port].destination;
 
 	return 0;
 }
 
 int vpu_set_output(struct vpu_client *client, unsigned int i)
 {
-	int ret = 0;
+	int ret = 0, port;
 	struct vpu_dev_session *session = client ? client->session : 0;
 	if (!session)
 		return -EPERM;
 
+	port = client->uses_output2 ? OUTPUT_PORT2 : OUTPUT_PORT;
+
 	mutex_lock(&session->lock);
-	if (session->streaming_state & (0x1 << OUTPUT_PORT)) {
+	if (session->streaming_state & (0x1 << PORT_TYPE_OUTPUT)) {
 		ret = -EBUSY;
 		goto exit_s_output;
 	}
 
-	session->port_info[OUTPUT_PORT].destination = i;
+	session->port_info[port].destination = i;
 
 	/* detach previous output tunnel port, if existing */
-	call_port_op(session, OUTPUT_PORT, detach);
+	call_port_op(session, port, detach);
 
 	/* initiate and attach input tunnel port, if needed */
 	if (i != VPU_OUTPUT_TYPE_HOST) {
 		ret = vpu_init_port_mdss(session,
-					&session->port_info[OUTPUT_PORT]);
+					&session->port_info[port]);
 		if (ret)
 			goto exit_s_output;
 
-		ret = call_port_op(session, OUTPUT_PORT, attach);
+		ret = call_port_op(session, port, attach);
 		if (ret)
 			goto exit_s_output;
 	}
 
-	ret = commit_port_config(session, OUTPUT_PORT, 1);
+	ret = commit_port_config(session, port, 1);
 
 exit_s_output:
 	mutex_unlock(&session->lock);
@@ -790,8 +917,11 @@ int vpu_get_control_port(struct vpu_client *client,
 
 	if (!session)
 		return -EPERM;
-	if (port < 0 || port > NUM_VPU_PORTS)
+	if (port < 0 || port >= NUM_VPU_PORT_TYPES)
 		return -EINVAL;
+
+	if (port == PORT_TYPE_OUTPUT && client->uses_output2)
+		port = OUTPUT_PORT2;
 
 	if (control->control_id == VPU_CTRL_FPS)
 		return __vpu_get_framerate(client,
@@ -808,8 +938,11 @@ int vpu_set_control_port(struct vpu_client *client,
 
 	if (!session)
 		return -EPERM;
-	if (port < 0 || port > NUM_VPU_PORTS)
+	if (port < 0 || port >= NUM_VPU_PORT_TYPES)
 		return -EINVAL;
+
+	if (port == PORT_TYPE_OUTPUT && client->uses_output2)
+		port = OUTPUT_PORT2;
 
 	if (control->control_id == VPU_CTRL_FPS)
 		return __vpu_set_framerate(client,
@@ -832,6 +965,26 @@ int vpu_commit_configuration(struct vpu_client *client)
 	return ret;
 }
 
+int vpu_dual_output(struct vpu_client *client)
+{
+	int ret = 0;
+	struct vpu_dev_session *session = client ? client->session : 0;
+	if (!session)
+		return -EPERM;
+
+	mutex_lock(&session->lock);
+	if (session->io_client[OUTPUT_PORT] == client) {
+		pr_err("Client using output port 1\n");
+		ret = -EINVAL;
+	} else {
+		session->dual_output = true;
+		client->uses_output2 = true;
+	}
+	mutex_unlock(&session->lock);
+
+	return ret;
+}
+
 /*
  * Streaming I/O operations
  */
@@ -849,13 +1002,13 @@ int vpu_reqbufs(struct vpu_client *client, struct v4l2_requestbuffers *req)
 	if (!session)
 		return -EPERM;
 
-	port = get_port_number(req->type);
+	port = get_port_number(client, req->type);
 	if (port < 0) {
 		pr_err("Invalid buffer type %d\n", req->type);
 		return -EINVAL;
 	}
 
-	pr_debug("count = %d\n", req->count);
+	pr_debug("port %d count = %d\n", port, req->count);
 
 	mutex_lock(&session->que_lock[port]);
 	if (session->io_client[port] != client && session->io_client[port]) {
@@ -919,6 +1072,7 @@ static int __check_user_planes(struct vb2_queue *vbq, struct v4l2_buffer *b)
 		return 0;
 	}
 
+	pr_err("Invalid planes parameters\n");
 	return -EINVAL;
 }
 
@@ -929,7 +1083,7 @@ int vpu_qbuf(struct vpu_client *client, struct v4l2_buffer *b)
 	if (!session)
 		return -EPERM;
 
-	port = get_port_number(b->type);
+	port = get_port_number(client, b->type);
 	if (port < 0) {
 		pr_err("Invalid type %d\n", b->type);
 		return -EINVAL;
@@ -943,8 +1097,13 @@ int vpu_qbuf(struct vpu_client *client, struct v4l2_buffer *b)
 		ret = -EINVAL;
 	} else {
 		ret = __check_user_planes(&session->vbqueue[port], b);
-		if (!ret)
+		if (!ret) {
+			struct vpu_buffer *vpu_buf = to_vpu_buffer(
+				session->vbqueue[port].bufs[b->index]);
+			vpu_buf->sequence = b->sequence;
+
 			ret = vb2_qbuf(&session->vbqueue[port], b);
+		}
 	}
 	mutex_unlock(&session->que_lock[port]);
 
@@ -959,7 +1118,7 @@ int vpu_dqbuf(struct vpu_client *client, struct v4l2_buffer *b,
 	if (!session)
 		return -EPERM;
 
-	port = get_port_number(b->type);
+	port = get_port_number(client, b->type);
 	if (port < 0) {
 		pr_err("Invalid type %d\n", b->type);
 		return -EINVAL;
@@ -975,6 +1134,8 @@ int vpu_dqbuf(struct vpu_client *client, struct v4l2_buffer *b,
 			int i;
 			struct vpu_buffer *vpu_buf = to_vpu_buffer(
 				session->vbqueue[port].bufs[b->index]);
+			b->sequence = vpu_buf->sequence;
+
 			for (i = 0; i < b->length; i++)
 				b->m.planes[i].reserved[0] =
 					vpu_buf->planes[i].data_offset;
@@ -1002,10 +1163,10 @@ static int __queue_pending_buffers(struct vpu_dev_session *session)
 		{
 			if (port == INPUT_PORT)
 				ret = vpu_hw_session_empty_buffer(session->id,
-						buff);
+						translate_port_id(port), buff);
 			else
 				ret = vpu_hw_session_fill_buffer(session->id,
-						buff);
+						translate_port_id(port), buff);
 
 			if (ret) {
 				pr_err("returning buffer\n");
@@ -1022,11 +1183,13 @@ static int __queue_pending_buffers(struct vpu_dev_session *session)
 int vpu_flush_bufs(struct vpu_client *client, enum v4l2_buf_type type)
 {
 	struct vpu_dev_session *session = client ? client->session : 0;
-	int ret = 0, port;
+	int ret = 0, port, port_type;
 	if (!session)
 		return -EPERM;
 
-	port = get_port_number(type);
+	port_type = get_port_type(type);
+
+	port = get_port_number(client, type);
 	if (port < 0) {
 		pr_err("Invalid type %d\n", type);
 		return -EINVAL;
@@ -1039,7 +1202,7 @@ int vpu_flush_bufs(struct vpu_client *client, enum v4l2_buf_type type)
 		ret = -EINVAL;
 		goto exit_flush;
 	} else {
-		if (!(session->streaming_state & (0x1 << port))) {
+		if (!(session->streaming_state & (0x1 << port_type))) {
 			/* Can't flush if port is not streaming */
 			ret = -EINVAL;
 			goto exit_flush;
@@ -1073,6 +1236,15 @@ int vpu_trigger_stream(struct vpu_dev_session *session)
 		return ret;
 	}
 
+	if (session->dual_output) {
+		ret = vb2_streamon(&session->vbqueue[OUTPUT_PORT2],
+				session->vbqueue[OUTPUT_PORT2].type);
+		if (ret) {
+			pr_err("Failed to vb2_streamon output port 2\n");
+			return ret;
+		}
+	}
+
 	session->streaming_state = ALL_STREAMING;
 	__queue_pending_buffers(session);
 
@@ -1082,16 +1254,19 @@ int vpu_trigger_stream(struct vpu_dev_session *session)
 int vpu_streamon(struct vpu_client *client, enum v4l2_buf_type type)
 {
 	struct vpu_dev_session *session = client ? client->session : 0;
-	int ret = 0, port;
+	int ret = 0, port, port_type;
 	u32 temp_streaming = 0;
 	if (!session)
 		return -EPERM;
 
-	port = get_port_number(type);
+	port_type = get_port_type(type);
+	port = get_port_number(client, type);
 	if (port < 0) {
 		pr_err("Invalid type %d\n", type);
 		return -EINVAL;
 	}
+	if (port == OUTPUT_PORT2)
+		return 0; /* do nothing for second output port */
 
 	mutex_lock(&session->lock); /* needed to sync streamon from two ports */
 
@@ -1108,10 +1283,10 @@ int vpu_streamon(struct vpu_client *client, enum v4l2_buf_type type)
 	if (ret)
 		goto early_exit_streamon;
 
-	if (temp_streaming & (0x1 << port)) {
+	if (temp_streaming & (0x1 << port_type)) {
 		goto early_exit_streamon; /* This port already streaming */
 	} else {
-		temp_streaming |= (0x1 << port);
+		temp_streaming |= (0x1 << port_type);
 		/* lock port if tunneling */
 		if (__is_tunneling(session, port))
 			session->io_client[port] = client;
@@ -1145,12 +1320,11 @@ int vpu_streamon(struct vpu_client *client, enum v4l2_buf_type type)
 
 	/* Start end-to-end session streaming */
 	ret = vpu_trigger_stream(session);
-
-	pr_debug("Session streaming started successfully\n");
+	if (!ret)
+		pr_debug("Session streaming started successfully\n");
 
 late_exit_streamon:
 	if (ret) {
-		/* TODO: How do we notify the streamed on sessions? */
 		if (__is_tunneling(session, port))
 			session->io_client[port] = NULL;
 	}
@@ -1174,11 +1348,13 @@ int vpu_streamoff(struct vpu_client *client, enum v4l2_buf_type type)
 	if (!session)
 		return -EPERM;
 
-	port = get_port_number(type);
+	port = get_port_number(client, type);
 	if (port < 0) {
 		pr_err("Invalid type %d\n", type);
 		return -EINVAL;
 	}
+	if (port == OUTPUT_PORT2)
+		return 0; /* do nothing for second output port */
 
 	/* session lock needed to protect actions inside vb2_stream_off */
 	mutex_lock(&session->lock);

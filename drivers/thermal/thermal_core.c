@@ -4,7 +4,7 @@
  *  Copyright (C) 2008 Intel Corp
  *  Copyright (C) 2008 Zhang Rui <rui.zhang@intel.com>
  *  Copyright (C) 2008 Sujith Thomas <sujith.thomas@intel.com>
- *  Copyright (c) 2013, The Linux Foundation. All rights reserved.
+ *  Copyright (c) 2013-2014, The Linux Foundation. All rights reserved.
  *
  *  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  *
@@ -34,10 +34,13 @@
 #include <linux/idr.h>
 #include <linux/thermal.h>
 #include <linux/reboot.h>
+#include <linux/kthread.h>
 #include <net/netlink.h>
 #include <net/genetlink.h>
 
 #include "thermal_core.h"
+
+#define THERMAL_UEVENT_DATA "type"
 
 MODULE_AUTHOR("Zhang Rui");
 MODULE_DESCRIPTION("Generic thermal management sysfs support");
@@ -159,13 +162,43 @@ int sensor_get_id(char *name)
 }
 EXPORT_SYMBOL(sensor_get_id);
 
+static void init_sensor_trip(struct sensor_info *sensor)
+{
+	int ret = 0, i = 0;
+	enum thermal_trip_type type;
+
+	for (i = 0; ((sensor->max_idx == -1) ||
+		(sensor->min_idx == -1)) &&
+		(sensor->tz->ops->get_trip_type) &&
+		(i < sensor->tz->trips); i++) {
+
+		sensor->tz->ops->get_trip_type(sensor->tz, i, &type);
+		if (type == THERMAL_TRIP_CONFIGURABLE_HI)
+			sensor->max_idx = i;
+		if (type == THERMAL_TRIP_CONFIGURABLE_LOW)
+			sensor->min_idx = i;
+		type = 0;
+	}
+
+	ret = sensor->tz->ops->get_trip_temp(sensor->tz,
+		sensor->min_idx, &sensor->threshold_min);
+	if (ret)
+		pr_err("Unable to get MIN trip temp. sensor:%d err:%d\n",
+				sensor->sensor_id, ret);
+
+	ret = sensor->tz->ops->get_trip_temp(sensor->tz,
+		sensor->max_idx, &sensor->threshold_max);
+	if (ret)
+		pr_err("Unable to get MAX trip temp. sensor:%d err:%d\n",
+				sensor->sensor_id, ret);
+}
+
 static int __update_sensor_thresholds(struct sensor_info *sensor)
 {
 	long max_of_low_thresh = LONG_MIN;
 	long min_of_high_thresh = LONG_MAX;
 	struct sensor_threshold *pos, *var;
-	enum thermal_trip_type type;
-	int i, ret = 0;
+	int ret = 0;
 
 	if (!sensor->tz->ops->set_trip_temp ||
 		!sensor->tz->ops->activate_trip_type ||
@@ -175,19 +208,8 @@ static int __update_sensor_thresholds(struct sensor_info *sensor)
 		goto update_done;
 	}
 
-	for (i = 0; ((sensor->max_idx == -1) || (sensor->min_idx == -1)) &&
-		(sensor->tz->ops->get_trip_type) && (i < sensor->tz->trips);
-		i++) {
-		sensor->tz->ops->get_trip_type(sensor->tz, i, &type);
-		if (type == THERMAL_TRIP_CONFIGURABLE_HI)
-			sensor->max_idx = i;
-		if (type == THERMAL_TRIP_CONFIGURABLE_LOW)
-			sensor->min_idx = i;
-		sensor->tz->ops->get_trip_temp(sensor->tz,
-			THERMAL_TRIP_CONFIGURABLE_LOW, &sensor->threshold_min);
-		sensor->tz->ops->get_trip_temp(sensor->tz,
-			THERMAL_TRIP_CONFIGURABLE_HI, &sensor->threshold_max);
-	}
+	if ((sensor->max_idx == -1) || (sensor->min_idx == -1))
+		init_sensor_trip(sensor);
 
 	list_for_each_entry_safe(pos, var, &sensor->threshold_list, list) {
 		if (!pos->active)
@@ -206,8 +228,7 @@ static int __update_sensor_thresholds(struct sensor_info *sensor)
 			sensor->sensor_id, max_of_low_thresh,
 			min_of_high_thresh);
 
-	if ((min_of_high_thresh != sensor->threshold_max) &&
-		(min_of_high_thresh != LONG_MAX)) {
+	if (min_of_high_thresh != LONG_MAX) {
 		ret = sensor->tz->ops->set_trip_temp(sensor->tz,
 			sensor->max_idx, min_of_high_thresh);
 		if (ret) {
@@ -228,8 +249,7 @@ static int __update_sensor_thresholds(struct sensor_info *sensor)
 		goto update_done;
 	}
 
-	if ((max_of_low_thresh != sensor->threshold_min) &&
-		(max_of_low_thresh != LONG_MIN)) {
+	if (max_of_low_thresh != LONG_MIN) {
 		ret = sensor->tz->ops->set_trip_temp(sensor->tz,
 			sensor->min_idx, max_of_low_thresh);
 		if (ret) {
@@ -271,6 +291,22 @@ static void sensor_update_work(struct work_struct *work)
 	mutex_unlock(&sensor->lock);
 }
 
+static __ref int sensor_sysfs_notify(void *data)
+{
+	int ret = 0;
+	struct sensor_info *sensor = (struct sensor_info *)data;
+
+	while (!kthread_should_stop()) {
+		while (wait_for_completion_interruptible(
+		   &sensor->sysfs_notify_complete) != 0)
+			;
+		INIT_COMPLETION(sensor->sysfs_notify_complete);
+		sysfs_notify(&sensor->tz->device.kobj, NULL,
+					THERMAL_UEVENT_DATA);
+	}
+	return ret;
+}
+
 /* May be called in an interrupt context.
  * Do NOT call sensor_set_trip from this function
  */
@@ -296,6 +332,9 @@ int thermal_sensor_trip(struct thermal_zone_device *tz,
 			((trip == THERMAL_TRIP_CONFIGURABLE_HI) &&
 				(pos->temp >= tz->sensor.threshold_max) &&
 				(pos->temp <= temp))) {
+			if ((pos == &tz->tz_threshold[0])
+				|| (pos == &tz->tz_threshold[1]))
+				complete(&tz->sensor.sysfs_notify_complete);
 			pos->active = 0;
 			pos->notify(trip, temp, pos->data);
 		}
@@ -306,6 +345,20 @@ int thermal_sensor_trip(struct thermal_zone_device *tz,
 	return ret;
 }
 EXPORT_SYMBOL(thermal_sensor_trip);
+
+int sensor_get_temp(uint32_t sensor_id, long *temp)
+{
+	struct sensor_info *sensor = get_sensor(sensor_id);
+	int ret = 0;
+
+	if (!sensor)
+		return -ENODEV;
+
+	ret = sensor->tz->ops->get_temp(sensor->tz, temp);
+
+	return ret;
+}
+EXPORT_SYMBOL(sensor_get_temp);
 
 int sensor_activate_trip(uint32_t sensor_id,
 	struct sensor_threshold *threshold, bool enable)
@@ -436,7 +489,7 @@ int sensor_init(struct thermal_zone_device *tz)
 
 	sensor->sensor_id = tz->id;
 	sensor->tz = tz;
-	sensor->threshold_min = 0;
+	sensor->threshold_min = LONG_MIN;
 	sensor->threshold_max = LONG_MAX;
 	sensor->max_idx = -1;
 	sensor->min_idx = -1;
@@ -453,6 +506,14 @@ int sensor_init(struct thermal_zone_device *tz)
 	tz->tz_threshold[1].trip = THERMAL_TRIP_CONFIGURABLE_LOW;
 	list_add(&sensor->sensor_list, &sensor_info_list);
 	INIT_WORK(&sensor->work, sensor_update_work);
+	init_completion(&sensor->sysfs_notify_complete);
+	sensor->sysfs_notify_thread = kthread_run(sensor_sysfs_notify,
+						  &tz->sensor,
+						  "therm_core:notify%d",
+						  tz->id);
+	if (IS_ERR(sensor->sysfs_notify_thread))
+		pr_err("Failed to create notify thread %d", tz->id);
+
 
 	return 0;
 }
@@ -2186,6 +2247,7 @@ void thermal_zone_device_unregister(struct thermal_zone_device *tz)
 
 	thermal_remove_hwmon_sysfs(tz);
 	flush_work(&tz->sensor.work);
+	kthread_stop(tz->sensor.sysfs_notify_thread);
 	mutex_lock(&thermal_list_lock);
 	list_del(&tz->sensor.sensor_list);
 	mutex_unlock(&thermal_list_lock);

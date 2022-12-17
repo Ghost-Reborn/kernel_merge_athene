@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2013-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -20,6 +20,8 @@
 #include <linux/clk.h>
 #include <linux/regulator/consumer.h>
 #include <linux/regulator/rpm-smd-regulator.h>
+#include <linux/platform_device.h>
+#include <linux/module.h>
 #include <linux/iopoll.h>
 #include <linux/clk/msm-clk.h>
 #include <soc/qcom/clock-alpha-pll.h>
@@ -28,14 +30,8 @@
 #include <soc/qcom/clock-rpm.h>
 #include <soc/qcom/clock-voter.h>
 
-#include <soc/qcom/socinfo.h>
-
-#include "clock.h"
-
 enum {
 	GCC_BASE,
-	LPASS_BASE,
-	APCS_GLB_BASE,
 	APCS_GCC_BASE,
 	APCS_ACC_BASE,
 	N_BASES,
@@ -1285,6 +1281,7 @@ static struct branch_clk gcc_mss_q6_bimc_axi_clk = {
 	.cbcr_reg = MSS_Q6_BIMC_AXI_CBCR,
 	.has_sibling = 1,
 	.base = &virt_bases[GCC_BASE],
+	.halt_check = DELAY,
 	.c = {
 		.dbg_name = "gcc_mss_q6_bimc_axi_clk",
 		.ops = &clk_ops_branch,
@@ -1330,6 +1327,7 @@ static struct branch_clk gcc_pcie_pipe_clk = {
 	.bcr_reg = PCIEPHY_PHY_BCR,
 	.has_sibling = 0,
 	.base = &virt_bases[GCC_BASE],
+	.halt_check = DELAY,
 	.c = {
 		.dbg_name = "gcc_pcie_pipe_clk",
 		.parent = &pcie_pipe_clk_src.c,
@@ -1433,7 +1431,7 @@ static struct branch_clk gcc_sdcc3_apps_clk = {
 
 static struct branch_clk gcc_sys_noc_usb3_axi_clk = {
 	.cbcr_reg = SYS_NOC_USB3_AXI_CBCR,
-	.has_sibling = 1,
+	.has_sibling = 0,
 	.base = &virt_bases[GCC_BASE],
 	.c = {
 		.dbg_name = "gcc_sys_noc_usb3_axi_clk",
@@ -1494,6 +1492,7 @@ static struct branch_clk gcc_usb3_pipe_clk = {
 	.bcr_reg = USB3PHY_PHY_BCR,
 	.has_sibling = 0,
 	.base = &virt_bases[GCC_BASE],
+	.halt_check = DELAY,
 	.c = {
 		.dbg_name = "gcc_usb3_pipe_clk",
 		.parent = &usb3_pipe_clk_src.c,
@@ -1924,6 +1923,7 @@ static struct measure_clk measure_clk = {
 	.c = {
 		.dbg_name = "measure_clk",
 		.ops = &clk_ops_measure,
+		.flags = CLKFLAG_MEASURE,
 		CLK_INIT(measure_clk.c),
 	},
 	.multiplier = 1,
@@ -1967,6 +1967,9 @@ static struct clk_lookup msm_clocks_9630[] = {
 
 	CLK_LOOKUP("iface_clk", gcc_blsp1_ahb_clk.c, "f991f000.serial"),
 	CLK_LOOKUP("core_clk", gcc_blsp1_uart3_apps_clk.c, "f991f000.serial"),
+
+	CLK_LOOKUP("iface_clk", gcc_blsp1_ahb_clk.c, "f991e000.uart"),
+	CLK_LOOKUP("core_clk", gcc_blsp1_uart2_apps_clk.c, "f991e000.uart"),
 
 	CLK_LOOKUP("iface_clk", gcc_blsp1_ahb_clk.c, "f9928000.spi"),
 	CLK_LOOKUP("core_clk", gcc_blsp1_qup6_spi_apps_clk.c, "f9928000.spi"),
@@ -2022,13 +2025,22 @@ static struct clk_lookup msm_clocks_9630[] = {
 	CLK_LOOKUP("core_clk", gcc_sdcc3_apps_clk.c, "msm_sdcc.3"),
 	CLK_LOOKUP("bus_clk", pnoc_sdcc3_clk.c, "msm_sdcc.3"),
 
-	CLK_LOOKUP("iface_clk", gcc_usb_hsic_ahb_clk.c,	  "msm_hsic_host"),
-	CLK_LOOKUP("phy_clk", gcc_usb_hsic_clk.c,	  "msm_hsic_host"),
-	CLK_LOOKUP("cal_clk", gcc_usb_hsic_io_cal_clk.c,  "msm_hsic_host"),
-	CLK_LOOKUP("core_clk", gcc_usb_hsic_system_clk.c, "msm_hsic_host"),
-	CLK_LOOKUP("alt_core_clk", gcc_usb_hsic_xcvr_fs_clk.c, ""),
+	CLK_LOOKUP("iface_clk", gcc_usb_hsic_ahb_clk.c,	"f9a15000.hsic_host"),
+	CLK_LOOKUP("phy_clk", gcc_usb_hsic_clk.c,	  "f9a15000.hsic_host"),
+	CLK_LOOKUP("cal_clk", gcc_usb_hsic_io_cal_clk.c,  "f9a15000.hsic_host"),
+	CLK_LOOKUP("core_clk", gcc_usb_hsic_system_clk.c, "f9a15000.hsic_host"),
+	CLK_LOOKUP("alt_core_clk", gcc_usb_hsic_xcvr_fs_clk.c,
+							"f9a15000.hsic_host"),
 	CLK_LOOKUP("inactivity_clk", gcc_usb_hsic_io_cal_sleep_clk.c,
-							"msm_hsic_host"),
+							"f9a15000.hsic_host"),
+
+	CLK_LOOKUP("iface_clk", gcc_usb_hsic_ahb_clk.c,	  "f9a15000.hsic"),
+	CLK_LOOKUP("phy_clk", gcc_usb_hsic_clk.c,	  "f9a15000.hsic"),
+	CLK_LOOKUP("cal_clk", gcc_usb_hsic_io_cal_clk.c,  "f9a15000.hsic"),
+	CLK_LOOKUP("core_clk", gcc_usb_hsic_system_clk.c, "f9a15000.hsic"),
+	CLK_LOOKUP("alt_core_clk", gcc_usb_hsic_xcvr_fs_clk.c, "f9a15000.hsic"),
+	CLK_LOOKUP("inactivity_clk", gcc_usb_hsic_io_cal_sleep_clk.c,
+		"f9a15000.hsic"),
 
 	CLK_LOOKUP("core_clk", gcc_ce1_clk.c, "fd400000.qcom,qcedev"),
 	CLK_LOOKUP("iface_clk", gcc_ce1_ahb_clk.c, "fd400000.qcom,qcedev"),
@@ -2042,10 +2054,12 @@ static struct clk_lookup msm_clocks_9630[] = {
 	CLK_LOOKUP("core_clk_src", qcrypto_ce1_clk_src.c,
 						"fd400000.qcom,qcrypto"),
 
-	CLK_LOOKUP("core_clk",     gcc_ce1_clk.c,         "scm"),
-	CLK_LOOKUP("iface_clk",    gcc_ce1_ahb_clk.c,     "scm"),
-	CLK_LOOKUP("bus_clk",      gcc_ce1_axi_clk.c,     "scm"),
-	CLK_LOOKUP("core_clk_src", scm_ce1_clk_src.c,     "scm"),
+	/* Crypto clocks */
+	CLK_LOOKUP("scm_core_clk", gcc_ce1_clk.c, "fe200000.qcom,lpass"),
+	CLK_LOOKUP("scm_iface_clk", gcc_ce1_ahb_clk.c, "fe200000.qcom,lpass"),
+	CLK_LOOKUP("scm_bus_clk", gcc_ce1_axi_clk.c, "fe200000.qcom,lpass"),
+	CLK_LOOKUP("scm_core_clk_src", scm_ce1_clk_src.c,
+						"fe200000.qcom,lpass"),
 
 	/* RPM and voter clocks */
 	CLK_LOOKUP("bus_clk", snoc_clk.c, ""),
@@ -2160,6 +2174,7 @@ static struct clk_lookup msm_clocks_9630[] = {
 	CLK_LOOKUP("pcie_0_cfg_ahb_clk", gcc_pcie_cfg_ahb_clk.c, "msm_pcie"),
 	CLK_LOOKUP("pcie_0_pipe_clk", gcc_pcie_pipe_clk.c, "msm_pcie"),
 	CLK_LOOKUP("pcie_0_aux_clk", gcc_pcie_sleep_clk.c, "msm_pcie"),
+	CLK_LOOKUP("pcie_0_ref_clk_src", lnbbclk_clk.c, "msm_pcie"),
 	CLK_LOOKUP("iface_clk",	gcc_sys_noc_usb3_axi_clk.c, "f9200000.ssusb"),
 	CLK_LOOKUP("iface_clk",	gcc_sys_noc_usb3_axi_clk.c, "msm_usb3"),
 	CLK_LOOKUP("aux_clk",	gcc_usb3_aux_clk.c,
@@ -2186,14 +2201,27 @@ static struct clk_lookup msm_clocks_9630[] = {
 	CLK_LOOKUP("ref_clk", lnbbclk_clk.c, "f9200000.ssusb"),
 	CLK_LOOKUP("", lnbbclk_a_clk.c, ""),
 	CLK_LOOKUP("xo", cxo_dwc3_clk.c, "f9200000.ssusb"),
+	CLK_LOOKUP("phy_com_reset",  gcc_usb3_phy_com_reset.c,
+		"f9200000.ssusb"),
 	CLK_LOOKUP("phy_sleep_clk", gcc_usb2b_phy_sleep_clk.c,
-		   "f9200000.ssusb"),
-
+		   "f92f8800.hsphy"),
 	CLK_LOOKUP("core_clk", qpic_clk.c, "f9ac0000.qcom,nand"),
-	CLK_LOOKUP("", qpic_a_clk.c, ""),
+	CLK_LOOKUP("core_a_clk", qpic_a_clk.c, "f9ac0000.qcom,msm_qpic"),
+	CLK_LOOKUP("pcie_0_slv_axi_clk", gcc_pcie_axi_clk.c,
+			"bfffd000.qcom,pcie"),
+	CLK_LOOKUP("pcie_0_mstr_axi_clk", gcc_pcie_axi_mstr_clk.c,
+			"bfffd000.qcom,pcie"),
+	CLK_LOOKUP("pcie_0_cfg_ahb_clk", gcc_pcie_cfg_ahb_clk.c,
+			"bfffd000.qcom,pcie"),
+	CLK_LOOKUP("pcie_0_pipe_clk", gcc_pcie_pipe_clk.c,
+			"bfffd000.qcom,pcie"),
+	CLK_LOOKUP("pcie_0_aux_clk", gcc_pcie_sleep_clk.c,
+			"bfffd000.qcom,pcie"),
+	CLK_LOOKUP("pcie_0_ldo",  gcc_pcie_gpio_ldo.c,
+			"bfffd000.qcom,pcie"),
 };
 
-static void __init reg_init(void)
+static void reg_init(void)
 {
 	u32 regval;
 
@@ -2207,7 +2235,7 @@ static void __init reg_init(void)
 	writel_relaxed(regval, GCC_REG_BASE(APCS_CLOCK_BRANCH_ENA_VOTE));
 }
 
-static void __init mdm9630_clock_post_init(void)
+static void mdm9630_clock_post_init(void)
 {
 	/*
 	 * Hold an active set vote for CXO; this is because CXO is expected
@@ -2222,59 +2250,117 @@ static void __init mdm9630_clock_post_init(void)
 	clk_prepare_enable(&pnoc_keepalive_a_clk.c);
 }
 
-#define GCC_CC_PHYS		0xFC400000
-#define GCC_CC_SIZE		SZ_8K
-
-#define LPASS_CC_PHYS		0xFE000000
-#define LPASS_CC_SIZE		SZ_256K
-
-#define APCS_GLB_PHYS		0xF9010000
-#define APCS_GLB_SIZE		0x38
-
-#define APCS_GCC_PHYS		0xF9011000
-#define APCS_GCC_SIZE		0x1C
-
-#define APCS_ACC_PHYS		0xF9008018
-#define APCS_ACC_SIZE		0x28
-
-static void __init mdm9630_clock_pre_init(void)
+static int mdm9630_clock_pre_init(void)
 {
-	virt_bases[GCC_BASE] = ioremap(GCC_CC_PHYS, GCC_CC_SIZE);
-	if (!virt_bases[GCC_BASE])
-		panic("clock-9630: Unable to ioremap GCC memory!");
-
-	virt_bases[LPASS_BASE] = ioremap(LPASS_CC_PHYS, LPASS_CC_SIZE);
-	if (!virt_bases[LPASS_BASE])
-		panic("clock-8226: Unable to ioremap LPASS_CC memory!");
-
-	virt_bases[APCS_GLB_BASE] = ioremap(APCS_GLB_PHYS, APCS_GLB_SIZE);
-	if (!virt_bases[APCS_GLB_BASE])
-		panic("clock-9630: Unable to ioremap APCS_GLB memory!");
-
-	virt_bases[APCS_GCC_BASE] = ioremap(APCS_GCC_PHYS, APCS_GCC_SIZE);
-	if (!virt_bases[APCS_GCC_BASE])
-		panic("clock-9630: Unable to ioremap APCS_GCC memory!");
-
-	virt_bases[APCS_ACC_BASE] = ioremap(APCS_ACC_PHYS, APCS_ACC_SIZE);
-	if (!virt_bases[APCS_ACC_BASE])
-		panic("clock-9630: Unable to ioremap APCS_PLL memory!");
-
-	vdd_dig.regulator[0] = regulator_get(NULL, "vdd_dig");
-	if (IS_ERR(vdd_dig.regulator[0]))
-		panic("clock-9630: Unable to get the vdd_dig regulator!");
-
-	vdd_dig_ao.regulator[0] = regulator_get(NULL, "vdd_dig_ao");
-	if (IS_ERR(vdd_dig_ao.regulator[0]))
-		panic("clock-9630: Unable to get the vdd_dig_ao regulator!");
-
-	enable_rpm_scaling();
+	int rc;
+	rc = enable_rpm_scaling();
+	if (rc)
+		return rc;
 
 	reg_init();
+	return 0;
 }
 
-struct clock_init_data mdm9630_clock_init_data __initdata = {
-	.table = msm_clocks_9630,
-	.size = ARRAY_SIZE(msm_clocks_9630),
-	.pre_init = mdm9630_clock_pre_init,
-	.post_init = mdm9630_clock_post_init,
+/* Please note that the order of reg-names is important */
+static int get_memory(struct platform_device *pdev)
+{
+	int i, count;
+	const char *str;
+	struct resource *res;
+	struct device *dev = &pdev->dev;
+
+	count = of_property_count_strings(dev->of_node, "reg-names");
+	if (count != N_BASES) {
+		dev_err(dev, "missing reg-names property, expected %d strings\n",
+				N_BASES);
+		return -EINVAL;
+	}
+
+	for (i = 0; i < count; i++) {
+		of_property_read_string_index(dev->of_node, "reg-names", i,
+						&str);
+		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, str);
+		if (!res) {
+			dev_err(dev, "Unable to retrieve register base.\n");
+			return -ENOMEM;
+		}
+
+		virt_bases[i] = devm_ioremap(dev, res->start,
+							resource_size(res));
+		if (!virt_bases[i]) {
+			dev_err(dev, "Failed to map in CC registers.\n");
+			return -ENOMEM;
+		}
+	}
+
+	return 0;
+}
+
+static int get_regulators(struct device *dev)
+{
+	struct regulator *r;
+
+	r = vdd_dig.regulator[0] = devm_regulator_get(dev, "vdd_dig");
+	if (IS_ERR(r)) {
+		if (PTR_ERR(r) != -EPROBE_DEFER)
+			dev_err(dev, "Unable to get the vdd_dig regulator!");
+		return PTR_ERR(r);
+	}
+
+	r = vdd_dig_ao.regulator[0] = devm_regulator_get(dev, "vdd_dig_ao");
+	if (IS_ERR(r)) {
+		if (PTR_ERR(r) != -EPROBE_DEFER)
+			dev_err(dev, "Unable to get the vdd_dig_ao regulator!");
+		return PTR_ERR(r);
+	}
+	return 0;
+}
+
+static int gcc_probe(struct platform_device *pdev)
+{
+	int rc;
+	struct device *dev = &pdev->dev;
+
+	rc = get_regulators(dev);
+	if (rc)
+		return rc;
+
+	rc = get_memory(pdev);
+	if (rc)
+		return rc;
+
+	rc = mdm9630_clock_pre_init();
+	if (rc)
+		return rc;
+
+	rc =  msm_clock_register(msm_clocks_9630, ARRAY_SIZE(msm_clocks_9630));
+	if (rc)
+		return rc;
+
+	mdm9630_clock_post_init();
+	return 0;
+}
+
+static struct of_device_id gcc_match_table[] = {
+	{ .compatible = "qcom,gcc-9630" },
+	{}
 };
+
+static struct platform_driver gcc_driver = {
+	.probe = gcc_probe,
+	.driver = {
+		.name = "qcom,gcc-9630",
+		.of_match_table = gcc_match_table,
+		.owner = THIS_MODULE,
+	},
+};
+
+static bool initialized;
+int __init msm_gcc_9630_init(void)
+{
+	if (initialized)
+		return true;
+	initialized  = true;
+	return platform_driver_register(&gcc_driver);
+}
+arch_initcall(msm_gcc_9630_init);

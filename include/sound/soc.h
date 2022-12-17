@@ -21,6 +21,7 @@
 #include <linux/kernel.h>
 #include <linux/regmap.h>
 #include <linux/log2.h>
+#include <linux/async.h>
 #include <sound/core.h>
 #include <sound/pcm.h>
 #include <sound/compress_driver.h>
@@ -74,7 +75,7 @@
 	.access = SNDRV_CTL_ELEM_ACCESS_TLV_READ | \
 	SNDRV_CTL_ELEM_ACCESS_READWRITE, \
 	.tlv.p  = (tlv_array),\
-	.info = snd_soc_info_volsw, \
+	.info = snd_soc_info_volsw_sx, \
 	.get = snd_soc_get_volsw_sx,\
 	.put = snd_soc_put_volsw_sx, \
 	.private_value = (unsigned long)&(struct soc_mixer_control) \
@@ -144,7 +145,7 @@
 	.access = SNDRV_CTL_ELEM_ACCESS_TLV_READ | \
 	SNDRV_CTL_ELEM_ACCESS_READWRITE, \
 	.tlv.p  = (tlv_array), \
-	.info = snd_soc_info_volsw, \
+	.info = snd_soc_info_volsw_sx, \
 	.get = snd_soc_get_volsw_sx, \
 	.put = snd_soc_put_volsw_sx, \
 	.private_value = (unsigned long)&(struct soc_mixer_control) \
@@ -512,6 +513,8 @@ int snd_soc_put_value_enum_double(struct snd_kcontrol *kcontrol,
 	struct snd_ctl_elem_value *ucontrol);
 int snd_soc_info_volsw(struct snd_kcontrol *kcontrol,
 	struct snd_ctl_elem_info *uinfo);
+int snd_soc_info_volsw_sx(struct snd_kcontrol *kcontrol,
+	struct snd_ctl_elem_info *uinfo);
 int snd_soc_info_volsw_ext(struct snd_kcontrol *kcontrol,
 	struct snd_ctl_elem_info *uinfo);
 #define snd_soc_info_bool_ext		snd_ctl_boolean_mono_info
@@ -831,6 +834,16 @@ struct snd_soc_platform_driver {
 	snd_pcm_sframes_t (*delay)(struct snd_pcm_substream *,
 		struct snd_soc_dai *);
 
+	/*
+	 * For platform-caused delay reporting, where the thread blocks waiting
+	 * for the delay amount to be determined.  Defining this will cause the
+	 * ASoC core to skip calling the delay callbacks for all components in
+	 * the runtime.
+	 * Optional.
+	 */
+	snd_pcm_sframes_t (*delay_blk)(struct snd_pcm_substream *,
+		struct snd_soc_dai *);
+
 	/* platform stream pcm ops */
 	const struct snd_pcm_ops *ops;
 
@@ -884,6 +897,14 @@ struct snd_soc_component {
 	struct list_head list;
 
 	const struct snd_soc_component_driver *driver;
+};
+
+enum snd_soc_async_ops {
+	ASYNC_DPCM_SND_SOC_OPEN = 1 << 0,
+	ASYNC_DPCM_SND_SOC_CLOSE = 1 << 1,
+	ASYNC_DPCM_SND_SOC_PREPARE = 1 << 2,
+	ASYNC_DPCM_SND_SOC_HW_PARAMS = 1 << 3,
+	ASYNC_DPCM_SND_SOC_FREE = 1 << 4,
 };
 
 struct snd_soc_dai_link {
@@ -956,6 +977,9 @@ struct snd_soc_dai_link {
 	/* machine stream operations */
 	const struct snd_soc_ops *ops;
 	const struct snd_soc_compr_ops *compr_ops;
+
+	/* this value determines what all ops can be started asynchronously */
+	enum snd_soc_async_ops async_ops;
 };
 
 struct snd_soc_codec_conf {
@@ -1093,6 +1117,9 @@ struct snd_soc_pcm_runtime {
 	long pmdown_time;
 	unsigned char pop_wait:1;
 
+	/* err in case of ops failed */
+	int err_ops;
+
 	/* runtime devices */
 	struct snd_pcm *pcm;
 	struct snd_compr *compr;
@@ -1227,6 +1254,7 @@ int snd_soc_of_parse_audio_routing(struct snd_soc_card *card,
 				   const char *propname);
 unsigned int snd_soc_of_parse_daifmt(struct device_node *np,
 				     const char *prefix);
+int soc_check_aux_dev_byname(struct snd_soc_card *card, const char *codec_name);
 
 #include <sound/soc-dai.h>
 

@@ -85,6 +85,7 @@ struct disk_stats {
 	unsigned long ticks[2];
 	unsigned long io_ticks;
 	unsigned long time_in_queue;
+	unsigned long data_sectors;
 };
 
 #define PARTITION_META_INFO_VOLNAMELTH	64
@@ -649,7 +650,7 @@ static inline void hd_ref_init(struct hd_struct *part)
 static inline void hd_struct_get(struct hd_struct *part)
 {
 	atomic_inc(&part->ref);
-	smp_mb__after_atomic_inc();
+	smp_mb__after_atomic();
 }
 
 static inline int hd_struct_try_get(struct hd_struct *part)

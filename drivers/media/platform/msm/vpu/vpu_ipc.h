@@ -1,4 +1,4 @@
-/* Copyright (c) 2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2013-2014, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -41,6 +41,7 @@
 #define VPU_STS_EINVALIDCLIENTID                     21
 #define VPU_STS_EINSUFFICIENTMEMAVAILABLE            22
 #define VPU_STS_EBADSTATE                            23
+#define VPU_STS_EFRAMEUNPROCESSED                    24
 
 /* Bit fields */
 #define VPU_IPC_BUFFER_RETURN_TO_HOST_BIT	0x0
@@ -218,7 +219,8 @@ enum vpu_ipc_flush {
  *		as part of acknowledgment message
  * sid:		unique ID associated with a session (only valid for session
  *		event)
- * port_id:	ID of the port (input/output) that command applies to
+ * port_id:	ID of the port (input/output) that command applies to (value
+ *		from enum vpu_ipc_channel_port)
  * flags:	bit 0:  indication of need for acknowledgment from FW
  *		bit 1-31: reserved
  */
@@ -237,7 +239,8 @@ struct vpu_ipc_cmd_header_packet {
  * msg_id:	session or System message type
  * status:	return status from FW
  * trans_id:	see vpu_ipc_cmd_header_packet.trans_id
- * port_id:	ID of the port (input/output) that message applies to
+ * port_id:	ID of the port (input/output) that command applies to (value
+ *		from enum vpu_ipc_channel_port)
  * sid:		unique ID associated with a session (only valid for session
  *		event)
  */
@@ -430,6 +433,9 @@ struct vpu_ipc_buffer_meta_data_t {
 /* Bits: 26-27 - Number of future buffers */
 #define BUFFER_PKT_FLAG_FUTURE_BUFFER_NUM_MASK      0x0C000000
 #define BUFFER_PKT_FLAG_FUTURE_BUFFER_NUM_SHIFT     26
+/* Bits: 28 - Chroma down sampling */
+#define BUFFER_PKT_FLAG_CDS_ENABLE                  0x10000000
+#define BUFFER_PKT_FLAG_CDS_SHIFT                   28
 
 /*
  * VPU_IPC_CMD_SESSION_SET_BUFFERS, VPU_IPC_CMD_SESSION_PROCESS_BUFFERS

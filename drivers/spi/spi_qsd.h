@@ -1,4 +1,4 @@
-/* Copyright (c) 2008-2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2014-2016, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -113,6 +113,8 @@
 #define INPUT_MODE_SHIFT              QSD_REG(10)         QUP_REG(12)
 
 /* SPI_OPERATIONAL fields */
+#define SPI_OP_IN_BLK_RD_REQ_FLAG     0x00002000
+#define SPI_OP_OUT_BLK_WR_REQ_FLAG    0x00001000
 #define SPI_OP_MAX_INPUT_DONE_FLAG    0x00000800
 #define SPI_OP_MAX_OUTPUT_DONE_FLAG   0x00000400
 #define SPI_OP_INPUT_SERVICE_FLAG     0x00000200
@@ -125,6 +127,10 @@
 #define SPI_OP_STATE                  0x00000003
 
 #define SPI_OP_STATE_CLEAR_BITS       0x2
+
+#define SPI_PINCTRL_STATE_DEFAULT "spi_default"
+#define SPI_PINCTRL_STATE_SLEEP "spi_sleep"
+
 enum msm_spi_state {
 	SPI_OP_STATE_RESET = 0x00000000,
 	SPI_OP_STATE_RUN   = 0x00000001,
@@ -178,8 +184,8 @@ enum msm_spi_clk_path_vec_idx {
 	MSM_SPI_CLK_PATH_SUSPEND_VEC = 0,
 	MSM_SPI_CLK_PATH_RESUME_VEC  = 1,
 };
-#define MSM_SPI_CLK_PATH_AVRG_BW(dd) (dd->pdata->max_clock_speed * 8)
-#define MSM_SPI_CLK_PATH_BRST_BW(dd) (dd->pdata->max_clock_speed * 8)
+#define MSM_SPI_CLK_PATH_AVRG_BW(dd) (76800000)
+#define MSM_SPI_CLK_PATH_BRST_BW(dd) (76800000)
 
 static char const * const spi_rsrcs[] = {
 	"spi_clk",
@@ -197,7 +203,6 @@ static char const * const spi_cs_rsrcs[] = {
 enum msm_spi_mode {
 	SPI_FIFO_MODE  = 0x0,  /* 00 */
 	SPI_BLOCK_MODE = 0x1,  /* 01 */
-	SPI_DMOV_MODE  = 0x2,  /* 10 */
 	SPI_BAM_MODE   = 0x3,  /* 11 */
 	SPI_MODE_NONE  = 0xFF, /* invalid value */
 };
@@ -208,53 +213,53 @@ struct spi_cs_gpio {
 	bool valid;
 };
 
-/* Structures for Data Mover */
-struct spi_dmov_cmd {
-	dmov_box box;      /* data aligned to max(dm_burst_size, block_size)
-							   (<= fifo_size) */
-	dmov_s single_pad; /* data unaligned to max(dm_burst_size, block_size)
-			      padded to fit */
-	dma_addr_t cmd_ptr;
-};
-
 #ifdef CONFIG_DEBUG_FS
 /* Used to create debugfs entries */
-static const struct {
+static struct msm_spi_regs{
 	const char *name;
 	mode_t mode;
 	int offset;
+	struct msm_spi *dd;
 } debugfs_spi_regs[] = {
-	{"config",                S_IRUGO | S_IWUSR, SPI_CONFIG},
-	{"io_control",            S_IRUGO | S_IWUSR, SPI_IO_CONTROL},
-	{"io_modes",              S_IRUGO | S_IWUSR, SPI_IO_MODES},
-	{"sw_reset",                        S_IWUSR, SPI_SW_RESET},
-	{"time_out_current",      S_IRUGO,           SPI_TIME_OUT_CURRENT},
-	{"mx_output_count",       S_IRUGO | S_IWUSR, SPI_MX_OUTPUT_COUNT},
-	{"mx_output_cnt_current", S_IRUGO,           SPI_MX_OUTPUT_CNT_CURRENT},
-	{"mx_input_count",        S_IRUGO | S_IWUSR, SPI_MX_INPUT_COUNT},
-	{"mx_input_cnt_current",  S_IRUGO,           SPI_MX_INPUT_CNT_CURRENT},
-	{"mx_read_count",         S_IRUGO | S_IWUSR, SPI_MX_READ_COUNT},
-	{"mx_read_cnt_current",   S_IRUGO,           SPI_MX_READ_CNT_CURRENT},
-	{"operational",           S_IRUGO | S_IWUSR, SPI_OPERATIONAL},
-	{"error_flags",           S_IRUGO | S_IWUSR, SPI_ERROR_FLAGS},
-	{"error_flags_en",        S_IRUGO | S_IWUSR, SPI_ERROR_FLAGS_EN},
-	{"deassert_wait",         S_IRUGO | S_IWUSR, SPI_DEASSERT_WAIT},
-	{"output_debug",          S_IRUGO,           SPI_OUTPUT_DEBUG},
-	{"input_debug",           S_IRUGO,           SPI_INPUT_DEBUG},
-	{"test_ctrl",             S_IRUGO | S_IWUSR, SPI_TEST_CTRL},
-	{"output_fifo",                     S_IWUSR, SPI_OUTPUT_FIFO},
-	{"input_fifo" ,           S_IRUSR,           SPI_INPUT_FIFO},
-	{"spi_state",             S_IRUGO | S_IWUSR, SPI_STATE},
+	{"config",                S_IRUGO | S_IWUSR, SPI_CONFIG, NULL},
+	{"io_control",            S_IRUGO | S_IWUSR, SPI_IO_CONTROL, NULL},
+	{"io_modes",              S_IRUGO | S_IWUSR, SPI_IO_MODES, NULL},
+	{"sw_reset",                        S_IWUSR, SPI_SW_RESET, NULL},
+	{"time_out_current",      S_IRUGO,           SPI_TIME_OUT_CURRENT,
+									NULL},
+	{"mx_output_count",       S_IRUGO | S_IWUSR, SPI_MX_OUTPUT_COUNT,
+									NULL},
+	{"mx_output_cnt_current", S_IRUGO,           SPI_MX_OUTPUT_CNT_CURRENT,
+									NULL},
+	{"mx_input_count",        S_IRUGO | S_IWUSR, SPI_MX_INPUT_COUNT, NULL},
+	{"mx_input_cnt_current",  S_IRUGO,           SPI_MX_INPUT_CNT_CURRENT,
+									NULL},
+	{"mx_read_count",         S_IRUGO | S_IWUSR, SPI_MX_READ_COUNT, NULL},
+	{"mx_read_cnt_current",   S_IRUGO,           SPI_MX_READ_CNT_CURRENT,
+									NULL},
+	{"operational",           S_IRUGO | S_IWUSR, SPI_OPERATIONAL, NULL},
+	{"error_flags",           S_IRUGO | S_IWUSR, SPI_ERROR_FLAGS, NULL},
+	{"error_flags_en",        S_IRUGO | S_IWUSR, SPI_ERROR_FLAGS_EN, NULL},
+	{"deassert_wait",         S_IRUGO | S_IWUSR, SPI_DEASSERT_WAIT, NULL},
+	{"output_debug",          S_IRUGO,           SPI_OUTPUT_DEBUG, NULL},
+	{"input_debug",           S_IRUGO,           SPI_INPUT_DEBUG, NULL},
+	{"test_ctrl",             S_IRUGO | S_IWUSR, SPI_TEST_CTRL, NULL},
+	{"output_fifo",                     S_IWUSR, SPI_OUTPUT_FIFO, NULL},
+	{"input_fifo" ,           S_IRUSR,           SPI_INPUT_FIFO, NULL},
+	{"spi_state",             S_IRUGO | S_IWUSR, SPI_STATE, NULL},
 #if defined(CONFIG_SPI_QSD) || defined(CONFIG_SPI_QSD_MODULE)
-	{"fifo_word_cnt",         S_IRUGO,           SPI_FIFO_WORD_CNT},
+	{"fifo_word_cnt",         S_IRUGO,           SPI_FIFO_WORD_CNT, NULL},
 #else
-	{"qup_config",            S_IRUGO | S_IWUSR, QUP_CONFIG},
-	{"qup_error_flags",       S_IRUGO | S_IWUSR, QUP_ERROR_FLAGS},
-	{"qup_error_flags_en",    S_IRUGO | S_IWUSR, QUP_ERROR_FLAGS_EN},
-	{"mx_write_cnt",          S_IRUGO | S_IWUSR, QUP_MX_WRITE_COUNT},
-	{"mx_write_cnt_current",  S_IRUGO,           QUP_MX_WRITE_CNT_CURRENT},
-	{"output_fifo_word_cnt",  S_IRUGO,           SPI_OUTPUT_FIFO_WORD_CNT},
-	{"input_fifo_word_cnt",   S_IRUGO,           SPI_INPUT_FIFO_WORD_CNT},
+	{"qup_config",            S_IRUGO | S_IWUSR, QUP_CONFIG, NULL},
+	{"qup_error_flags",       S_IRUGO | S_IWUSR, QUP_ERROR_FLAGS, NULL},
+	{"qup_error_flags_en",    S_IRUGO | S_IWUSR, QUP_ERROR_FLAGS_EN, NULL},
+	{"mx_write_cnt",          S_IRUGO | S_IWUSR, QUP_MX_WRITE_COUNT, NULL},
+	{"mx_write_cnt_current",  S_IRUGO,           QUP_MX_WRITE_CNT_CURRENT,
+									NULL},
+	{"output_fifo_word_cnt",  S_IRUGO,           SPI_OUTPUT_FIFO_WORD_CNT,
+									NULL},
+	{"input_fifo_word_cnt",   S_IRUGO,           SPI_INPUT_FIFO_WORD_CNT,
+									NULL},
 #endif
 };
 #endif
@@ -284,8 +289,8 @@ struct msm_spi_bam_pipe {
 
 struct msm_spi_bam {
 	void __iomem            *base;
-	u32                      phys_addr;
-	u32                      handle;
+	phys_addr_t              phys_addr;
+	uintptr_t                handle;
 	u32                      irq;
 	struct msm_spi_bam_pipe  prod;
 	struct msm_spi_bam_pipe  cons;
@@ -305,7 +310,8 @@ struct msm_spi {
 	struct mutex             core_lock;
 	struct spi_message      *cur_msg;
 	struct spi_transfer     *cur_transfer;
-	struct completion        transfer_complete;
+	struct completion        tx_transfer_complete;
+	struct completion        rx_transfer_complete;
 	struct clk              *clk;    /* core clock */
 	struct clk              *pclk;   /* interface clock */
 	struct qup_i2c_clk_path_vote clk_path_vote;
@@ -330,7 +336,8 @@ struct msm_spi {
 	bool                     transfer_pending;
 	wait_queue_head_t        continue_suspend;
 	/* DMA data */
-	enum msm_spi_mode        mode;
+	enum msm_spi_mode        tx_mode;
+	enum msm_spi_mode        rx_mode;
 	bool                     use_dma;
 	int                      tx_dma_chan;
 	int                      tx_dma_crci;
@@ -339,14 +346,6 @@ struct msm_spi {
 	int                      (*dma_init) (struct msm_spi *dd);
 	void                     (*dma_teardown) (struct msm_spi *dd);
 	struct msm_spi_bam       bam;
-	/* Data Mover Commands */
-	struct spi_dmov_cmd      *tx_dmov_cmd;
-	struct spi_dmov_cmd      *rx_dmov_cmd;
-	/* Physical address of the tx dmov box command */
-	dma_addr_t               tx_dmov_cmd_dma;
-	dma_addr_t               rx_dmov_cmd_dma;
-	struct msm_dmov_cmd      tx_hdr;
-	struct msm_dmov_cmd      rx_hdr;
 	int                      input_block_size;
 	int                      output_block_size;
 	int                      input_burst_size;
@@ -361,12 +360,8 @@ struct msm_spi {
 	u32                      tx_unaligned_len;
 	u32                      rx_unaligned_len;
 	/* DMA statistics */
-	int                      stat_dmov_tx_err;
-	int                      stat_dmov_rx_err;
 	int                      stat_rx;
-	int                      stat_dmov_rx;
 	int                      stat_tx;
-	int                      stat_dmov_tx;
 #ifdef CONFIG_DEBUG_FS
 	struct dentry *dent_spi;
 	struct dentry *debugfs_spi_regs[ARRAY_SIZE(debugfs_spi_regs)];
@@ -374,7 +369,8 @@ struct msm_spi {
 	struct msm_spi_platform_data *pdata; /* Platform data */
 	/* When set indicates multiple transfers in a single message */
 	bool                     multi_xfr;
-	bool                     done;
+	bool                     rx_done;
+	bool                     tx_done;
 	u32                      cur_msg_len;
 	/* Used in FIFO mode to keep track of the transfer being processed */
 	struct spi_transfer     *cur_tx_transfer;
@@ -392,6 +388,8 @@ struct msm_spi {
 	struct pinctrl		*pinctrl;
 	struct pinctrl_state	*pins_active;
 	struct pinctrl_state	*pins_sleep;
+	bool			is_init_complete;
+	bool			pack_words;
 };
 
 /* Forward declaration */
@@ -548,7 +546,8 @@ static inline void msm_spi_set_write_count(struct msm_spi *dd, int val)
 
 static inline void msm_spi_complete(struct msm_spi *dd)
 {
-	dd->done = 1;
+	dd->tx_done = true;
+	dd->rx_done = true;
 }
 
 static inline void msm_spi_enable_error_flags(struct msm_spi *dd)

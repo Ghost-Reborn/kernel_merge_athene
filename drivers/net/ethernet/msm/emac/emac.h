@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2013-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -34,20 +34,30 @@
 #define EMAC_NUM_CORE_IRQ     4
 #define EMAC_WOL_IRQ          4
 #define EMAC_SGMII_PHY_IRQ    5
-#define EMAC_NUM_IRQ          6
-
-/* emac clocks */
-#define EMAC_AXI_CLK          0
-#define EMAC_CFG_AHB_CLK      1
-#define EMAC_125M_CLK         2
-#define EMAC_SYS_25M_CLK      3
-#define EMAC_TX_CLK           4
-#define EMAC_RX_CLK           5
-#define EMAC_SYS_CLK          6
-#define EMAC_NUM_CLK          7
-
+#define EMAC_IRQ_CNT          6
 /* mdio/mdc gpios */
-#define EMAC_NUM_GPIO         2
+#define EMAC_GPIO_CNT         2
+
+enum emac_clk_id {
+	EMAC_CLK_AXI,
+	EMAC_CLK_CFG_AHB,
+	EMAC_CLK_125M,
+	EMAC_CLK_SYS_25M,
+	EMAC_CLK_TX,
+	EMAC_CLK_RX,
+	EMAC_CLK_SYS,
+	EMAC_CLK_CNT
+};
+
+#define KHz(RATE)	((RATE)    * 1000)
+#define MHz(RATE)	(KHz(RATE) * 1000)
+
+enum emac_clk_rate {
+	EMC_CLK_RATE_2_5MHz	= KHz(2500),
+	EMC_CLK_RATE_19_2MHz	= KHz(19200),
+	EMC_CLK_RATE_25MHz	= MHz(25),
+	EMC_CLK_RATE_125MHz	= MHz(125),
+};
 
 #define EMAC_LINK_SPEED_UNKNOWN         0x0
 #define EMAC_LINK_SPEED_10_HALF         0x0001
@@ -177,10 +187,35 @@ struct emac_hw_stats {
 	u64 tx_col;             /* collisions */
 };
 
+enum emac_hw_flags {
+	EMAC_FLAG_HW_PROMISC_EN,
+	EMAC_FLAG_HW_VLANSTRIP_EN,
+	EMAC_FLAG_HW_MULTIALL_EN,
+	EMAC_FLAG_HW_LOOPBACK_EN,
+	EMAC_FLAG_HW_PTP_CAP,
+	EMAC_FLAG_HW_PTP_EN,
+	EMAC_FLAG_HW_TS_RX_EN,
+	EMAC_FLAG_HW_TS_TX_EN,
+};
+
+enum emac_adapter_flags {
+	EMAC_FLAG_ADPT_STATE_RESETTING,
+	EMAC_FLAG_ADPT_STATE_DOWN,
+	EMAC_FLAG_ADPT_STATE_WATCH_DOG,
+	EMAC_FLAG_ADPT_TASK_REINIT_REQ,
+	EMAC_FLAG_ADPT_TASK_LSC_REQ,
+	EMAC_FLAG_ADPT_TASK_CHK_SGMII_REQ,
+};
+
+/* emac shorthand bitops macros */
+#define TEST_FLAG(OBJ, FLAG)	test_bit(EMAC_FLAG_ ## FLAG,  &((OBJ)->flags))
+#define SET_FLAG(OBJ,  FLAG)	set_bit(EMAC_FLAG_ ## FLAG,   &((OBJ)->flags))
+#define CLR_FLAG(OBJ,  FLAG)	clear_bit(EMAC_FLAG_ ## FLAG, &((OBJ)->flags))
+#define TEST_N_SET_FLAG(OBJ, FLAG) \
+			test_and_set_bit(EMAC_FLAG_ ## FLAG,  &((OBJ)->flags))
+
 struct emac_hw {
 	void __iomem *reg_addr[NUM_EMAC_REG_BASES];
-
-	struct emac_adapter *adpt;
 
 	u16     devid;
 	u16     revid;
@@ -223,27 +258,19 @@ struct emac_hw {
 
 	/* 1588 parameter */
 	enum emac_ptp_clk_mode  ptp_clk_mode;
-	u32                     rtc_ref_clkrate;
+	enum emac_ptp_mode      ptp_mode;
+	u32                     ptp_intr_mask;
 	spinlock_t              ptp_lock;
+	u32                     tstamp_rx_offset;
+	u32                     tstamp_tx_offset;
+	void                    *frac_ns_adj_tbl;
+	u32                     frac_ns_adj_tbl_sz;
+	s32                     frac_ns_adj;
 
 	u32                 irq_mod;
 	u32                 preamble;
 	unsigned long       flags;
 };
-
-#define EMAC_HW_FLAG_PROMISC_EN          0
-#define EMAC_HW_FLAG_VLANSTRIP_EN        1
-#define EMAC_HW_FLAG_MULTIALL_EN         2
-#define EMAC_HW_FLAG_LOOPBACK_EN         3
-
-#define EMAC_HW_FLAG_PTP_CAP             4
-#define EMAC_HW_FLAG_PTP_EN              5
-#define EMAC_HW_FLAG_TS_RX_EN            6
-#define EMAC_HW_FLAG_TS_TX_EN            7
-
-#define CHK_HW_FLAG(_flag)              CHK_FLAG(hw, HW, _flag)
-#define SET_HW_FLAG(_flag)              SET_FLAG(hw, HW, _flag)
-#define CLI_HW_FLAG(_flag)              CLI_FLAG(hw, HW, _flag)
 
 /* RSS hstype Definitions */
 #define EMAC_RSS_HSTYP_IPV4_EN           0x00000001
@@ -278,8 +305,6 @@ struct emac_hw {
 		_vlan = ((((_tag) >> 8) & 0xFF) | (((_tag) & 0xFF) << 8));
 
 
-#define EMAC_MAX_HANDLED_INTRS          5
-
 #define EMAC_DEF_RX_BUF_SIZE            1536
 #define EMAC_MAX_JUMBO_PKT_SIZE         (9*1024)
 #define EMAC_MAX_TX_OFFLOAD_THRESH      (9*1024)
@@ -292,7 +317,7 @@ struct emac_hw {
 #define EMAC_ACTIVE_TXQ         0
 
 #define EMAC_MAX_RX_QUEUES      4
-#define EMAC_DEF_RX_QUEUES      4
+#define EMAC_DEF_RX_QUEUES      1
 
 #define EMAC_MIN_TX_DESCS       128
 #define EMAC_MIN_RX_DESCS       128
@@ -352,6 +377,17 @@ struct emac_sw_rrdes_general {
 	/* dword 5 */
 	u32 ts_high;
 };
+
+/* EMAC Errors in emac_sw_rrdesc.dfmt.dw[3] */
+#define EMAC_RRDES_L4F BIT(14)
+#define EMAC_RRDES_IPF BIT(15)
+#define EMAC_RRDES_CRC BIT(21)
+#define EMAC_RRDES_FAE BIT(22)
+#define EMAC_RRDES_TRN BIT(23)
+#define EMAC_RRDES_RNT BIT(24)
+#define EMAC_RRDES_INC BIT(25)
+#define EMAC_RRDES_FOV BIT(29)
+#define EMAC_RRDES_LEN BIT(30)
 
 union emac_sw_rrdesc {
 	struct emac_sw_rrdes_general genr;
@@ -483,29 +519,45 @@ union emac_sw_tpdesc {
 #define EMAC_TPD_LAST_FRAGMENT  0x80000000
 #define EMAC_TPD_TSTAMP_SAVE    0x80000000
 
-struct emac_irq_info {
+
+/* emac_irq_per_dev per-device (per-adapter) irq properties.
+ * @idx:	index of this irq entry in the adapter irq array.
+ * @irq:	irq number.
+ * @mask	mask to use over status register.
+ */
+struct emac_irq_per_dev {
+	int idx;
 	unsigned int irq;
+	u32 mask;
+};
+
+/* emac_irq_common irq properties which are common to all devices of this driver
+ * @name	name in configuration (devicetree).
+ * @handler	ISR.
+ * @status_reg	status register offset.
+ * @mask_reg	mask   register offset.
+ * @init_mask	initial value for mask to use over status register.
+ * @irqflags	request_irq() flags.
+ */
+struct emac_irq_common {
 	char *name;
 	irq_handler_t handler;
 
 	u32 status_reg;
 	u32 mask_reg;
-	u32 mask;
+	u32 init_mask;
 
-	struct emac_rx_queue *rxque;
-	struct emac_adapter  *adpt;
+	unsigned long irqflags;
 };
 
-struct emac_gpio_info {
-	unsigned int gpio;
-	char *name;
-};
+/* emac_irq_cmn_tbl a table of common irq properties to all devices of this
+ * driver.
+ */
+extern const struct emac_irq_common emac_irq_cmn_tbl[];
 
-struct emac_clk_info {
-	struct clk           *clk;
-	char                 *name;
-	bool                  enabled;
-	struct emac_adapter  *adpt;
+struct emac_clk {
+	struct clk		*clk;
+	bool			enabled;
 };
 
 /* emac_ring_header represents a single, contiguous block of DMA space
@@ -571,7 +623,7 @@ struct emac_rx_queue {
 	u8 consume_shft;
 
 	u32 intr;
-	struct emac_irq_info *irq_info;
+	struct emac_irq_per_dev *irq;
 };
 
 #define GET_RFD_BUFFER(_rque, _i)    (&((_rque)->rfd.rfbuff[(_i)]))
@@ -587,6 +639,28 @@ struct emac_tpd_ring {
 	u32 produce_idx;
 	u32 consume_idx;
 	u32 last_produce_idx;
+};
+
+#define EMAC_HWTXTSTAMP_FIFO_DEPTH          8
+#define EMAC_TX_POLL_HWTXTSTAMP_THRESHOLD   EMAC_HWTXTSTAMP_FIFO_DEPTH
+
+/* HW tx timestamp */
+struct emac_hwtxtstamp {
+	u32 ts_idx;
+	u32 sec;
+	u32 ns;
+};
+
+struct emac_tx_tstamp_stats {
+	u32 tx;
+	u32 rx;
+	u32 deliver;
+	u32 drop;
+	u32 lost;
+	u32 timeout;
+	u32 sched;
+	u32 poll;
+	u32 tx_poll;
 };
 
 /* tx queue */
@@ -611,9 +685,9 @@ struct emac_tx_queue {
 struct emac_adapter {
 	struct net_device *netdev;
 
-	struct emac_irq_info  irq_info[EMAC_NUM_IRQ];
-	struct emac_gpio_info gpio_info[EMAC_NUM_GPIO];
-	struct emac_clk_info  clk_info[EMAC_NUM_CLK];
+	struct emac_irq_per_dev		irq[EMAC_IRQ_CNT];
+	unsigned int			gpio[EMAC_GPIO_CNT];
+	struct emac_clk			clk[EMAC_CLK_CNT];
 
 	/* dma parameters */
 	u64                             dma_mask;
@@ -637,6 +711,13 @@ struct emac_adapter {
 	struct emac_hw hw;
 	struct emac_hw_stats hw_stats;
 
+	/* tx timestamping queue */
+	struct sk_buff_head         hwtxtstamp_pending_queue;
+	struct sk_buff_head         hwtxtstamp_ready_queue;
+	struct work_struct          hwtxtstamp_task;
+	spinlock_t                  hwtxtstamp_lock; /* lock for hwtxtstamp */
+	struct emac_tx_tstamp_stats hwtxtstamp_stats;
+
 	struct work_struct emac_task;
 	struct timer_list  emac_timer;
 	unsigned long	link_jiffies;
@@ -650,28 +731,22 @@ struct emac_adapter {
 	unsigned long   flags;
 };
 
-#define EMAC_ADPT_FLAG_STATE_RESETTING          16
-#define EMAC_ADPT_FLAG_STATE_DOWN               17
-#define EMAC_ADPT_FLAG_STATE_WATCH_DOG          18
+static inline struct emac_adapter *emac_hw_get_adap(struct emac_hw *hw)
+{
+	return container_of(hw, struct emac_adapter, hw);
+}
 
-#define EMAC_ADPT_FLAG_TASK_REINIT_REQ          19
-#define EMAC_ADPT_FLAG_TASK_LSC_REQ             20
-#define EMAC_ADPT_FLAG_TASK_CHK_SGMII_REQ       21
-
-#define CHK_ADPT_FLAG(_flag)           CHK_FLAG(adpt, ADPT, _flag)
-#define SET_ADPT_FLAG(_flag)           SET_FLAG(adpt, ADPT, _flag)
-#define CLI_ADPT_FLAG(_flag)           CLI_FLAG(adpt, ADPT, _flag)
-#define CHK_AND_SET_ADPT_FLAG(_flag)   CHK_AND_SET_FLAG(adpt, ADPT, _flag)
-
-/* definitions for flags */
-#define CHK_FLAG(_st, _type, _flag) \
-		test_bit((EMAC_##_type##_FLAG_##_flag), &((_st)->flags))
-#define SET_FLAG(_st, _type, _flag) \
-		set_bit((EMAC_##_type##_FLAG_##_flag), &((_st)->flags))
-#define CLI_FLAG(_st, _type, _flag) \
-		clear_bit((EMAC_##_type##_FLAG_##_flag), &((_st)->flags))
-#define CHK_AND_SET_FLAG(_st, _type, _flag) \
-		test_and_set_bit((EMAC_##_type##_FLAG_##_flag), &((_st)->flags))
+static inline
+struct emac_adapter *emac_irq_get_adpt(struct emac_irq_per_dev *irq)
+{
+	struct emac_irq_per_dev *irq_0 = irq - irq->idx;
+	/* why using __builtin_offsetof() and not container_of() ?
+	 * container_of(irq_0, struct emac_adapter, irq) fails to compile
+	 * because emac->irq is of array type.
+	 */
+	return (struct emac_adapter *)
+		((char *)irq_0 - __builtin_offsetof(struct emac_adapter, irq));
+}
 
 /* default to trying for four seconds */
 #define EMAC_TRY_LINK_TIMEOUT     (4 * HZ)

@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2010-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -15,7 +15,7 @@
 #define __ARCH_ARM_MACH_MSM_CLOCK_RPM_H
 
 #include <linux/clk/msm-clk-provider.h>
-#include <mach/rpm-smd.h>
+#include <soc/qcom/rpm-smd.h>
 
 #define RPM_SMD_KEY_RATE	0x007A484B
 #define RPM_SMD_KEY_ENABLE	0x62616E45
@@ -31,11 +31,11 @@ extern struct clk_ops clk_ops_rpm;
 extern struct clk_ops clk_ops_rpm_branch;
 
 struct rpm_clk {
-	const int rpm_res_type;
-	const int rpm_key;
-	const int rpm_clk_id;
+	int rpm_res_type;
+	int rpm_key;
+	int rpm_clk_id;
 	const int rpm_status_id;
-	const bool active_only;
+	bool active_only;
 	bool enabled;
 	bool branch; /* true: RPM only accepts 1 for ON and 0 for OFF */
 	struct clk_rpmrs_data *rpmrs_data;
@@ -52,7 +52,9 @@ static inline struct rpm_clk *to_rpm_clk(struct clk *clk)
  * RPM scaling enable function used for target that has an RPM resource for
  * rpm clock scaling enable.
  */
-void enable_rpm_scaling(void);
+int enable_rpm_scaling(void);
+
+int vote_bimc(struct rpm_clk *r, uint32_t value);
 
 extern struct clk_rpmrs_data clk_rpmrs_data_smd;
 

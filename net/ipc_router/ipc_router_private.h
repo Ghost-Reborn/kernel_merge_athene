@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2011-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -38,10 +38,12 @@
 #define IPC_ROUTER_NID_LOCAL			1
 #define MAX_IPC_PKT_SIZE 66000
 
-#define IPC_ROUTER_DEFAULT_RX_QUOTA	5
+#define IPC_ROUTER_LOW_RX_QUOTA		5
+#define IPC_ROUTER_HIGH_RX_QUOTA	10
 
 #define IPC_ROUTER_INFINITY -1
-#define DEFAULT_RCV_TIMEO 0
+#define DEFAULT_RCV_TIMEO IPC_ROUTER_INFINITY
+#define DEFAULT_SND_TIMEO IPC_ROUTER_INFINITY
 
 #define ALIGN_SIZE(x) ((4 - ((x) & 3)) & 3)
 
@@ -64,10 +66,16 @@ enum {
 	MULTI_LINK_MODE,
 };
 
+enum {
+	CONNECTION_RESET = -1,
+	NOT_CONNECTED,
+	CONNECTED,
+};
+
 struct msm_ipc_sock {
 	struct sock sk;
 	struct msm_ipc_port *port;
-	void *default_pil;
+	void *default_node_vote_info;
 };
 
 /**
@@ -91,7 +99,8 @@ struct msm_ipc_port *msm_ipc_router_create_raw_port(void *endpoint,
 	void *priv);
 int msm_ipc_router_send_to(struct msm_ipc_port *src,
 			   struct sk_buff_head *data,
-			   struct msm_ipc_addr *dest);
+			   struct msm_ipc_addr *dest,
+			   long timeout);
 int msm_ipc_router_read(struct msm_ipc_port *port_ptr,
 			struct rr_packet **pkt,
 			size_t buf_len);
@@ -114,4 +123,14 @@ void msm_ipc_sync_default_sec_rule(void *rule);
 int msm_ipc_router_rx_data_wait(struct msm_ipc_port *port_ptr, long timeout);
 
 void msm_ipc_router_free_skb(struct sk_buff_head *skb_head);
+
+/**
+ * ipc_router_set_conn() - Set the connection by initializing dest address
+ * @port_ptr: Local port in which the connection has to be set.
+ * @addr: Destination address of the connection.
+ *
+ * @return: 0 on success, standard Linux error codes on failure.
+ */
+int ipc_router_set_conn(struct msm_ipc_port *port_ptr,
+			struct msm_ipc_addr *addr);
 #endif

@@ -1,9 +1,10 @@
-/* arch/arm/mach-msm/io.c
+/*
+ * arch/arm/mach-msm/io.c
  *
  * MSM7K, QSD io support
  *
  * Copyright (C) 2007 Google, Inc.
- * Copyright (c) 2008-2014, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2008-2015, The Linux Foundation. All rights reserved.
  * Author: Brian Swetland <swetland@google.com>
  *
  * This software is licensed under the terms of the GNU General Public
@@ -91,6 +92,22 @@ void __init msm_map_fsm9900_io(void)
 }
 #endif /* CONFIG_ARCH_FSM9900 */
 
+#ifdef CONFIG_ARCH_FSM9010
+static struct map_desc fsm9010_io_desc[] __initdata = {
+	MSM_CHIP_DEVICE(APCS_GCC, FSM9010),
+	MSM_CHIP_DEVICE(MPM2_PSHOLD, FSM9010),
+#ifdef CONFIG_DEBUG_FSM9010_UART
+	MSM_DEVICE(DEBUG_UART),
+#endif
+};
+
+void __init msm_map_fsm9010_io(void)
+{
+	iotable_init(fsm9010_io_desc, ARRAY_SIZE(fsm9010_io_desc));
+}
+#endif /* CONFIG_ARCH_FSM9010 */
+
+
 #ifdef CONFIG_ARCH_MDM9630
 static struct map_desc mdm9630_io_desc[] __initdata = {
 	MSM_CHIP_DEVICE(TLMM, MDM9630),
@@ -103,20 +120,33 @@ void __init msm_map_mdm9630_io(void)
 }
 #endif /* CONFIG_ARCH_MDM9630 */
 
-#ifdef CONFIG_ARCH_MPQ8092
-static struct map_desc mpq8092_io_desc[] __initdata = {
-	MSM_CHIP_DEVICE(MPM2_PSHOLD, MPQ8092),
-	MSM_CHIP_DEVICE(TLMM, MPQ8092),
-#ifdef CONFIG_DEBUG_MPQ8092_UART
+#ifdef CONFIG_ARCH_MSM8909
+static struct map_desc msm8909_io_desc[] __initdata = {
+	MSM_CHIP_DEVICE(APCS_GCC, MSM8909),
+#ifdef CONFIG_DEBUG_MSM8909_UART
 	MSM_DEVICE(DEBUG_UART),
 #endif
 };
 
-void __init msm_map_mpq8092_io(void)
+void __init msm_map_msm8909_io(void)
 {
-	iotable_init(mpq8092_io_desc, ARRAY_SIZE(mpq8092_io_desc));
+	iotable_init(msm8909_io_desc, ARRAY_SIZE(msm8909_io_desc));
 }
-#endif /* CONFIG_ARCH_MPQ8092 */
+#endif /* CONFIG_ARCH_MSM8909 */
+
+#ifdef CONFIG_ARCH_MSM8916
+static struct map_desc msm8916_io_desc[] __initdata = {
+	MSM_CHIP_DEVICE(APCS_GCC, MSM8916),
+#ifdef CONFIG_DEBUG_MSM8916_UART
+	MSM_DEVICE(DEBUG_UART),
+#endif
+};
+
+void __init msm_map_msm8916_io(void)
+{
+	iotable_init(msm8916_io_desc, ARRAY_SIZE(msm8916_io_desc));
+}
+#endif /* CONFIG_ARCH_MSM8916 */
 
 #ifdef CONFIG_ARCH_MSM8226
 static struct map_desc msm_8226_io_desc[] __initdata = {
@@ -148,17 +178,41 @@ void __init msm_map_msm8610_io(void)
 }
 #endif /* CONFIG_ARCH_MSM8610 */
 
-#ifdef CONFIG_ARCH_MSMSAMARIUM
-static struct map_desc msmsamarium_io_desc[] __initdata = {
-	MSM_CHIP_DEVICE(TLMM, MSMSAMARIUM),
-	MSM_CHIP_DEVICE(MPM2_PSHOLD, MSMSAMARIUM),
-#if defined(CONFIG_DEBUG_MSMSAMARIUM_UART) || defined(CONFIG_DEBUG_MSM8974_UART)
+#ifdef CONFIG_ARCH_MDM9640
+static struct map_desc mdm9640_io_desc[] __initdata = {
+#ifdef CONFIG_DEBUG_MDM9640_UART
 	MSM_DEVICE(DEBUG_UART),
 #endif
 };
 
-void __init msm_map_msmsamarium_io(void)
+void __init msm_map_mdm9640_io(void)
 {
-	iotable_init(msmsamarium_io_desc, ARRAY_SIZE(msmsamarium_io_desc));
+	iotable_init(mdm9640_io_desc, ARRAY_SIZE(mdm9640_io_desc));
 }
-#endif /* CONFIG_ARCH_MSMSAMARIUM */
+#endif /* CONFIG_ARCH_MDM9640 */
+
+#ifdef CONFIG_ARCH_MSMVPIPA
+static struct map_desc msmvpipa_io_desc[] __initdata = {
+#ifdef CONFIG_DEBUG_MSMVPIPA_UART
+	MSM_DEVICE(DEBUG_UART),
+#endif
+};
+
+void __init msm_map_msmvpipa_io(void)
+{
+	iotable_init(msmvpipa_io_desc, ARRAY_SIZE(msmvpipa_io_desc));
+}
+#endif /* CONFIG_ARCH_MSMVPIPA */
+
+#ifdef CONFIG_ARCH_MDMFERMIUM
+static struct map_desc mdmfermium_io_desc[] __initdata = {
+#ifdef CONFIG_DEBUG_MDMFERMIUM_UART
+	MSM_DEVICE(DEBUG_UART),
+#endif
+};
+
+void __init msm_map_mdmfermium_io(void)
+{
+	iotable_init(mdmfermium_io_desc, ARRAY_SIZE(mdmfermium_io_desc));
+}
+#endif /* CONFIG_ARCH_MDMFERMIUM */

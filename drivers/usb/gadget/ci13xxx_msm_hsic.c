@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -27,9 +27,9 @@
 #include <linux/usb/gadget.h>
 #include <linux/usb/msm_hsusb_hw.h>
 #include <linux/usb/msm_hsusb.h>
+#include <linux/msm-bus.h>
 
 #include <mach/msm_iomap.h>
-#include <mach/msm_xo.h>
 #include <mach/rpm-regulator.h>
 
 #include "ci13xxx_udc.c"
@@ -37,9 +37,6 @@
 #define MSM_USB_BASE	(mhsic->regs)
 
 #define ULPI_IO_TIMEOUT_USEC			(10 * 1000)
-#define USB_PHY_VDD_DIG_VOL_NONE		0 /*uV */
-#define USB_PHY_VDD_DIG_VOL_MIN			1045000 /* uV */
-#define USB_PHY_VDD_DIG_VOL_MAX			1320000 /* uV */
 #define LINK_RESET_TIMEOUT_USEC			(250 * 1000)
 #define PHY_SUSPEND_TIMEOUT_USEC		(500 * 1000)
 #define PHY_RESUME_TIMEOUT_USEC			(100 * 1000)
@@ -48,6 +45,7 @@
 #define HSIC_DBG1_REG					0x38
 
 struct msm_hsic_per *the_mhsic;
+static u64 msm_hsic_peripheral_dma_mask = DMA_BIT_MASK(32);
 
 struct msm_hsic_per {
 	struct device		*dev;
@@ -56,79 +54,85 @@ struct msm_hsic_per {
 	struct clk			*alt_core_clk;
 	struct clk			*phy_clk;
 	struct clk			*cal_clk;
-	struct regulator	*hsic_vddcx;
-	bool				async_int;
+	struct regulator	*hsic_vdd;
+	int			async_int;
+	int			vdd_val[3];
+	struct regulator        *hsic_gdsc;
 	void __iomem		*regs;
-	int					irq;
-	atomic_t			in_lpm;
+	int			irq;
+	int			async_irq_no;
+	atomic_t		in_lpm;
 	struct wake_lock	wlock;
-	struct msm_xo_voter	*xo_handle;
 	struct workqueue_struct *wq;
 	struct work_struct	suspend_w;
 	struct msm_hsic_peripheral_platform_data *pdata;
+	u32			bus_perf_client;
+	struct msm_bus_scale_pdata	*bus_scale_table;
 	enum usb_vdd_type	vdd_type;
 	bool connected;
 };
 
-static const int vdd_val[VDD_TYPE_MAX][VDD_VAL_MAX] = {
-		{   /* VDD_CX CORNER Voting */
-			[VDD_NONE]	= RPM_VREG_CORNER_NONE,
-			[VDD_MIN]	= RPM_VREG_CORNER_NOMINAL,
-			[VDD_MAX]	= RPM_VREG_CORNER_HIGH,
-		},
-		{   /* VDD_CX Voltage Voting */
-			[VDD_NONE]	= USB_PHY_VDD_DIG_VOL_NONE,
-			[VDD_MIN]	= USB_PHY_VDD_DIG_VOL_MIN,
-			[VDD_MAX]	= USB_PHY_VDD_DIG_VOL_MAX,
-		},
-};
+#define NONE 0
+#define MIN  1
+#define MAX  2
 
-static int msm_hsic_init_vddcx(struct msm_hsic_per *mhsic, int init)
+static int msm_hsic_init_vdd(struct msm_hsic_per *mhsic, int init)
 {
 	int ret = 0;
-	int none_vol, min_vol, max_vol;
 
-	if (!mhsic->hsic_vddcx) {
-		mhsic->vdd_type = VDDCX_CORNER;
-		mhsic->hsic_vddcx = devm_regulator_get(mhsic->dev,
-			"hsic_vdd_dig");
-		if (IS_ERR(mhsic->hsic_vddcx)) {
-			mhsic->hsic_vddcx = devm_regulator_get(mhsic->dev,
-				"HSIC_VDDCX");
-			if (IS_ERR(mhsic->hsic_vddcx)) {
-				dev_err(mhsic->dev, "unable to get hsic vddcx\n");
-				return PTR_ERR(mhsic->hsic_vddcx);
+	if (!mhsic->hsic_vdd) {
+		mhsic->hsic_vdd = devm_regulator_get(mhsic->dev, "vdd");
+		if (IS_ERR(mhsic->hsic_vdd)) {
+			dev_err(mhsic->dev, "unable to get hsic vdd\n");
+				return PTR_ERR(mhsic->hsic_vdd);
 			}
-			mhsic->vdd_type = VDDCX;
-		}
 	}
 
-	none_vol = vdd_val[mhsic->vdd_type][VDD_NONE];
-	min_vol = vdd_val[mhsic->vdd_type][VDD_MIN];
-	max_vol = vdd_val[mhsic->vdd_type][VDD_MAX];
+	if (mhsic->dev->of_node) {
+		ret = of_property_read_u32_array(mhsic->dev->of_node,
+			"qcom,vdd-voltage-level",
+			mhsic->vdd_val, ARRAY_SIZE(mhsic->vdd_val));
+
+		if (ret == -EINVAL)
+			dev_err(mhsic->dev, "invalid vdd-level.\n");
+		else if (ret == -ENODATA)
+			dev_err(mhsic->dev, "no data for vdd-level.\n");
+		else if (ret == -EOVERFLOW)
+			dev_err(mhsic->dev, "overflow with vdd-level.\n");
+
+		if (ret)
+			return ret;
+	} else {
+		dev_err(mhsic->dev, "vdd config is not provided.\n");
+		return -EINVAL;
+	}
 
 	if (!init)
 		goto disable_reg;
 
-	ret = regulator_set_voltage(mhsic->hsic_vddcx, min_vol, max_vol);
+	dev_dbg(mhsic->dev, "vdd[NONE]:%d vdd[MIN]:%d vdd[MAX]:%d\n",
+		mhsic->vdd_val[NONE], mhsic->vdd_val[MIN], mhsic->vdd_val[MAX]);
+
+	ret = regulator_set_voltage(mhsic->hsic_vdd, mhsic->vdd_val[MIN],
+							mhsic->vdd_val[MAX]);
 	if (ret) {
-		dev_err(mhsic->dev, "unable to set the voltage"
-				"for hsic vddcx\n");
+		dev_err(mhsic->dev, "unable to set the voltage for hsic vdd\n");
 		goto reg_set_voltage_err;
 	}
 
-	ret = regulator_enable(mhsic->hsic_vddcx);
+	ret = regulator_enable(mhsic->hsic_vdd);
 	if (ret) {
-		dev_err(mhsic->dev, "unable to enable hsic vddcx\n");
+		dev_err(mhsic->dev, "unable to enable hsic vddx\n");
 		goto reg_enable_err;
 	}
 
 	return 0;
 
 disable_reg:
-	regulator_disable(mhsic->hsic_vddcx);
+	regulator_disable(mhsic->hsic_vdd);
 reg_enable_err:
-	regulator_set_voltage(mhsic->hsic_vddcx, none_vol, max_vol);
+	regulator_set_voltage(mhsic->hsic_vdd, mhsic->vdd_val[NONE],
+						mhsic->vdd_val[MAX]);
 reg_set_voltage_err:
 
 	return ret;
@@ -164,6 +168,7 @@ static int msm_hsic_phy_clk_reset(struct msm_hsic_per *mhsic)
 {
 	int ret;
 
+	clk_enable(mhsic->alt_core_clk);
 	ret = clk_reset(mhsic->core_clk, CLK_RESET_ASSERT);
 	if (ret) {
 		clk_disable(mhsic->alt_core_clk);
@@ -202,6 +207,30 @@ static int msm_hsic_phy_reset(struct msm_hsic_per *mhsic)
 	return 0;
 }
 
+static int msm_hsic_config_gdsc(struct platform_device *pdev,
+			struct msm_hsic_per *mhsic, bool enable)
+{
+	int ret = 0;
+
+	if (!mhsic->hsic_gdsc) {
+		mhsic->hsic_gdsc = devm_regulator_get(&pdev->dev, "GDSC");
+		if (IS_ERR(mhsic->hsic_gdsc))
+			return 0;
+	}
+
+	if (enable) {
+		ret = regulator_enable(mhsic->hsic_gdsc);
+		if (ret) {
+			dev_err(mhsic->dev, "unable to enable hsic gdsc\n");
+			return ret;
+		}
+	} else {
+		regulator_disable(mhsic->hsic_gdsc);
+	}
+
+	return 0;
+}
+
 static int msm_hsic_enable_clocks(struct platform_device *pdev,
 				struct msm_hsic_per *mhsic, bool enable)
 {
@@ -214,36 +243,56 @@ static int msm_hsic_enable_clocks(struct platform_device *pdev,
 	if (IS_ERR(mhsic->iface_clk)) {
 		dev_err(mhsic->dev, "failed to get iface_clk\n");
 		ret = PTR_ERR(mhsic->iface_clk);
-		goto put_iface_clk;
+		goto error_enable_clocks;
 	}
 
 	mhsic->core_clk = clk_get(&pdev->dev, "core_clk");
 	if (IS_ERR(mhsic->core_clk)) {
 		dev_err(mhsic->dev, "failed to get core_clk\n");
 		ret = PTR_ERR(mhsic->core_clk);
-		goto put_core_clk;
+		goto put_iface_clk;
 	}
+
+	ret = clk_set_rate(mhsic->core_clk,
+			clk_round_rate(mhsic->core_clk, LONG_MAX));
+	if (ret)
+		dev_err(mhsic->dev, "failed to set core_clk rate\n");
 
 	mhsic->phy_clk = clk_get(&pdev->dev, "phy_clk");
 	if (IS_ERR(mhsic->phy_clk)) {
 		dev_err(mhsic->dev, "failed to get phy_clk\n");
 		ret = PTR_ERR(mhsic->phy_clk);
-		goto put_phy_clk;
+		goto put_core_clk;
 	}
+
+	ret = clk_set_rate(mhsic->phy_clk,
+			clk_round_rate(mhsic->phy_clk, LONG_MAX));
+	if (ret)
+		dev_err(mhsic->dev, "failed to set phy_clk rate\n");
 
 	mhsic->alt_core_clk = clk_get(&pdev->dev, "alt_core_clk");
 	if (IS_ERR(mhsic->alt_core_clk)) {
 		dev_err(mhsic->dev, "failed to get alt_core_clk\n");
 		ret = PTR_ERR(mhsic->alt_core_clk);
-		goto put_alt_core_clk;
+		goto put_phy_clk;
 	}
+
+	ret = clk_set_rate(mhsic->alt_core_clk,
+			clk_round_rate(mhsic->alt_core_clk, LONG_MAX));
+	if (ret)
+		dev_err(mhsic->dev, "failed to set alt_core_clk rate\n");
 
 	mhsic->cal_clk = clk_get(&pdev->dev, "cal_clk");
 	if (IS_ERR(mhsic->cal_clk)) {
 		dev_err(mhsic->dev, "failed to get cal_clk\n");
 		ret = PTR_ERR(mhsic->cal_clk);
-		goto put_cal_clk;
+		goto put_alt_core_clk;
 	}
+
+	ret = clk_set_rate(mhsic->cal_clk,
+			clk_round_rate(mhsic->cal_clk, LONG_MAX));
+	if (ret)
+		dev_err(mhsic->dev, "failed to set cal_clk rate\n");
 
 	clk_prepare_enable(mhsic->iface_clk);
 	clk_prepare_enable(mhsic->core_clk);
@@ -259,7 +308,7 @@ put_clocks:
 	clk_disable_unprepare(mhsic->phy_clk);
 	clk_disable_unprepare(mhsic->alt_core_clk);
 	clk_disable_unprepare(mhsic->cal_clk);
-put_cal_clk:
+
 	clk_put(mhsic->cal_clk);
 put_alt_core_clk:
 	clk_put(mhsic->alt_core_clk);
@@ -269,6 +318,7 @@ put_core_clk:
 	clk_put(mhsic->core_clk);
 put_iface_clk:
 	clk_put(mhsic->iface_clk);
+error_enable_clocks:
 
 	return ret;
 }
@@ -338,7 +388,6 @@ static int msm_hsic_suspend(struct msm_hsic_per *mhsic)
 {
 	int cnt = 0, ret;
 	u32 val;
-	int none_vol, max_vol;
 
 	if (atomic_read(&mhsic->in_lpm)) {
 		dev_dbg(mhsic->dev, "%s called while in lpm\n", __func__);
@@ -346,43 +395,48 @@ static int msm_hsic_suspend(struct msm_hsic_per *mhsic)
 	}
 	disable_irq(mhsic->irq);
 
-	/*
-	 * PHY may take some time or even fail to enter into low power
-	 * mode (LPM). Hence poll for 500 msec and reset the PHY and link
-	 * in failure case.
-	 */
-	val = readl_relaxed(USB_PORTSC) | PORTSC_PHCD;
-	writel_relaxed(val, USB_PORTSC);
+	/* Don't try to put PHY into suspend if it is not in CONNECT state. */
+	if (the_mhsic->connected) {
+		/*
+		 * PHY may take some time or even fail to enter into low power
+		 * mode (LPM). Hence poll for 500 msec and reset the PHY and
+		 * link in failure case.
+		 */
+		val = readl_relaxed(USB_PORTSC) | PORTSC_PHCD;
+		writel_relaxed(val, USB_PORTSC);
 
-	while (cnt < PHY_SUSPEND_TIMEOUT_USEC) {
-		if (readl_relaxed(USB_PORTSC) & PORTSC_PHCD)
-			break;
-		udelay(1);
-		cnt++;
+		while (cnt < PHY_SUSPEND_TIMEOUT_USEC) {
+			if (readl_relaxed(USB_PORTSC) & PORTSC_PHCD)
+				break;
+			udelay(1);
+			cnt++;
+		}
+
+		if (cnt >= PHY_SUSPEND_TIMEOUT_USEC) {
+			dev_err(mhsic->dev, "Unable to suspend PHY\n");
+			msm_hsic_reset(mhsic);
+		}
+
+		/*
+		 * PHY has capability to generate interrupt asynchronously in
+		 * low power mode (LPM). This interrupt is level triggered. So
+		 * USB IRQ line must be disabled till async interrupt enable bit
+		 * is cleared in USBCMD register. Assert STP (ULPI interface
+		 * STOP signal) to block data communication from PHY.
+		 */
+		writel_relaxed(readl_relaxed(USB_USBCMD) | ASYNC_INTR_CTRL |
+					ULPI_STP_CTRL, USB_USBCMD);
+
+		/*
+		 * Ensure that hardware is put in low power mode before
+		 * clocks are turned OFF and VDD is allowed to minimize.
+		 */
+		mb();
+	} else {
+		dev_dbg(mhsic->dev, "%s SKIP PHY suspend\n", __func__);
 	}
 
-	if (cnt >= PHY_SUSPEND_TIMEOUT_USEC) {
-		dev_err(mhsic->dev, "Unable to suspend PHY\n");
-		msm_hsic_reset(mhsic);
-	}
-
-	/*
-	 * PHY has capability to generate interrupt asynchronously in low
-	 * power mode (LPM). This interrupt is level triggered. So USB IRQ
-	 * line must be disabled till async interrupt enable bit is cleared
-	 * in USBCMD register. Assert STP (ULPI interface STOP signal) to
-	 * block data communication from PHY.
-	 */
-	writel_relaxed(readl_relaxed(USB_USBCMD) | ASYNC_INTR_CTRL |
-				ULPI_STP_CTRL, USB_USBCMD);
-
-	/*
-	 * Ensure that hardware is put in low power mode before
-	 * clocks are turned OFF and VDD is allowed to minimize.
-	 */
-	mb();
-
-	if (!mhsic->pdata->core_clk_always_on_workaround || !mhsic->connected) {
+	if (!mhsic->connected) {
 		clk_disable_unprepare(mhsic->iface_clk);
 		clk_disable_unprepare(mhsic->core_clk);
 	}
@@ -390,22 +444,28 @@ static int msm_hsic_suspend(struct msm_hsic_per *mhsic)
 	clk_disable_unprepare(mhsic->cal_clk);
 	clk_disable_unprepare(mhsic->alt_core_clk);
 
-	ret = msm_xo_mode_vote(mhsic->xo_handle, MSM_XO_MODE_OFF);
-	if (ret)
-		dev_err(mhsic->dev, "%s failed to devote for TCXO %d\n"
-				, __func__, ret);
-
-	none_vol = vdd_val[mhsic->vdd_type][VDD_NONE];
-	max_vol = vdd_val[mhsic->vdd_type][VDD_MAX];
-
-	ret = regulator_set_voltage(mhsic->hsic_vddcx, none_vol, max_vol);
+	ret = regulator_set_voltage(mhsic->hsic_vdd, mhsic->vdd_val[NONE],
+							mhsic->vdd_val[MAX]);
 	if (ret < 0)
-		dev_err(mhsic->dev, "unable to set vddcx voltage for VDD MIN\n");
+		dev_err(mhsic->dev, "unable to set vdd voltage for VDD MIN\n");
+	if (mhsic->bus_perf_client) {
+		ret = msm_bus_scale_client_update_request(
+				mhsic->bus_perf_client, 0);
+		if (ret)
+			dev_err(mhsic->dev, "Failed to vote for bus scaling\n");
+	}
 
-	if (device_may_wakeup(mhsic->dev))
+	if (device_may_wakeup(mhsic->dev)) {
 		enable_irq_wake(mhsic->irq);
+		if (mhsic->async_irq_no)
+			enable_irq_wake(mhsic->async_irq_no);
+	}
 
 	atomic_set(&mhsic->in_lpm, 1);
+	/* If async irq present, enable while going into LPM */
+	if (mhsic->async_irq_no)
+		enable_irq(mhsic->async_irq_no);
+
 	enable_irq(mhsic->irq);
 	wake_unlock(&mhsic->wlock);
 
@@ -418,7 +478,6 @@ static int msm_hsic_resume(struct msm_hsic_per *mhsic)
 {
 	int cnt = 0, ret;
 	unsigned temp;
-	int min_vol, max_vol;
 
 	if (!atomic_read(&mhsic->in_lpm)) {
 		dev_dbg(mhsic->dev, "%s called while not in lpm\n", __func__);
@@ -427,23 +486,23 @@ static int msm_hsic_resume(struct msm_hsic_per *mhsic)
 
 	wake_lock(&mhsic->wlock);
 
-	min_vol = vdd_val[mhsic->vdd_type][VDD_MIN];
-	max_vol = vdd_val[mhsic->vdd_type][VDD_MAX];
-
-	ret = regulator_set_voltage(mhsic->hsic_vddcx, min_vol, max_vol);
+	if (mhsic->bus_perf_client) {
+		ret = msm_bus_scale_client_update_request(
+				mhsic->bus_perf_client, 1);
+		if (ret)
+			dev_err(mhsic->dev, "Failed to vote for bus scaling\n");
+	}
+	ret = regulator_set_voltage(mhsic->hsic_vdd, mhsic->vdd_val[MIN],
+							mhsic->vdd_val[MAX]);
 	if (ret < 0)
 		dev_err(mhsic->dev,
 			"unable to set nominal vddcx voltage (no VDD MIN)\n");
 
-	ret = msm_xo_mode_vote(mhsic->xo_handle, MSM_XO_MODE_ON);
-	if (ret)
-		dev_err(mhsic->dev, "%s failed to vote for TCXO %d\n",
-				__func__, ret);
-
-	if (!mhsic->pdata->core_clk_always_on_workaround || !mhsic->connected) {
+	if (!mhsic->connected) {
 		clk_prepare_enable(mhsic->iface_clk);
 		clk_prepare_enable(mhsic->core_clk);
 	}
+
 	clk_prepare_enable(mhsic->phy_clk);
 	clk_prepare_enable(mhsic->cal_clk);
 	clk_prepare_enable(mhsic->alt_core_clk);
@@ -475,15 +534,22 @@ static int msm_hsic_resume(struct msm_hsic_per *mhsic)
 		msm_hsic_reset(mhsic);
 	}
 skip_phy_resume:
-	if (device_may_wakeup(mhsic->dev))
+	if (device_may_wakeup(mhsic->dev)) {
 		disable_irq_wake(mhsic->irq);
+		if (mhsic->async_irq_no)
+			disable_irq_wake(mhsic->async_irq_no);
+	}
 
 	atomic_set(&mhsic->in_lpm, 0);
 
 	if (mhsic->async_int) {
-		mhsic->async_int = false;
-		enable_irq(mhsic->irq);
+		enable_irq(mhsic->async_int);
+		mhsic->async_int = 0;
 	}
+
+	/* If Async irq present, keep it disable once out of LPM */
+	if (mhsic->async_irq_no)
+		disable_irq(mhsic->async_irq_no);
 
 	dev_info(mhsic->dev, "HSIC-USB exited from low power mode\n");
 
@@ -585,8 +651,9 @@ static irqreturn_t msm_udc_hsic_irq(int irq, void *data)
 	struct msm_hsic_per *mhsic = data;
 
 	if (atomic_read(&mhsic->in_lpm)) {
-		disable_irq_nosync(mhsic->irq);
-		mhsic->async_int = true;
+		pr_debug("%s(): HSIC IRQ:%d in LPM\n", __func__, irq);
+		disable_irq_nosync(irq);
+		mhsic->async_int = irq;
 		pm_request_resume(mhsic->dev);
 		return IRQ_HANDLED;
 	}
@@ -598,16 +665,25 @@ static void ci13xxx_msm_hsic_notify_event(struct ci13xxx *udc, unsigned event)
 {
 	struct device *dev = udc->gadget.dev.parent;
 	struct msm_hsic_per *mhsic = the_mhsic;
+	int	temp;
 
 	switch (event) {
 	case CI13XXX_CONTROLLER_RESET_EVENT:
 		dev_info(dev, "CI13XXX_CONTROLLER_RESET_EVENT received\n");
 		writel_relaxed(0, USB_AHBBURST);
 		writel_relaxed(0x08, USB_AHBMODE);
+
+		/* workaround for rx buffer collision issue */
+		temp = readl_relaxed(USB_GENCONFIG);
+		temp &= ~GENCONFIG_TXFIFO_IDLE_FORCE_DISABLE;
+		writel_relaxed(temp, USB_GENCONFIG);
+		mb();
 		break;
 	case CI13XXX_CONTROLLER_CONNECT_EVENT:
 		dev_info(dev, "CI13XXX_CONTROLLER_CONNECT_EVENT received\n");
-		msm_hsic_wakeup();
+		/* bring HSIC core out of LPM */
+		pm_runtime_get_sync(the_mhsic->dev);
+		msm_hsic_start();
 		the_mhsic->connected = true;
 		break;
 	case CI13XXX_CONTROLLER_SUSPEND_EVENT:
@@ -615,21 +691,15 @@ static void ci13xxx_msm_hsic_notify_event(struct ci13xxx *udc, unsigned event)
 		queue_work(mhsic->wq, &mhsic->suspend_w);
 		break;
 	case CI13XXX_CONTROLLER_REMOTE_WAKEUP_EVENT:
-		dev_info(dev, "CI13XXX_CONTROLLER_REMOTE_WAKEUP_EVENT received\n");
+		dev_info(dev,
+			 "CI13XXX_CONTROLLER_REMOTE_WAKEUP_EVENT received\n");
 		msm_hsic_wakeup();
 		break;
 	case CI13XXX_CONTROLLER_UDC_STARTED_EVENT:
-		dev_info(dev, "CI13XXX_CONTROLLER_UDC_STARTED_EVENT received\n");
-		/*
-		 * UDC started, suspend the hsic device until it will be
-		 * connected by a pullup (CI13XXX_CONTROLLER_CONNECT_EVENT)
-		 * Before suspend, finish required configurations.
-		 */
-		hw_device_state(udc->ep0out.qh.dma);
-		msm_hsic_start();
-		usleep(10000);
-
+		dev_info(dev,
+			 "CI13XXX_CONTROLLER_UDC_STARTED_EVENT received\n");
 		mhsic->connected = false;
+		/* put HSIC core into LPM */
 		pm_runtime_put_noidle(the_mhsic->dev);
 		pm_runtime_suspend(the_mhsic->dev);
 		break;
@@ -649,6 +719,29 @@ static struct ci13xxx_udc_driver ci13xxx_msm_udc_hsic_driver = {
 	.notify_event		= ci13xxx_msm_hsic_notify_event,
 };
 
+struct ci13xxx_platform_data *msm_hsic_peripheral_dt_to_pdata(
+					struct platform_device *pdev)
+{
+	struct device_node *node = pdev->dev.of_node;
+	struct ci13xxx_platform_data *pdata;
+	u32 core_id;
+	int ret;
+
+	pdata = devm_kzalloc(&pdev->dev, sizeof(*pdata), GFP_KERNEL);
+	if (!pdata) {
+		dev_err(&pdev->dev, "unable to allocate platform data\n");
+		return NULL;
+	}
+
+	ret = of_property_read_u32(node, "qcom,hsic-usb-core-id", &core_id);
+	if (ret)
+		dev_err(&pdev->dev, "hsic usb core id is not provided.\n");
+	else
+		pdata->usb_core_id = (u8)core_id;
+
+	return pdata;
+}
+
 static int msm_hsic_probe(struct platform_device *pdev)
 {
 	struct resource *res;
@@ -658,12 +751,22 @@ static int msm_hsic_probe(struct platform_device *pdev)
 
 	dev_dbg(&pdev->dev, "msm-hsic probe\n");
 
+	if (pdev->dev.of_node) {
+		dev_dbg(&pdev->dev, "device tree enabled\n");
+		pdev->dev.platform_data = msm_hsic_peripheral_dt_to_pdata(pdev);
+	}
+
 	if (!pdev->dev.platform_data) {
 		dev_err(&pdev->dev, "No platform data given. Bailing out\n");
 		return -ENODEV;
-	} else {
-		pdata = pdev->dev.platform_data;
 	}
+
+	if (!pdev->dev.dma_mask)
+		pdev->dev.dma_mask = &msm_hsic_peripheral_dma_mask;
+	if (!pdev->dev.coherent_dma_mask)
+		pdev->dev.coherent_dma_mask = DMA_BIT_MASK(32);
+
+	pdata = pdev->dev.platform_data;
 
 	mhsic = kzalloc(sizeof(struct msm_hsic_per), GFP_KERNEL);
 	if (!mhsic) {
@@ -680,6 +783,13 @@ static int msm_hsic_probe(struct platform_device *pdev)
 	if (mhsic->irq < 0) {
 		dev_err(&pdev->dev, "Unable to get IRQ resource\n");
 		ret = mhsic->irq;
+		goto error;
+	}
+
+	mhsic->async_irq_no = platform_get_irq(pdev, 1);
+	if (mhsic->async_irq_no < 0) {
+		dev_err(&pdev->dev, "Unable to get async IRQ resource\n");
+		ret = mhsic->async_irq_no;
 		goto error;
 	}
 
@@ -702,23 +812,14 @@ static int msm_hsic_probe(struct platform_device *pdev)
 	if (!mhsic->regs) {
 		dev_err(&pdev->dev, "ioremap failed\n");
 		ret = -ENOMEM;
-		goto unmap;
+		goto error;
 	}
-	dev_info(&pdev->dev, "HSIC Peripheral regs = %p\n", mhsic->regs);
+	dev_info(&pdev->dev, "HSIC Peripheral regs = %pK\n", mhsic->regs);
 
-	mhsic->xo_handle = msm_xo_get(MSM_XO_TCXO_D0, "hsic_peripheral");
-	if (IS_ERR(mhsic->xo_handle)) {
-		dev_err(&pdev->dev, "%s not able to get the handle "
-			"to vote for TCXO\n", __func__);
-		ret = PTR_ERR(mhsic->xo_handle);
-		goto unmap;
-	}
-
-	ret = msm_xo_mode_vote(mhsic->xo_handle, MSM_XO_MODE_ON);
+	ret = msm_hsic_config_gdsc(pdev, mhsic, true);
 	if (ret) {
-		dev_err(&pdev->dev, "%s failed to vote for TCXO %d\n",
-				__func__, ret);
-		goto free_xo_handle;
+		dev_err(&pdev->dev, "unable to configure hsic gdsc\n");
+		goto unmap;
 	}
 
 	ret = msm_hsic_enable_clocks(pdev, mhsic, true);
@@ -726,13 +827,13 @@ static int msm_hsic_probe(struct platform_device *pdev)
 	if (ret) {
 		dev_err(&pdev->dev, "msm_hsic_enable_clocks failed\n");
 		ret = -ENODEV;
-		goto deinit_clocks;
+		goto unconfig_gdsc;
 	}
-	ret = msm_hsic_init_vddcx(mhsic, 1);
+	ret = msm_hsic_init_vdd(mhsic, 1);
 	if (ret) {
 		dev_err(&pdev->dev, "unable to initialize VDDCX\n");
 		ret = -ENODEV;
-		goto deinit_vddcx;
+		goto deinit_clocks;
 	}
 
 	ret = msm_hsic_reset(mhsic);
@@ -740,6 +841,19 @@ static int msm_hsic_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "msm_hsic_reset failed\n");
 		ret = -ENODEV;
 		goto deinit_vddcx;
+	}
+
+	mhsic->bus_scale_table = msm_bus_cl_get_pdata(pdev);
+	if (!mhsic->bus_scale_table) {
+		dev_err(&pdev->dev, "bus scaling is disabled\n");
+	} else {
+		mhsic->bus_perf_client =
+			msm_bus_scale_register_client(mhsic->bus_scale_table);
+		ret = msm_bus_scale_client_update_request(
+						mhsic->bus_perf_client, 1);
+		dev_dbg(&pdev->dev, "bus scaling is enabled\n");
+		if (ret)
+			dev_err(mhsic->dev, "Failed to vote for bus scaling\n");
 	}
 
 	ret = udc_probe(&ci13xxx_msm_udc_hsic_driver, &pdev->dev, mhsic->regs);
@@ -763,20 +877,33 @@ static int msm_hsic_probe(struct platform_device *pdev)
 		goto udc_remove;
 	}
 
+	ret = request_irq(mhsic->async_irq_no, msm_udc_hsic_irq,
+					  IRQF_TRIGGER_HIGH, pdev->name, mhsic);
+	if (ret < 0) {
+		dev_err(&pdev->dev, "request_irq failed\n");
+		ret = -ENODEV;
+		goto free_core_irq;
+	}
+
+	disable_irq(mhsic->async_irq_no);
+
 	pm_runtime_set_active(&pdev->dev);
 	pm_runtime_enable(&pdev->dev);
 	pm_runtime_get_sync(&pdev->dev);
 
 	return 0;
+free_core_irq:
+	free_irq(mhsic->irq, mhsic);
 udc_remove:
 	udc_remove();
+	if (mhsic->bus_perf_client)
+		msm_bus_scale_unregister_client(mhsic->bus_perf_client);
 deinit_vddcx:
-	msm_hsic_init_vddcx(mhsic, 0);
+	msm_hsic_init_vdd(mhsic, 0);
 deinit_clocks:
 	msm_hsic_enable_clocks(pdev, mhsic, 0);
-	msm_xo_mode_vote(mhsic->xo_handle, MSM_XO_MODE_OFF);
-free_xo_handle:
-	msm_xo_put(mhsic->xo_handle);
+unconfig_gdsc:
+	msm_hsic_config_gdsc(pdev, mhsic, false);
 unmap:
 	iounmap(mhsic->regs);
 error:
@@ -793,17 +920,27 @@ static int hsic_msm_remove(struct platform_device *pdev)
 	pm_runtime_disable(&pdev->dev);
 	pm_runtime_set_suspended(&pdev->dev);
 
-	msm_hsic_init_vddcx(mhsic, 0);
+	free_irq(mhsic->irq, mhsic);
+	free_irq(mhsic->async_irq_no, mhsic);
+
+	msm_hsic_init_vdd(mhsic, 0);
 	msm_hsic_enable_clocks(pdev, mhsic, 0);
-	msm_xo_put(mhsic->xo_handle);
 	wake_lock_destroy(&mhsic->wlock);
 	destroy_workqueue(mhsic->wq);
+	if (mhsic->bus_perf_client)
+		msm_bus_scale_unregister_client(mhsic->bus_perf_client);
 	udc_remove();
 	iounmap(mhsic->regs);
 	kfree(mhsic);
 
 	return 0;
 }
+
+static const struct of_device_id hsic_peripheral_dt_match[] = {
+	{ .compatible = "qcom,hsic-peripheral",
+	},
+	{}
+};
 
 static struct platform_driver msm_hsic_peripheral_driver = {
 	.probe	= msm_hsic_probe,
@@ -813,6 +950,7 @@ static struct platform_driver msm_hsic_peripheral_driver = {
 #ifdef CONFIG_PM
 		.pm = &msm_hsic_dev_pm_ops,
 #endif
+		.of_match_table = hsic_peripheral_dt_match,
 	},
 };
 

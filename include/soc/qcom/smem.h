@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2013-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -23,6 +23,8 @@ enum {
 	SMEM_WCNSS,
 	SMEM_MODEM_Q6_FW,
 	SMEM_RPM,
+	SMEM_TZ,
+	SMEM_SPSS,
 	NUM_SMEM_SUBSYSTEMS,
 };
 
@@ -40,6 +42,17 @@ enum {
 
 #define SMEM_NUM_SMD_STREAM_CHANNELS        64
 
+/**
+ * OVERFLOW_ADD_UNSIGNED() - check for unsigned overflow
+ *
+ * @type: type to check for overflow
+ * @a: left value to use
+ * @b: right value to use
+ * @returns: true if a + b will result in overflow; false otherwise
+ */
+#define OVERFLOW_ADD_UNSIGNED(type, a, b) \
+	(((type)~0 - (a)) < (b) ? true : false)
+
 enum {
 	/* fixed items */
 	SMEM_PROC_COMM = 0,
@@ -56,7 +69,7 @@ enum {
 	/* dynamic items */
 	SMEM_AARM_PARTITION_TABLE,
 	SMEM_AARM_BAD_BLOCK_TABLE,
-	SMEM_RESERVE_BAD_BLOCKS,
+	SMEM_ERR_CRASH_LOG_ADSP,
 	SMEM_WM_UUID,
 	SMEM_CHANNEL_ALLOC_TBL,
 	SMEM_SMD_BASE_ID,
@@ -95,7 +108,9 @@ enum {
 	SMEM_OSS_RRCASN1_BUF1,
 	SMEM_OSS_RRCASN1_BUF2,
 	SMEM_ID_VENDOR0,
+	SMEM_KERNEL_RESERVE = SMEM_ID_VENDOR0,
 	SMEM_ID_VENDOR1,
+	SMEM_SDRAM_INFO = SMEM_ID_VENDOR1,
 	SMEM_ID_VENDOR2,
 	SMEM_HW_SW_BUILD_ID,
 	SMEM_SMD_BASE_ID_2,
@@ -110,7 +125,7 @@ enum {
 	SMEM_SMSM_CPU_INTR_MASK,
 	SMEM_APPS_DEM_SLAVE_DATA,
 	SMEM_QDSP6_DEM_SLAVE_DATA,
-	SMEM_CLKREGIM_BSP,
+	SMEM_VSENSE_DATA,
 	SMEM_CLKREGIM_SOURCES,
 	SMEM_SMD_FIFO_BASE_ID,
 	SMEM_USABLE_RAM_PARTITION_TABLE = SMEM_SMD_FIFO_BASE_ID +
@@ -152,7 +167,15 @@ enum {
 	SMEM_CPR_CONFIG, /* 473 */
 	SMEM_CLOCK_INFO, /* 474 */
 	SMEM_IPC_FIFO, /* 475 */
-	SMEM_NUM_ITEMS,
+	SMEM_RF_EEPROM_DATA, /* 476 */
+	SMEM_COEX_MDM_WCN, /* 477 */
+	SMEM_GLINK_NATIVE_XPRT_DESCRIPTOR, /* 478 */
+	SMEM_GLINK_NATIVE_XPRT_FIFO_0, /* 479 */
+	SMEM_GLINK_NATIVE_XPRT_FIFO_1, /* 480 */
+	SMEM_SMP2P_SENSOR_BASE, /* 481 */
+	SMEM_SMP2P_TZ_BASE = SMEM_SMP2P_SENSOR_BASE + 8, /* 489 */
+	SMEM_IPA_FILTER_TABLE = SMEM_SMP2P_TZ_BASE + 8, /* 497 */
+	SMEM_NUM_ITEMS, /* 498 */
 };
 
 #ifdef CONFIG_MSM_SMEM

@@ -1,4 +1,4 @@
-/* Copyright (c) 2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2013-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -36,6 +36,15 @@ static const char *const pmic_names[] = {
 	"PMA8084",
 	"PMI8962",
 	"PMD9635",
+	"PM8994",
+	"PMI8994",
+	"PM8916",
+	"PM8004",
+	"PM8909",
+	"Unknown PMIC",
+	"Unknown PMIC",
+	"PM8950",
+	"PMI8950",
 };
 
 struct revid_chip {
@@ -168,6 +177,11 @@ static int qpnp_revid_probe(struct spmi_device *spmi)
 	revid_chip->data.pmic_subtype = pmic_subtype;
 	revid_chip->data.pmic_type = pmic_type;
 
+	if (pmic_subtype < ARRAY_SIZE(pmic_names))
+		revid_chip->data.pmic_name = pmic_names[pmic_subtype];
+	else
+		revid_chip->data.pmic_name = pmic_names[0];
+
 	mutex_lock(&revid_chips_lock);
 	list_add(&revid_chip->link, &revid_chips);
 	mutex_unlock(&revid_chips_lock);
@@ -203,7 +217,7 @@ static void __exit qpnp_revid_exit(void)
 	return spmi_driver_unregister(&qpnp_revid_driver);
 }
 
-module_init(qpnp_revid_init);
+subsys_initcall(qpnp_revid_init);
 module_exit(qpnp_revid_exit);
 
 MODULE_DESCRIPTION("QPNP REVID DRIVER");

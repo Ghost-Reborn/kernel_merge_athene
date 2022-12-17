@@ -1,4 +1,4 @@
-/* Copyright (c) 2013-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2013-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -16,12 +16,6 @@
 		uart1 = &blsp2_uart4;
 	};
 
-	memory {
-		fb_mem: fb_region@0 {
-			reg = <0 0 0 0x1d00000>;
-		};
-	};
-
 	bt_qca6174 {
 		compatible = "qca,qca6174";
 		qca,bt-reset-gpio = <&pma8084_gpios 4 0>; /* BT_EN */
@@ -34,6 +28,7 @@
 		qcom,model = "apq8084-taiko-liquid-snd-card";
 
 		qcom,audio-routing =
+			"AIF4 VI", "MCLK",
 			"RX_BIAS", "MCLK",
 			"LDO_H", "MCLK",
 			"Lineout_1 amp", "LINEOUT1",
@@ -64,6 +59,8 @@
 
 		qcom,cdc-micbias2-headset-only;
 		qcom,hdmi-audio-rx;
+		asoc-codec = <&stub_codec>, <&hdmi_audio>;
+		asoc-codec-names = "msm-stub-codec.1", "msm-hdmi-audio-codec-rx";
 		qcom,ext-spk-amp-supply = <&hdmi_vreg>;
 		qcom,ext-spk-amp-gpio = <&pma8084_mpps 6 0>;
 		qcom,dock-plug-det-irq = <&msmgpio 142 0>;
@@ -137,41 +134,32 @@
 		qcom,dock-hub-reset-gpio = <&msmgpio 65 0>;
 		qcom,dock-enable-gpio = <&msmgpio 93 0>;
 		qcom,dock-eth-reset-gpio = <&msmgpio 94 0>;
-		status = "disabled";
+		qcom,usb-host = <&usb3_sec>;
 	};
 };
 
-#include "dsi-panel-jdi-dualmipi0-video.dtsi"
-#include "dsi-panel-jdi-dualmipi1-video.dtsi"
-#include "dsi-panel-jdi-dualmipi0-cmd.dtsi"
-#include "dsi-panel-jdi-dualmipi1-cmd.dtsi"
-
-&dsi_dual_jdi_video_0 {
+&dsi_dual_jdi_video {
 	qcom,mdss-dsi-bl-pmic-control-type = "bl_ctrl_pwm";
 	qcom,mdss-dsi-bl-pmic-pwm-frequency = <50>;
 	qcom,mdss-dsi-bl-pmic-bank-select = <2>;
 	qcom,mdss-dsi-pwm-gpio = <&pma8084_gpios 7 0>;
-	qcom,cont-splash-enabled;
+	qcom,panel-supply-entries = <&dsi_panel_pwr_supply>;
 };
 
-&dsi_dual_jdi_video_1 {
-	qcom,cont-splash-enabled;
-};
-
-
-&dsi_dual_jdi_cmd_0 {
+&dsi_dual_jdi_cmd {
 	qcom,mdss-dsi-bl-pmic-control-type = "bl_ctrl_pwm";
 	qcom,mdss-dsi-bl-pmic-pwm-frequency = <50>;
 	qcom,mdss-dsi-bl-pmic-bank-select = <2>;
 	qcom,mdss-dsi-pwm-gpio = <&pma8084_gpios 7 0>;
+	/delete-property/ qcom,cmd-sync-wait-broadcast;
+	qcom,partial-update-enabled;
+	qcom,panel-roi-alignment = <4 4 2 2 20 20>;
+	qcom,panel-supply-entries = <&dsi_panel_pwr_supply>;
 };
-
-&dsi_dual_jdi_cmd_1 {
-};
-
 
 &mdss_mdp {
 	qcom,mdss-pref-prim-intf = "dsi";
+	vdd-cx-supply = <&pma8084_s2_corner>;
 };
 
 &mdss_hdmi_tx {
@@ -184,8 +172,12 @@
 	qcom,memory-reservation-size = <0x1C20000>;
 };
 
+&mdss_dsi {
+	hw-config = "split_dsi";
+};
+
 &mdss_dsi0 {
-	qcom,dsi-pref-prim-pan = <&dsi_dual_jdi_video_0>;
+	qcom,dsi-pref-prim-pan = <&dsi_dual_jdi_video>;
 	qcom,platform-te-gpio = <&msmgpio 12 0>;
 	qcom,platform-reset-gpio = <&msmgpio 96 0>;
 	qcom,platform-enable-gpio = <&msmgpio 137 0>;
@@ -193,7 +185,13 @@
 };
 
 &mdss_dsi1 {
-	qcom,dsi-pref-prim-pan = <&dsi_dual_jdi_video_1>;
+	qcom,dsi-pref-prim-pan = <&dsi_dual_jdi_video>;
+};
+
+&uart6 {
+	qcom,inject-rx-on-wakeup;
+	qcom,rx-char-to-inject = <0xfd>;
+	status = "ok";
 };
 
 &blsp2_uart1 {
@@ -201,6 +199,7 @@
 };
 
 &blsp2_uart4 {
+	qcom,no-suspend-delay;
 	status = "ok";
 };
 
@@ -271,10 +270,9 @@
 	qcom,vdd-io-voltage-level = <1800000 1800000>;
 	qcom,vdd-io-current-level = <200 154000>;
 
-	qcom,pad-pull-on = <0x0 0x3 0x3 0x1>; /* no-pull, pull-up, pull-up, pull-down */
-	qcom,pad-pull-off = <0x0 0x3 0x3 0x1>; /* no-pull, pull-up, pull-up, pull-down */
-	qcom,pad-drv-on = <0x7 0x4 0x4>; /* 16mA, 10mA, 10mA */
-	qcom,pad-drv-off = <0x0 0x0 0x0>; /* 2mA, 2mA, 2mA */
+	pinctrl-names = "active", "sleep";
+	pinctrl-0 = <&sdc1_clk_on &sdc1_cmd_on &sdc1_data_on &sdc1_rclk_on>;
+	pinctrl-1 = <&sdc1_clk_off &sdc1_cmd_off &sdc1_data_off &sdc1_rclk_off>;
 
 	qcom,clk-rates = <400000 20000000 25000000 50000000 100000000 192000000 384000000>;
 	qcom,nonremovable;
@@ -291,10 +289,9 @@
 	qcom,vdd-io-voltage-level = <1800000 2950000>;
 	qcom,vdd-io-current-level = <200 22000>;
 
-	qcom,pad-pull-on = <0x0 0x3 0x3>; /* no-pull, pull-up, pull-up */
-	qcom,pad-pull-off = <0x0 0x3 0x3>; /* no-pull, pull-up, pull-up */
-	qcom,pad-drv-on = <0x7 0x4 0x4>; /* 16mA, 10mA, 10mA */
-	qcom,pad-drv-off = <0x0 0x0 0x0>; /* 2mA, 2mA, 2mA */
+	pinctrl-names = "active", "sleep";
+	pinctrl-0 = <&sdc2_clk_on &sdc2_cmd_on &sdc2_data_on &sdhc2_cd_on>;
+	pinctrl-1 = <&sdc2_clk_off &sdc2_cmd_off &sdc2_data_off &sdhc2_cd_off>;
 
 	qcom,clk-rates = <400000 20000000 25000000 50000000 100000000 200000000>;
 	qcom,bus-speed-mode = "SDR12", "SDR25", "SDR50", "DDR50", "SDR104";
@@ -338,7 +335,16 @@
 };
 
 &usb3 {
+	vbus_dwc3-supply = <&usb0_vreg>;
 	qcom,charging-disabled;
+};
+
+&usb3_sec {
+	status = "ok";
+};
+
+&hsphy1 {
+	status = "ok";
 };
 
 &pma8084_gpios {
@@ -423,6 +429,10 @@
 	};
 
 	gpio@cd00 { /* GPIO 14 */
+		qcom,mode = <0>;
+		qcom,pull = <1>;
+		qcom,vin-sel = <2>;
+		qcom,src-sel = <0>;
 	};
 
 	gpio@ce00 { /* GPIO 15 */
@@ -804,13 +814,13 @@
 		interrupt-parent = <&msmgpio>;
 		spi-max-frequency = <960000>;
 		qcom,channels = <31>;
-		qcom,gain = <50 50 50 50 50 100 50 100 50 50
-				100 50 50 50 50 50 50 50 50 50
-				50 50 50 100 50 50 50 1 1 1
+		qcom,gain = <50 100 50 50 50 50 100 50 100 100
+				4 50 100 50 50 50 100 100 100 50
+				100 100 100 50 50 50 100 1 1 1
 				1>;
-		qcom,rsense = <50 100 500 10 25 1000 40 200 200 5
-				500 500 75 10 5 25 33 75 25 200
-				10 25 33 100 10 10 3 1000 1000 1000
+		qcom,rsense = <100 25 50 10 10 25 5 200 100 1000
+				1000 10 100 2 25 10 10 200 200 5
+				100 5 20 1000 2 2 25 1000 1000 1000
 				1000>;
 		qcom,channel-type = <0xf0000000>;
 		qcom,epm-enable-gpio = <&msmgpio 92 0>;
@@ -839,5 +849,25 @@
 				qcom,mode = "manual";
 			};
 		};
+	};
+};
+
+&i2c_0 {
+	qcom,i2c-bus-freq = <100000>;
+
+	battery@b {
+		compatible = "ti,bq28400-battery";
+		reg = <0xb>;
+		ti,temp-cold-degc = <2>;
+		ti,temp-hot-degc = <43>;
+	};
+
+	smb350-charger@2b {
+		compatible = "summit,smb350-charger";
+		reg = <0x2b>; /* 0x56/0x57 */
+		interrupt-parent = <&spmi_bus>;
+		interrupts = <0x0 0xcd 0x0>;	/* PMA8084 GPIO 14 */
+		summit,term-current-ma = <300>;
+		summit,fuel-gauge-name = "bq28400_battery";
 	};
 };

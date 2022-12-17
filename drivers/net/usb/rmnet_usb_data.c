@@ -133,6 +133,7 @@ module_param_cb(rmnet_data_init, &rmnet_init_ops, &rmnet_data_init,
 
 static void rmnet_usb_setup(struct net_device *);
 static int rmnet_ioctl(struct net_device *, struct ifreq *, int);
+static void rmnet_usb_disable_hsic_autosuspend(struct usbnet *, int);
 
 static int rmnet_usb_suspend(struct usb_interface *iface, pm_message_t message)
 {
@@ -165,6 +166,26 @@ static int rmnet_usb_resume(struct usb_interface *iface)
 	usbnet_resume(iface);
 
 	return rmnet_usb_ctrl_start_rx(dev);
+}
+
+static void rmnet_usb_disable_hsic_autosuspend(struct usbnet *usbnet,
+						int enable_autosuspend)
+{
+	struct usb_device *usb_dev = usbnet->udev;
+	struct rmnet_ctrl_udev *rmnet_udev =
+		(struct rmnet_ctrl_udev *)usbnet->data[1];
+
+	usb_get_dev(usb_dev);
+	if (!enable_autosuspend) {
+		usb_disable_autosuspend(usb_dev);
+		rmnet_udev->autosuspend_disabled = 1;
+		rmnet_udev->autosuspend_dis_cnt++;
+	} else {
+		usb_enable_autosuspend(usb_dev);
+		rmnet_udev->autosuspend_disabled = 0;
+		rmnet_udev->autosuspend_en_cnt++;
+	}
+	usb_put_dev(usb_dev);
 }
 
 static int rmnet_usb_bind(struct usbnet *usbnet, struct usb_interface *iface)
@@ -362,6 +383,9 @@ static int rmnet_ioctl_extended(struct net_device *dev, struct ifreq *ifr)
 		ext_cmd.u.data =
 			unet->intf->cur_altsetting->desc.bInterfaceNumber;
 		break;
+	case RMNET_IOCTL_SET_SLEEP_STATE:
+		rmnet_usb_disable_hsic_autosuspend(unet, ext_cmd.u.data);
+		break;
 	}
 
 	rc = copy_to_user(ifr->ifr_ifru.ifru_data, &ext_cmd,
@@ -375,9 +399,10 @@ static int rmnet_ioctl_extended(struct net_device *dev, struct ifreq *ifr)
 static int rmnet_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 {
 	struct usbnet	*unet = netdev_priv(dev);
-	u32		old_opmode;
+	unsigned long	old_opmode;
 	int		prev_mtu = dev->mtu;
 	int		rc = 0;
+	struct rmnet_ioctl_data_s ioctl_data;
 
 	old_opmode = unet->data[0]; /*data[0] saves operation mode*/
 	/* Process IOCTL command */
@@ -416,9 +441,12 @@ static int rmnet_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 		break;
 
 	case RMNET_IOCTL_GET_LLP:	/* Get link protocol state */
-		ifr->ifr_ifru.ifru_data = (void *)(unet->data[0]
+		ioctl_data.u.operation_mode = (unet->data[0]
 						& (RMNET_MODE_LLP_ETH
 						| RMNET_MODE_LLP_IP));
+		if (copy_to_user(ifr->ifr_ifru.ifru_data, &ioctl_data,
+			sizeof(struct rmnet_ioctl_data_s)))
+			rc = -EFAULT;
 		break;
 
 	case RMNET_IOCTL_SET_QOS_ENABLE:	/* Set QoS header enabled*/
@@ -434,12 +462,18 @@ static int rmnet_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 		break;
 
 	case RMNET_IOCTL_GET_QOS:		/* Get QoS header state */
-		ifr->ifr_ifru.ifru_data = (void *)(unet->data[0]
+		ioctl_data.u.operation_mode = (unet->data[0]
 						& RMNET_MODE_QOS);
+		if (copy_to_user(ifr->ifr_ifru.ifru_data, &ioctl_data,
+			sizeof(struct rmnet_ioctl_data_s)))
+			rc = -EFAULT;
 		break;
 
 	case RMNET_IOCTL_GET_OPMODE:		/* Get operation mode*/
-		ifr->ifr_ifru.ifru_data = (void *)unet->data[0];
+		ioctl_data.u.operation_mode = unet->data[0];
+		if (copy_to_user(ifr->ifr_ifru.ifru_data, &ioctl_data,
+			sizeof(struct rmnet_ioctl_data_s)))
+			rc = -EFAULT;
 		break;
 
 	case RMNET_IOCTL_OPEN:			/* Open transport port */
@@ -457,13 +491,12 @@ static int rmnet_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 		break;
 
 	default:
-		dev_err(&unet->intf->dev, "[%s] error: "
-			"rmnet_ioct called for unsupported cmd[%d]",
+		dev_dbg(&unet->intf->dev, "[%s] error: rmnet_ioctl called for unsupported cmd[0x%x]\n",
 			dev->name, cmd);
 		return -EINVAL;
 	}
 
-	DBG2("[%s] %s: cmd=0x%x opmode old=0x%08x new=0x%08lx\n",
+	DBG2("[%s] %s: cmd=0x%x opmode old=0x%08lx new=0x%08lx\n",
 		dev->name, __func__, cmd, old_opmode, unet->data[0]);
 
 	return rc;
@@ -487,6 +520,8 @@ static void rmnet_usb_setup(struct net_device *dev)
 static int rmnet_usb_data_status(struct seq_file *s, void *unused)
 {
 	struct usbnet *unet = s->private;
+	struct rmnet_ctrl_udev *rmnet_udev =
+		(struct rmnet_ctrl_udev *)unet->data[1];
 
 	seq_printf(s, "RMNET_MODE_LLP_IP:  %d\n",
 			test_bit(RMNET_MODE_LLP_IP, &unet->data[0]));
@@ -519,6 +554,12 @@ static int rmnet_usb_data_status(struct seq_file *s, void *unused)
 			test_bit(EVENT_RX_MEMORY, &unet->flags));
 	seq_printf(s, "EVENT_DEV_ASLEEP:   %d\n",
 			test_bit(EVENT_DEV_ASLEEP, &unet->flags));
+	seq_printf(s, "autosuspend_disabled: %d\n",
+			rmnet_udev->autosuspend_disabled);
+	seq_printf(s, "No. of times autosuspend enabled: %d\n",
+					rmnet_udev->autosuspend_en_cnt);
+	seq_printf(s, "No. of times autosuspend disabled: %d\n",
+					rmnet_udev->autosuspend_dis_cnt);
 
 	return 0;
 }
@@ -703,7 +744,8 @@ static const struct usb_device_id vidpids[] = {
 	{ USB_DEVICE_INTERFACE_NUMBER(0x05c6, 0x904c, 8),
 	.driver_info = (unsigned long)&rmnet_info,
 	},
-	{ USB_DEVICE_INTERFACE_NUMBER(0x05c6, 0x9075, 6), /*mux over hsic mdm*/
+	/* mux over hsic mdm */
+	{ USB_DEVICE_INTERFACE_NUMBER(0x05c6, 0x9075, 6),
 	.driver_info = (unsigned long)&rmnet_info,
 	},
 	{ USB_DEVICE_INTERFACE_NUMBER(0x05c6, 0x908E, 8),
@@ -721,10 +763,20 @@ static const struct usb_device_id vidpids[] = {
 	{ USB_DEVICE_INTERFACE_NUMBER(0x05c6, 0x9079, 8),
 	.driver_info = (unsigned long)&rmnet_usb_info,
 	},
-	{ USB_DEVICE_INTERFACE_NUMBER(0x05c6, 0x908A, 6), /*mux over hsic mdm*/
+	/* mux over hsic mdm */
+	{ USB_DEVICE_INTERFACE_NUMBER(0x05c6, 0x908A, 6),
 	.driver_info = (unsigned long)&rmnet_info,
 	},
-	{ USB_DEVICE_INTERFACE_NUMBER(0x05c6, 0x90A0, 6), /*mux over hsic mdm*/
+	/* mux over hsic mdm */
+	{ USB_DEVICE_INTERFACE_NUMBER(0x05c6, 0x909F, 6),
+	.driver_info = (unsigned long)&rmnet_info,
+	},
+	/* mux over hsic mdm */
+	{ USB_DEVICE_INTERFACE_NUMBER(0x05c6, 0x90A0, 6),
+	.driver_info = (unsigned long)&rmnet_info,
+	},
+	/* mux over hsic mdm */
+	{ USB_DEVICE_INTERFACE_NUMBER(0x05c6, 0x90A4, 8),
 	.driver_info = (unsigned long)&rmnet_info,
 	},
 
@@ -740,6 +792,7 @@ static struct usb_driver rmnet_usb = {
 	.disconnect = rmnet_usb_disconnect,
 	.suspend    = rmnet_usb_suspend,
 	.resume     = rmnet_usb_resume,
+	.reset_resume     = rmnet_usb_resume,
 	.supports_autosuspend = true,
 };
 

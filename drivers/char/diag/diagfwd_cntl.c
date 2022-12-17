@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2011-2017, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -12,245 +12,713 @@
 
 #include <linux/slab.h>
 #include <linux/diagchar.h>
-#include <linux/platform_device.h>
 #include <linux/kmemleak.h>
 #include <linux/delay.h>
 #include "diagchar.h"
 #include "diagfwd.h"
 #include "diagfwd_cntl.h"
-#include "diagfwd_hsic.h"
+#include "diagfwd_peripheral.h"
+#include "diagfwd_bridge.h"
 #include "diag_dci.h"
 #include "diagmem.h"
+#include "diag_masks.h"
+
+#define FEATURE_SUPPORTED(x)	((feature_mask << (i * 8)) & (1 << x))
+
+uint16_t md_support;
+
 /* tracks which peripheral is undergoing SSR */
 static uint16_t reg_dirty;
-#define HDR_SIZ 8
+static void diag_notify_md_client(uint8_t peripheral, int data);
 
-void diag_clean_reg_fn(struct work_struct *work)
+static void diag_mask_update_work_fn(struct work_struct *work)
 {
-	struct diag_smd_info *smd_info = container_of(work,
-						struct diag_smd_info,
-						diag_notify_update_smd_work);
-	if (!smd_info)
-		return;
+	uint8_t peripheral;
 
-	pr_debug("diag: clean registration for peripheral: %d\n",
-		smd_info->peripheral);
-
-	reg_dirty |= smd_info->peripheral_mask;
-	diag_clear_reg(smd_info->peripheral);
-	reg_dirty ^= smd_info->peripheral_mask;
-
-	/* Reset the feature mask flag */
-	driver->rcvd_feature_mask[smd_info->peripheral] = 0;
-
-	smd_info->notify_context = 0;
+	for (peripheral = 0; peripheral <= NUM_PERIPHERALS; peripheral++) {
+		if (!(driver->mask_update & PERIPHERAL_MASK(peripheral)))
+			continue;
+		mutex_lock(&driver->cntl_lock);
+		driver->mask_update ^= PERIPHERAL_MASK(peripheral);
+		mutex_unlock(&driver->cntl_lock);
+		diag_send_updates_peripheral(peripheral);
+	}
 }
 
-void diag_cntl_smd_work_fn(struct work_struct *work)
+void diag_cntl_channel_open(struct diagfwd_info *p_info)
 {
-	struct diag_smd_info *smd_info = container_of(work,
-						struct diag_smd_info,
-						diag_general_smd_work);
+	if (!p_info)
+		return;
+	driver->mask_update |= PERIPHERAL_MASK(p_info->peripheral);
+	queue_work(driver->cntl_wq, &driver->mask_update_work);
+	diag_notify_md_client(p_info->peripheral, DIAG_STATUS_OPEN);
+}
 
-	if (!smd_info || smd_info->type != SMD_CNTL_TYPE)
+void diag_cntl_channel_close(struct diagfwd_info *p_info)
+{
+	uint8_t peripheral;
+
+	if (!p_info)
 		return;
 
-	if (smd_info->general_context == UPDATE_PERIPHERAL_STM_STATE) {
-		if (driver->peripheral_supports_stm[smd_info->peripheral] ==
-								ENABLE_STM) {
-			int status = 0;
-			int index = smd_info->peripheral;
-			status = diag_send_stm_state(smd_info,
-				(uint8_t)(driver->stm_state_requested[index]));
-			if (status == 1)
-				driver->stm_state[index] =
-					driver->stm_state_requested[index];
+	peripheral = p_info->peripheral;
+	if (peripheral >= NUM_PERIPHERALS)
+		return;
+
+	driver->feature[peripheral].sent_feature_mask = 0;
+	driver->feature[peripheral].rcvd_feature_mask = 0;
+	flush_workqueue(driver->cntl_wq);
+	reg_dirty |= PERIPHERAL_MASK(peripheral);
+	diag_cmd_remove_reg_by_proc(peripheral);
+	driver->feature[peripheral].stm_support = DISABLE_STM;
+	driver->feature[peripheral].log_on_demand = 0;
+	driver->stm_state[peripheral] = DISABLE_STM;
+	driver->stm_state_requested[peripheral] = DISABLE_STM;
+	reg_dirty ^= PERIPHERAL_MASK(peripheral);
+	diag_notify_md_client(peripheral, DIAG_STATUS_CLOSED);
+}
+
+static void diag_stm_update_work_fn(struct work_struct *work)
+{
+	uint8_t i;
+	uint16_t peripheral_mask = 0;
+	int err = 0;
+
+	mutex_lock(&driver->cntl_lock);
+	peripheral_mask = driver->stm_peripheral;
+	driver->stm_peripheral = 0;
+	mutex_unlock(&driver->cntl_lock);
+
+	if (peripheral_mask == 0)
+		return;
+
+	for (i = 0; i < NUM_PERIPHERALS; i++) {
+		if (!driver->feature[i].stm_support)
+				continue;
+		if (peripheral_mask & PERIPHERAL_MASK(i)) {
+			err = diag_send_stm_state(i,
+				(uint8_t)(driver->stm_state_requested[i]));
+			if (!err) {
+				driver->stm_state[i] =
+					driver->stm_state_requested[i];
+			}
 		}
 	}
-	smd_info->general_context = 0;
 }
 
-void diag_cntl_stm_notify(struct diag_smd_info *smd_info, int action)
+void diag_notify_md_client(uint8_t peripheral, int data)
 {
-	if (!smd_info || smd_info->type != SMD_CNTL_TYPE)
+	int stat = 0;
+	struct siginfo info;
+
+	if (data == DIAG_STATUS_OPEN) {
+		md_support |= PERIPHERAL_MASK(peripheral);
+	} else if (data == DIAG_STATUS_CLOSED) {
+		md_support ^= PERIPHERAL_MASK(peripheral);
+	}
+
+	if (driver->logging_mode != MEMORY_DEVICE_MODE)
 		return;
 
-	if (action == CLEAR_PERIPHERAL_STM_STATE)
-		driver->peripheral_supports_stm[smd_info->peripheral] =
-								DISABLE_STM;
+	memset(&info, 0, sizeof(struct siginfo));
+	info.si_code = SI_QUEUE;
+	info.si_int = (PERIPHERAL_MASK(peripheral) | data);
+	info.si_signo = SIGCONT;
+	if (driver->md_proc[DIAG_LOCAL_PROC].mdlog_process) {
+		stat = send_sig_info(info.si_signo, &info,
+			driver->md_proc[DIAG_LOCAL_PROC].mdlog_process);
+		if (stat)
+			pr_err("diag: Err sending signal to memory device client, signal data: 0x%x, stat: %d\n",
+			       info.si_int, stat);
+	}
+
 }
 
-static void process_stm_feature(struct diag_smd_info *smd_info,
-			      uint8_t feature_mask)
+static void process_pd_status(uint8_t *buf, uint32_t len,
+			      uint8_t peripheral)
 {
-	if (feature_mask & F_DIAG_OVER_STM) {
-		driver->peripheral_supports_stm[smd_info->peripheral] =
-								ENABLE_STM;
-		smd_info->general_context = UPDATE_PERIPHERAL_STM_STATE;
-		queue_work(driver->diag_cntl_wq,
-				&(smd_info->diag_general_smd_work));
+	struct diag_ctrl_msg_pd_status *pd_msg = NULL;
+	uint32_t pd;
+	int status = DIAG_STATUS_CLOSED;
+
+	if (!buf || peripheral >= NUM_PERIPHERALS || len < sizeof(*pd_msg))
+		return;
+
+	pd_msg = (struct diag_ctrl_msg_pd_status *)buf;
+	pd = pd_msg->pd_id;
+	status = (pd_msg->status == 0) ? DIAG_STATUS_OPEN : DIAG_STATUS_CLOSED;
+	diag_notify_md_client(peripheral, status);
+}
+
+static void enable_stm_feature(uint8_t peripheral)
+{
+	if (peripheral >= NUM_PERIPHERALS)
+		return;
+
+	mutex_lock(&driver->cntl_lock);
+	driver->feature[peripheral].stm_support = ENABLE_STM;
+	driver->stm_peripheral |= PERIPHERAL_MASK(peripheral);
+	mutex_unlock(&driver->cntl_lock);
+
+	queue_work(driver->cntl_wq, &(driver->stm_update_work));
+}
+
+static void enable_socket_feature(uint8_t peripheral)
+{
+	if (peripheral >= NUM_PERIPHERALS)
+		return;
+
+	if (driver->supports_sockets)
+		driver->feature[peripheral].sockets_enabled = 1;
+	else
+		driver->feature[peripheral].sockets_enabled = 0;
+}
+
+static void process_hdlc_encoding_feature(uint8_t peripheral)
+{
+	if (peripheral >= NUM_PERIPHERALS)
+		return;
+
+	if (driver->supports_apps_hdlc_encoding) {
+		driver->feature[peripheral].encode_hdlc =
+					ENABLE_APPS_HDLC_ENCODING;
 	} else {
-		driver->peripheral_supports_stm[smd_info->peripheral] =
-								DISABLE_STM;
+		driver->feature[peripheral].encode_hdlc =
+					DISABLE_APPS_HDLC_ENCODING;
 	}
 }
 
-static void process_hdlc_encoding_feature(struct diag_smd_info *smd_info,
-					uint8_t feature_mask)
+static void process_command_deregistration(uint8_t *buf, uint32_t len,
+					   uint8_t peripheral)
 {
+	uint8_t *ptr = buf;
+	int i;
+	int header_len = sizeof(struct diag_ctrl_cmd_dereg);
+	int read_len = 0;
+	struct diag_ctrl_cmd_dereg *dereg = NULL;
+	struct cmd_code_range *range = NULL;
+	struct diag_cmd_reg_entry_t del_entry;
+
 	/*
-	 * Check if apps supports hdlc encoding and the
-	 * peripheral supports apps hdlc encoding
+	 * Perform Basic sanity. The len field is the size of the data payload.
+	 * This doesn't include the header size.
 	 */
-	if (driver->supports_apps_hdlc_encoding &&
-		(feature_mask & F_DIAG_HDLC_ENCODE_IN_APPS_MASK)) {
-		driver->smd_data[smd_info->peripheral].encode_hdlc =
-						ENABLE_APPS_HDLC_ENCODING;
-		if (driver->separate_cmdrsp[smd_info->peripheral] &&
-			smd_info->peripheral < NUM_SMD_CMD_CHANNELS)
-			driver->smd_cmd[smd_info->peripheral].encode_hdlc =
-						ENABLE_APPS_HDLC_ENCODING;
-	} else {
-		driver->smd_data[smd_info->peripheral].encode_hdlc =
-						DISABLE_APPS_HDLC_ENCODING;
-		if (driver->separate_cmdrsp[smd_info->peripheral] &&
-			smd_info->peripheral < NUM_SMD_CMD_CHANNELS)
-			driver->smd_cmd[smd_info->peripheral].encode_hdlc =
-						DISABLE_APPS_HDLC_ENCODING;
+	if (!buf || peripheral >= NUM_PERIPHERALS || len == 0)
+		return;
+
+	dereg = (struct diag_ctrl_cmd_dereg *)ptr;
+	ptr += header_len;
+	/* Don't account for pkt_id and length */
+	read_len += header_len - (2 * sizeof(uint32_t));
+
+	if (dereg->count_entries == 0) {
+		pr_debug("diag: In %s, received reg tbl with no entries\n",
+			 __func__);
+		return;
+	}
+
+	for (i = 0; i < dereg->count_entries && read_len < len; i++) {
+		range = (struct cmd_code_range *)ptr;
+		ptr += sizeof(struct cmd_code_range) - sizeof(uint32_t);
+		read_len += sizeof(struct cmd_code_range) - sizeof(uint32_t);
+		del_entry.cmd_code = dereg->cmd_code;
+		del_entry.subsys_id = dereg->subsysid;
+		del_entry.cmd_code_hi = range->cmd_code_hi;
+		del_entry.cmd_code_lo = range->cmd_code_lo;
+		diag_cmd_remove_reg(&del_entry, peripheral);
+	}
+
+	if (i != dereg->count_entries) {
+		pr_err("diag: In %s, reading less than available, read_len: %d, len: %d count: %d\n",
+		       __func__, read_len, len, dereg->count_entries);
 	}
 }
-
-/* Process the data read from the smd control channel */
-int diag_process_smd_cntl_read_data(struct diag_smd_info *smd_info, void *buf,
-								int total_recd)
+static void process_command_registration(uint8_t *buf, uint32_t len,
+					 uint8_t peripheral)
 {
-	int data_len = 0, type = -1, count_bytes = 0, j, flag = 0;
-	struct bindpkt_params_per_process *pkt_params =
-		kzalloc(sizeof(struct bindpkt_params_per_process), GFP_KERNEL);
-	struct diag_ctrl_msg *msg;
-	struct cmd_code_range *range;
-	struct bindpkt_params *temp;
+	uint8_t *ptr = buf;
+	int i;
+	int header_len = sizeof(struct diag_ctrl_cmd_reg);
+	int read_len = 0;
+	struct diag_ctrl_cmd_reg *reg = NULL;
+	struct cmd_code_range *range = NULL;
+	struct diag_cmd_reg_entry_t new_entry;
 
-	if (pkt_params == NULL) {
-		pr_alert("diag: In %s, Memory allocation failure\n",
-			__func__);
-		return 0;
+	/*
+	 * Perform Basic sanity. The len field is the size of the data payload.
+	 * This doesn't include the header size.
+	 */
+	if (!buf || peripheral >= NUM_PERIPHERALS || len == 0)
+		return;
+
+	reg = (struct diag_ctrl_cmd_reg *)ptr;
+	ptr += header_len;
+	/* Don't account for pkt_id and length */
+	read_len += header_len - (2 * sizeof(uint32_t));
+
+	if (reg->count_entries == 0) {
+		pr_debug("diag: In %s, received reg tbl with no entries\n",
+			 __func__);
+		return;
 	}
 
-	if (!smd_info) {
-		pr_err("diag: In %s, No smd info. Not able to read.\n",
-			__func__);
-		kfree(pkt_params);
-		return 0;
+	for (i = 0; i < reg->count_entries && read_len < len; i++) {
+		range = (struct cmd_code_range *)ptr;
+		ptr += sizeof(struct cmd_code_range);
+		read_len += sizeof(struct cmd_code_range);
+		new_entry.cmd_code = reg->cmd_code;
+		new_entry.subsys_id = reg->subsysid;
+		new_entry.cmd_code_hi = range->cmd_code_hi;
+		new_entry.cmd_code_lo = range->cmd_code_lo;
+		diag_cmd_add_reg(&new_entry, peripheral, INVALID_PID);
 	}
 
-	while (count_bytes + HDR_SIZ <= total_recd) {
-		type = *(uint32_t *)(buf);
-		data_len = *(uint32_t *)(buf + 4);
-		if (type < DIAG_CTRL_MSG_REG ||
-				 type > DIAG_CTRL_MSG_LAST) {
-			pr_alert("diag: In %s, Invalid Msg type %d proc %d",
-				 __func__, type, smd_info->peripheral);
-			break;
-		}
-		if (data_len < 0 || data_len > total_recd) {
-			pr_alert("diag: In %s, Invalid data len %d, total_recd: %d, proc %d",
-				 __func__, data_len, total_recd,
-				 smd_info->peripheral);
-			break;
-		}
-		count_bytes = count_bytes+HDR_SIZ+data_len;
-		if (type == DIAG_CTRL_MSG_REG && total_recd >= count_bytes) {
-			msg = buf+HDR_SIZ;
-			range = buf+HDR_SIZ+
-					sizeof(struct diag_ctrl_msg);
-			if (msg->count_entries == 0) {
-				pr_debug("diag: In %s, received reg tbl with no entries\n",
-								__func__);
-				buf = buf + HDR_SIZ + data_len;
-				continue;
-			}
-			pkt_params->count = msg->count_entries;
-			pkt_params->params = kzalloc(pkt_params->count *
-				sizeof(struct bindpkt_params), GFP_KERNEL);
-			if (!pkt_params->params) {
-				pr_alert("diag: In %s, Memory alloc fail for cmd_code: %d, subsys: %d\n",
-						__func__, msg->cmd_code,
-						msg->subsysid);
-				buf = buf + HDR_SIZ + data_len;
-				continue;
-			}
-			temp = pkt_params->params;
-			for (j = 0; j < pkt_params->count; j++) {
-				temp->cmd_code = msg->cmd_code;
-				temp->subsys_id = msg->subsysid;
-				temp->client_id = smd_info->peripheral;
-				temp->proc_id = NON_APPS_PROC;
-				temp->cmd_code_lo = range->cmd_code_lo;
-				temp->cmd_code_hi = range->cmd_code_hi;
-				range++;
-				temp++;
-			}
-			flag = 1;
-			/* peripheral undergoing SSR should not
-			 * record new registration
-			 */
-			if (!(reg_dirty & smd_info->peripheral_mask))
-				diagchar_ioctl(NULL, DIAG_IOCTL_COMMAND_REG,
-						(unsigned long)pkt_params);
-			else
-				pr_err("diag: drop reg proc %d\n",
-						smd_info->peripheral);
-			kfree(pkt_params->params);
-		} else if (type == DIAG_CTRL_MSG_FEATURE &&
-				total_recd >= count_bytes) {
-			uint8_t feature_mask = 0;
-			int feature_mask_len = *(int *)(buf+8);
-			if (feature_mask_len > 0) {
-				int periph = smd_info->peripheral;
-				driver->rcvd_feature_mask[smd_info->peripheral]
-									= 1;
-				feature_mask = *(uint8_t *)(buf+12);
-				if (periph == MODEM_DATA)
-					driver->log_on_demand_support =
-						feature_mask &
-					F_DIAG_LOG_ON_DEMAND_RSP_ON_MASTER;
-				/*
-				 * If apps supports separate cmd/rsp channels
-				 * and the peripheral supports separate cmd/rsp
-				 * channels
-				 */
-				if (driver->supports_separate_cmdrsp &&
-					(feature_mask & F_DIAG_REQ_RSP_CHANNEL))
-					driver->separate_cmdrsp[periph] =
-							ENABLE_SEPARATE_CMDRSP;
-				else
-					driver->separate_cmdrsp[periph] =
-							DISABLE_SEPARATE_CMDRSP;
-				/*
-				 * Check if apps supports hdlc encoding and the
-				 * peripheral supports apps hdlc encoding
-				 */
-				process_hdlc_encoding_feature(smd_info,
-								feature_mask);
-				if (feature_mask_len > 1) {
-					feature_mask = *(uint8_t *)(buf+13);
-					process_stm_feature(smd_info,
-								feature_mask);
-				}
-			}
-			flag = 1;
-		} else if (type != DIAG_CTRL_MSG_REG) {
-			flag = 1;
-		}
-		buf = buf + HDR_SIZ + data_len;
+	if (i != reg->count_entries) {
+		pr_err("diag: In %s, reading less than available, read_len: %d, len: %d count: %d\n",
+		       __func__, read_len, len, reg->count_entries);
 	}
-	kfree(pkt_params);
-
-	return flag;
 }
 
-static int diag_compute_real_time(int idx)
+static void diag_close_transport_work_fn(struct work_struct *work)
+{
+	uint8_t transport;
+	uint8_t peripheral;
+
+	mutex_lock(&driver->cntl_lock);
+	for (peripheral = 0; peripheral <= NUM_PERIPHERALS; peripheral++) {
+		if (!(driver->close_transport & PERIPHERAL_MASK(peripheral)))
+			continue;
+		driver->close_transport ^= PERIPHERAL_MASK(peripheral);
+		transport = driver->feature[peripheral].sockets_enabled ?
+					TRANSPORT_SMD : TRANSPORT_SOCKET;
+		diagfwd_close_transport(transport, peripheral);
+	}
+	mutex_unlock(&driver->cntl_lock);
+}
+
+static void process_socket_feature(uint8_t peripheral)
+{
+	if (peripheral >= NUM_PERIPHERALS)
+		return;
+
+	mutex_lock(&driver->cntl_lock);
+	driver->close_transport |= PERIPHERAL_MASK(peripheral);
+	queue_work(driver->cntl_wq, &driver->close_transport_work);
+	mutex_unlock(&driver->cntl_lock);
+}
+
+static void process_log_on_demand_feature(uint8_t peripheral)
+{
+	/* Log On Demand command is registered only on Modem */
+	if (peripheral != PERIPHERAL_MODEM)
+		return;
+
+	if (driver->feature[PERIPHERAL_MODEM].log_on_demand)
+		driver->log_on_demand_support = 1;
+	else
+		driver->log_on_demand_support = 0;
+}
+
+static void process_incoming_feature_mask(uint8_t *buf, uint32_t len,
+					  uint8_t peripheral)
+{
+	int i;
+	int header_len = sizeof(struct diag_ctrl_feature_mask);
+	int read_len = 0;
+	struct diag_ctrl_feature_mask *header = NULL;
+	uint32_t feature_mask_len = 0;
+	uint32_t feature_mask = 0;
+	uint8_t *ptr = buf;
+
+	if (!buf || peripheral >= NUM_PERIPHERALS || len == 0)
+		return;
+
+	header = (struct diag_ctrl_feature_mask *)ptr;
+	ptr += header_len;
+	feature_mask_len = header->feature_mask_len;
+
+	if (feature_mask_len == 0) {
+		pr_debug("diag: In %s, received invalid feature mask from peripheral %d\n",
+			 __func__, peripheral);
+		return;
+	}
+
+	if (feature_mask_len > FEATURE_MASK_LEN) {
+		pr_alert("diag: Receiving feature mask length more than Apps support\n");
+		feature_mask_len = FEATURE_MASK_LEN;
+	}
+
+	driver->feature[peripheral].rcvd_feature_mask = 1;
+
+	for (i = 0; i < feature_mask_len && read_len < len; i++) {
+		feature_mask = *(uint8_t *)ptr;
+		driver->feature[peripheral].feature_mask[i] = feature_mask;
+		ptr += sizeof(uint8_t);
+		read_len += sizeof(uint8_t);
+
+		if (FEATURE_SUPPORTED(F_DIAG_LOG_ON_DEMAND_APPS))
+			driver->feature[peripheral].log_on_demand = 1;
+		if (FEATURE_SUPPORTED(F_DIAG_REQ_RSP_SUPPORT))
+			driver->feature[peripheral].separate_cmd_rsp = 1;
+		if (FEATURE_SUPPORTED(F_DIAG_APPS_HDLC_ENCODE))
+			process_hdlc_encoding_feature(peripheral);
+		if (FEATURE_SUPPORTED(F_DIAG_STM))
+			enable_stm_feature(peripheral);
+		if (FEATURE_SUPPORTED(F_DIAG_MASK_CENTRALIZATION))
+			driver->feature[peripheral].mask_centralization = 1;
+		if (FEATURE_SUPPORTED(F_DIAG_PERIPHERAL_BUFFERING))
+			driver->feature[peripheral].peripheral_buffering = 1;
+		if (FEATURE_SUPPORTED(F_DIAG_SOCKETS_ENABLED))
+			enable_socket_feature(peripheral);
+	}
+
+	process_socket_feature(peripheral);
+	process_log_on_demand_feature(peripheral);
+}
+
+static void process_last_event_report(uint8_t *buf, uint32_t len,
+				      uint8_t peripheral)
+{
+	struct diag_ctrl_last_event_report *header = NULL;
+	uint8_t *ptr = buf;
+	uint8_t *temp = NULL;
+	uint32_t pkt_len = sizeof(uint32_t) + sizeof(uint16_t);
+	uint16_t event_size = 0;
+
+	if (!buf || peripheral >= NUM_PERIPHERALS || len != pkt_len)
+		return;
+
+	mutex_lock(&event_mask.lock);
+	header = (struct diag_ctrl_last_event_report *)ptr;
+	event_size = ((header->event_last_id / 8) + 1);
+	if (event_size >= driver->event_mask_size) {
+		pr_debug("diag: In %s, receiving event mask size more that Apps can handle\n",
+			 __func__);
+		temp = krealloc(driver->event_mask->ptr, event_size,
+				GFP_KERNEL);
+		if (!temp) {
+			pr_err("diag: In %s, unable to reallocate event mask to support events from %d\n",
+			       __func__, peripheral);
+			goto err;
+		}
+		driver->event_mask->ptr = temp;
+		driver->event_mask_size = event_size;
+	}
+
+	driver->num_event_id[peripheral] = header->event_last_id;
+	if (header->event_last_id > driver->last_event_id)
+		driver->last_event_id = header->event_last_id;
+err:
+	mutex_unlock(&event_mask.lock);
+}
+
+static void process_log_range_report(uint8_t *buf, uint32_t len,
+				     uint8_t peripheral)
+{
+	int i;
+	int read_len = 0;
+	int header_len = sizeof(struct diag_ctrl_log_range_report);
+	uint8_t *ptr = buf;
+	uint8_t *temp = NULL;
+	uint32_t mask_size;
+	struct diag_ctrl_log_range_report *header = NULL;
+	struct diag_ctrl_log_range *log_range = NULL;
+	struct diag_log_mask_t *mask_ptr = NULL;
+
+	if (!buf || peripheral >= NUM_PERIPHERALS || len < 0)
+		return;
+
+	header = (struct diag_ctrl_log_range_report *)ptr;
+	ptr += header_len;
+	/* Don't account for pkt_id and length */
+	read_len += header_len - (2 * sizeof(uint32_t));
+
+	driver->num_equip_id[peripheral] = header->num_ranges;
+	for (i = 0; i < header->num_ranges && read_len < len; i++) {
+		log_range = (struct diag_ctrl_log_range *)ptr;
+		ptr += sizeof(struct diag_ctrl_log_range);
+		read_len += sizeof(struct diag_ctrl_log_range);
+
+		if (log_range->equip_id >= MAX_EQUIP_ID) {
+			pr_err("diag: receiving log equip id %d more than supported equip id: %d from peripheral: %d\n",
+			       log_range->equip_id, MAX_EQUIP_ID, peripheral);
+			continue;
+		}
+		mask_ptr = (struct diag_log_mask_t *)log_mask.ptr;
+		mask_ptr = &mask_ptr[log_range->equip_id];
+		mutex_lock(&(mask_ptr->lock));
+		mask_size = LOG_ITEMS_TO_SIZE(log_range->num_items);
+		if (mask_size < mask_ptr->range)
+			goto proceed;
+
+		temp = krealloc(mask_ptr->ptr, mask_size, GFP_KERNEL);
+		if (!temp) {
+			pr_err("diag: In %s, Unable to reallocate log mask ptr to size: %d, equip_id: %d\n",
+			       __func__, mask_size, log_range->equip_id);
+			mutex_unlock(&(mask_ptr->lock));
+			continue;
+		}
+		mask_ptr->ptr = temp;
+		mask_ptr->range = mask_size;
+proceed:
+		if (log_range->num_items > mask_ptr->num_items)
+			mask_ptr->num_items = log_range->num_items;
+		mutex_unlock(&(mask_ptr->lock));
+	}
+}
+
+static int update_msg_mask_tbl_entry(struct diag_msg_mask_t *mask,
+				     struct diag_ssid_range_t *range)
+{
+	uint32_t temp_range;
+
+	if (!mask || !range)
+		return -EIO;
+	if (range->ssid_last < range->ssid_first) {
+		pr_err("diag: In %s, invalid ssid range, first: %d, last: %d\n",
+		       __func__, range->ssid_first, range->ssid_last);
+		return -EINVAL;
+	}
+	if (range->ssid_last >= mask->ssid_last) {
+		temp_range = range->ssid_last - mask->ssid_first + 1;
+		mask->ssid_last = range->ssid_last;
+		mask->range = temp_range;
+	}
+
+	return 0;
+}
+
+static void process_ssid_range_report(uint8_t *buf, uint32_t len,
+				      uint8_t peripheral)
+{
+	int i;
+	int j;
+	int read_len = 0;
+	int found = 0;
+	int new_size = 0;
+	int err = 0;
+	struct diag_ctrl_ssid_range_report *header = NULL;
+	struct diag_ssid_range_t *ssid_range = NULL;
+	int header_len = sizeof(struct diag_ctrl_ssid_range_report);
+	struct diag_msg_mask_t *mask_ptr = NULL;
+	uint8_t *ptr = buf;
+	uint8_t *temp = NULL;
+	uint32_t min_len = header_len - sizeof(struct diag_ctrl_pkt_header_t);
+
+	if (!buf || peripheral >= NUM_PERIPHERALS || len < min_len)
+		return;
+
+	header = (struct diag_ctrl_ssid_range_report *)ptr;
+	ptr += header_len;
+	/* Don't account for pkt_id and length */
+	read_len += header_len - (2 * sizeof(uint32_t));
+	mutex_lock(&driver->msg_mask_lock);
+	driver->max_ssid_count[peripheral] = header->count;
+	for (i = 0; i < header->count && read_len < len; i++) {
+		ssid_range = (struct diag_ssid_range_t *)ptr;
+		ptr += sizeof(struct diag_ssid_range_t);
+		read_len += sizeof(struct diag_ssid_range_t);
+		mask_ptr = (struct diag_msg_mask_t *)msg_mask.ptr;
+		found = 0;
+		for (j = 0; j < driver->msg_mask_tbl_count; j++, mask_ptr++) {
+			if (mask_ptr->ssid_first != ssid_range->ssid_first)
+				continue;
+			mutex_lock(&mask_ptr->lock);
+			err = update_msg_mask_tbl_entry(mask_ptr, ssid_range);
+			mutex_unlock(&mask_ptr->lock);
+			if (err == -ENOMEM) {
+				pr_err("diag: In %s, unable to increase the msg mask table range\n",
+				       __func__);
+			}
+			found = 1;
+			break;
+		}
+
+		if (found)
+			continue;
+
+		new_size = (driver->msg_mask_tbl_count + 1) *
+			   sizeof(struct diag_msg_mask_t);
+		temp = krealloc(msg_mask.ptr, new_size, GFP_KERNEL);
+		if (!temp) {
+			pr_err("diag: In %s, Unable to add new ssid table to msg mask, ssid first: %d, last: %d\n",
+			       __func__, ssid_range->ssid_first,
+			       ssid_range->ssid_last);
+			continue;
+		}
+		msg_mask.ptr = temp;
+		err = diag_create_msg_mask_table_entry(mask_ptr, ssid_range);
+		if (err) {
+			pr_err("diag: In %s, Unable to create a new msg mask table entry, first: %d last: %d err: %d\n",
+			       __func__, ssid_range->ssid_first,
+			       ssid_range->ssid_last, err);
+			continue;
+		}
+		driver->msg_mask_tbl_count += 1;
+	}
+	mutex_unlock(&driver->msg_mask_lock);
+}
+
+static void diag_build_time_mask_update(uint8_t *buf,
+					struct diag_ssid_range_t *range)
+{
+	int i;
+	int j;
+	int num_items = 0;
+	int err = 0;
+	int found = 0;
+	int new_size = 0;
+	uint8_t *temp = NULL;
+	uint32_t *mask_ptr = (uint32_t *)buf;
+	uint32_t *dest_ptr = NULL;
+	struct diag_msg_mask_t *build_mask = NULL;
+
+	if (!range || !buf)
+		return;
+
+	if (range->ssid_last < range->ssid_first) {
+		pr_err("diag: In %s, invalid ssid range, first: %d, last: %d\n",
+		       __func__, range->ssid_first, range->ssid_last);
+		return;
+	}
+	mutex_lock(&driver->msg_mask_lock);
+	build_mask = (struct diag_msg_mask_t *)(driver->build_time_mask->ptr);
+	num_items = range->ssid_last - range->ssid_first + 1;
+
+	for (i = 0; i < driver->bt_msg_mask_tbl_count; i++, build_mask++) {
+		if (build_mask->ssid_first != range->ssid_first)
+			continue;
+		found = 1;
+		mutex_lock(&build_mask->lock);
+		err = update_msg_mask_tbl_entry(build_mask, range);
+		if (err == -ENOMEM) {
+			pr_err("diag: In %s, unable to increase the msg build mask table range\n",
+			       __func__);
+		}
+		dest_ptr = build_mask->ptr;
+		for (j = 0; j < build_mask->range; j++, mask_ptr++, dest_ptr++)
+			*(uint32_t *)dest_ptr |= *mask_ptr;
+		mutex_unlock(&build_mask->lock);
+		break;
+	}
+
+	if (found)
+		goto end;
+	new_size = (driver->bt_msg_mask_tbl_count + 1) *
+		   sizeof(struct diag_msg_mask_t);
+	temp = krealloc(driver->build_time_mask->ptr, new_size, GFP_KERNEL);
+	if (!temp) {
+		pr_err("diag: In %s, unable to create a new entry for build time mask\n",
+		       __func__);
+		goto end;
+	}
+	driver->build_time_mask->ptr = temp;
+	err = diag_create_msg_mask_table_entry(build_mask, range);
+	if (err) {
+		pr_err("diag: In %s, Unable to create a new msg mask table entry, err: %d\n",
+		       __func__, err);
+		goto end;
+	}
+	driver->bt_msg_mask_tbl_count += 1;
+end:
+	mutex_unlock(&driver->msg_mask_lock);
+	return;
+}
+
+static void process_build_mask_report(uint8_t *buf, uint32_t len,
+				      uint8_t peripheral)
+{
+	int i;
+	int read_len = 0;
+	int num_items = 0;
+	int header_len = sizeof(struct diag_ctrl_build_mask_report);
+	uint8_t *ptr = buf;
+	struct diag_ctrl_build_mask_report *header = NULL;
+	struct diag_ssid_range_t *range = NULL;
+
+	if (!buf || peripheral >= NUM_PERIPHERALS || len < header_len)
+		return;
+
+	header = (struct diag_ctrl_build_mask_report *)ptr;
+	ptr += header_len;
+	/* Don't account for pkt_id and length */
+	read_len += header_len - (2 * sizeof(uint32_t));
+
+	for (i = 0; i < header->count && read_len < len; i++) {
+		range = (struct diag_ssid_range_t *)ptr;
+		ptr += sizeof(struct diag_ssid_range_t);
+		read_len += sizeof(struct diag_ssid_range_t);
+		num_items = range->ssid_last - range->ssid_first + 1;
+		diag_build_time_mask_update(ptr, range);
+		ptr += num_items * sizeof(uint32_t);
+		read_len += num_items * sizeof(uint32_t);
+	}
+}
+
+void diag_cntl_process_read_data(struct diagfwd_info *p_info, void *buf,
+				 int len)
+{
+	uint32_t read_len = 0;
+	uint32_t header_len = sizeof(struct diag_ctrl_pkt_header_t);
+	uint8_t *ptr = buf;
+	struct diag_ctrl_pkt_header_t *ctrl_pkt = NULL;
+
+	if (!buf || len <= 0 || !p_info)
+		return;
+
+	if (reg_dirty & PERIPHERAL_MASK(p_info->peripheral)) {
+		pr_err_ratelimited("diag: dropping command registration from peripheral %d\n",
+		       p_info->peripheral);
+		return;
+	}
+
+	while (read_len + header_len < len) {
+		ctrl_pkt = (struct diag_ctrl_pkt_header_t *)ptr;
+		switch (ctrl_pkt->pkt_id) {
+		case DIAG_CTRL_MSG_REG:
+			process_command_registration(ptr, ctrl_pkt->len,
+						     p_info->peripheral);
+			break;
+		case DIAG_CTRL_MSG_DEREG:
+			process_command_deregistration(ptr, ctrl_pkt->len,
+						       p_info->peripheral);
+			break;
+		case DIAG_CTRL_MSG_FEATURE:
+			process_incoming_feature_mask(ptr, ctrl_pkt->len,
+						      p_info->peripheral);
+			break;
+		case DIAG_CTRL_MSG_LAST_EVENT_REPORT:
+			process_last_event_report(ptr, ctrl_pkt->len,
+						  p_info->peripheral);
+			break;
+		case DIAG_CTRL_MSG_LOG_RANGE_REPORT:
+			process_log_range_report(ptr, ctrl_pkt->len,
+						 p_info->peripheral);
+			break;
+		case DIAG_CTRL_MSG_SSID_RANGE_REPORT:
+			process_ssid_range_report(ptr, ctrl_pkt->len,
+						  p_info->peripheral);
+			break;
+		case DIAG_CTRL_MSG_BUILD_MASK_REPORT:
+			process_build_mask_report(ptr, ctrl_pkt->len,
+						  p_info->peripheral);
+			break;
+		case DIAG_CTRL_MSG_PD_STATUS:
+			process_pd_status(ptr, ctrl_pkt->len,
+						p_info->peripheral);
+			break;
+		default:
+			pr_debug("diag: Control packet %d not supported\n",
+				 ctrl_pkt->pkt_id);
+		}
+		ptr += header_len + ctrl_pkt->len;
+		read_len += header_len + ctrl_pkt->len;
+	}
+
+	return;
+}
+
+int diag_compute_real_time(int idx)
 {
 	int real_time = MODE_REALTIME;
 	if (driver->proc_active_mask == 0) {
@@ -339,6 +807,11 @@ void diag_update_real_time_vote(uint16_t proc, uint8_t real_time, int index)
 {
 	int i;
 
+	if (index > DIAG_NUM_PROC) {
+		pr_err("diag: In %s, invalid index %d\n", __func__, index);
+		return;
+	}
+
 	mutex_lock(&driver->real_time_mutex);
 	if (index == ALL_PROC) {
 		for (i = 0; i < DIAG_NUM_PROC; i++) {
@@ -358,7 +831,7 @@ void diag_update_real_time_vote(uint16_t proc, uint8_t real_time, int index)
 
 
 #ifdef CONFIG_DIAGFWD_BRIDGE_CODE
-static void diag_send_diag_mode_update_by_hsic(int index, int real_time)
+static void diag_send_diag_mode_update_remote(int token, int real_time)
 {
 	unsigned char *buf = NULL;
 	int err = 0;
@@ -367,9 +840,9 @@ static void diag_send_diag_mode_update_by_hsic(int index, int real_time)
 	int msg_size = sizeof(struct diag_ctrl_msg_diagmode);
 	uint32_t write_len = 0;
 
-	if (index < 0 || index > MAX_HSIC_DCI_CH) {
-		pr_err("diag: Invalid HSIC channel in %s, index: %d\n",
-							__func__, index);
+	if (token < 0 || token >= NUM_DCI_PROC) {
+		pr_err("diag: Invalid remote device channel in %s, token: %d\n",
+							__func__, token);
 		return;
 	}
 
@@ -379,13 +852,7 @@ static void diag_send_diag_mode_update_by_hsic(int index, int real_time)
 		return;
 	}
 
-	if (!diag_hsic_dci[index].hsic_ch) {
-		pr_debug("diag: In %s, hsic dci channel %d is not enabled.\n",
-							__func__, index);
-		return;
-	}
-
-	buf = dci_get_buffer_from_bridge(index);
+	buf = dci_get_buffer_from_bridge(token);
 	if (!buf) {
 		pr_err("diag: In %s, unable to get dci buffers to write data\n",
 			__func__);
@@ -403,16 +870,16 @@ static void diag_send_diag_mode_update_by_hsic(int index, int real_time)
 	write_len += msg_size;
 	*(buf + write_len) = CONTROL_CHAR; /* End Terminator */
 	write_len += sizeof(uint8_t);
-	err = diag_dci_write_bridge(index, buf, write_len);
+	err = diagfwd_bridge_write(TOKEN_TO_BRIDGE(token), buf, write_len);
 	if (err != write_len) {
 		pr_err("diag: cannot send nrt mode ctrl pkt, err: %d\n", err);
-		diagmem_free(driver, buf, POOL_TYPE_HSIC_DCI_WRITE + index);
+		diagmem_free(driver, buf, dci_ops_tbl[token].mempool);
 	} else {
-		driver->real_time_mode[index + 1] = real_time;
+		driver->real_time_mode[token + 1] = real_time;
 	}
 }
 #else
-static inline void diag_send_diag_mode_update_by_hsic(int index, int real_time)
+static inline void diag_send_diag_mode_update_remote(int token, int real_time)
 {
 }
 #endif
@@ -421,7 +888,25 @@ static inline void diag_send_diag_mode_update_by_hsic(int index, int real_time)
 void diag_real_time_work_fn(struct work_struct *work)
 {
 	int temp_real_time = MODE_REALTIME, i, j;
+	uint8_t send_update = 1;
 
+	/*
+	 * If any peripheral in the local processor is in either threshold or
+	 * circular buffering mode, don't send the real time mode control
+	 * packet.
+	 */
+	for (i = 0; i < NUM_PERIPHERALS; i++) {
+		if (!driver->feature[i].peripheral_buffering)
+			continue;
+		switch (driver->buffering_mode[i].mode) {
+		case DIAG_BUFFERING_MODE_THRESHOLD:
+		case DIAG_BUFFERING_MODE_CIRCULAR:
+			send_update = 0;
+			break;
+		}
+	}
+
+	mutex_lock(&driver->mode_lock);
 	for (i = 0; i < DIAG_NUM_PROC; i++) {
 		temp_real_time = diag_compute_real_time(i);
 		if (temp_real_time == driver->real_time_mode[i]) {
@@ -431,14 +916,20 @@ void diag_real_time_work_fn(struct work_struct *work)
 		}
 
 		if (i == DIAG_LOCAL_PROC) {
-			for (j = 0; j < NUM_SMD_CONTROL_CHANNELS; j++)
-				diag_send_diag_mode_update_by_smd(
-					&driver->smd_cntl[j], temp_real_time);
+			if (!send_update) {
+				pr_debug("diag: In %s, cannot send real time mode pkt since one of the periperhal is in buffering mode\n",
+					 __func__);
+				break;
+			}
+			for (j = 0; j < NUM_PERIPHERALS; j++)
+				diag_send_real_time_update(j,
+						temp_real_time);
 		} else {
-			diag_send_diag_mode_update_by_hsic(i - 1,
+			diag_send_diag_mode_update_remote(i - 1,
 							   temp_real_time);
 		}
 	}
+	mutex_unlock(&driver->mode_lock);
 
 	if (driver->real_time_update_busy > 0)
 		driver->real_time_update_busy--;
@@ -467,12 +958,12 @@ void diag_real_time_work_fn(struct work_struct *work)
 		}
 
 		if (i == DIAG_LOCAL_PROC) {
-			for (j = 0; j < NUM_SMD_CONTROL_CHANNELS; j++)
-				diag_send_diag_mode_update_by_smd(
-					&driver->smd_cntl[j], temp_real_time);
+			for (j = 0; j < NUM_PERIPHERALS; j++)
+				diag_send_real_time_update(
+					j, temp_real_time);
 		} else {
-			diag_send_diag_mode_update_by_hsic(i - 1,
-								temp_real_time);
+			diag_send_diag_mode_update_remote(i - 1,
+							  temp_real_time);
 		}
 	}
 
@@ -481,235 +972,331 @@ void diag_real_time_work_fn(struct work_struct *work)
 }
 #endif
 
-void diag_send_diag_mode_update_by_smd(struct diag_smd_info *smd_info,
-							int real_time)
+int diag_send_real_time_update(uint8_t peripheral, int real_time)
 {
 	char buf[sizeof(struct diag_ctrl_msg_diagmode)];
 	int msg_size = sizeof(struct diag_ctrl_msg_diagmode);
-	int wr_size = -ENOMEM, retry_count = 0, timer;
-	struct diag_smd_info *data = NULL;
+	int err = 0;
 
-	if (!smd_info || smd_info->type != SMD_CNTL_TYPE) {
-		pr_err("diag: In %s, invalid channel info, smd_info: %p type: %d\n",
-					__func__, smd_info,
-					((smd_info) ? smd_info->type : -1));
-		return;
+	if (peripheral >= NUM_PERIPHERALS)
+		return -EINVAL;
+
+	if (!driver->diagfwd_cntl[peripheral] ||
+	    !driver->diagfwd_cntl[peripheral]->ch_open) {
+		pr_debug("diag: In %s, control channel is not open, p: %d\n",
+			 __func__, peripheral);
+		return err;
 	}
 
-	if (smd_info->peripheral < MODEM_DATA ||
-					smd_info->peripheral > WCNSS_DATA) {
-		pr_err("diag: In %s, invalid peripheral %d\n", __func__,
-							smd_info->peripheral);
-		return;
+	if (real_time != MODE_NONREALTIME && real_time != MODE_REALTIME) {
+		pr_err("diag: In %s, invalid real time mode %d, peripheral: %d\n",
+		       __func__, real_time, peripheral);
+		return -EINVAL;
 	}
-
-	data = &driver->smd_data[smd_info->peripheral];
-	if (!data)
-		return;
 
 	diag_create_diag_mode_ctrl_pkt(buf, real_time);
 
 	mutex_lock(&driver->diag_cntl_mutex);
-	if (smd_info->ch) {
-		while (retry_count < 3) {
-			wr_size = smd_write(smd_info->ch, buf, msg_size);
-			if (wr_size == -ENOMEM) {
-				/*
-				 * The smd channel is full. Delay while
-				 * smd processes existing data and smd
-				 * has memory become available. The delay
-				 * of 2000 was determined empirically as
-				 * best value to use.
-				 */
-				retry_count++;
-				for (timer = 0; timer < 5; timer++)
-					udelay(2000);
-			} else {
-				data =
-				&driver->smd_data[smd_info->peripheral];
-				driver->real_time_mode[DIAG_LOCAL_PROC] =
-								real_time;
-				break;
-			}
-		}
-		if (wr_size != msg_size)
-			pr_err("diag: proc %d fail feature update %d, tried %d",
-				smd_info->peripheral,
-				wr_size, msg_size);
+	err = diagfwd_write(peripheral, TYPE_CNTL, buf, msg_size);
+	if (err && err != -ENODEV) {
+		pr_err("diag: In %s, unable to write to smd, peripheral: %d, type: %d, len: %d, err: %d\n",
+		       __func__, peripheral, TYPE_CNTL,
+		       msg_size, err);
 	} else {
-		pr_err("diag: ch invalid, feature update on proc %d\n",
-				smd_info->peripheral);
+		driver->real_time_mode[DIAG_LOCAL_PROC] = real_time;
 	}
-	process_lock_enabling(&data->nrt_lock, real_time);
 
 	mutex_unlock(&driver->diag_cntl_mutex);
+
+	return err;
 }
 
-int diag_send_stm_state(struct diag_smd_info *smd_info,
-			  uint8_t stm_control_data)
+int diag_send_peripheral_buffering_mode(struct diag_buffering_mode_t *params)
 {
-	struct diag_ctrl_msg_stm stm_msg;
-	int msg_size = sizeof(struct diag_ctrl_msg_stm);
-	int retry_count = 0;
-	int wr_size = 0;
-	int success = 0;
+	int err = 0;
+	int mode = MODE_REALTIME;
+	uint8_t peripheral = 0;
 
-	if (!smd_info || (smd_info->type != SMD_CNTL_TYPE) ||
-		(driver->peripheral_supports_stm[smd_info->peripheral] ==
-								DISABLE_STM)) {
+	if (!params)
+		return -EIO;
+
+	peripheral = params->peripheral;
+	if (peripheral >= NUM_PERIPHERALS) {
+		pr_err("diag: In %s, invalid peripheral %d\n", __func__,
+		       peripheral);
 		return -EINVAL;
 	}
 
-	if (smd_info->ch) {
-		stm_msg.ctrl_pkt_id = 21;
-		stm_msg.ctrl_pkt_data_len = 5;
-		stm_msg.version = 1;
-		stm_msg.control_data = stm_control_data;
-		while (retry_count < 3) {
-			wr_size = smd_write(smd_info->ch, &stm_msg, msg_size);
-			if (wr_size == -ENOMEM) {
-				/*
-				 * The smd channel is full. Delay while
-				 * smd processes existing data and smd
-				 * has memory become available. The delay
-				 * of 10000 was determined empirically as
-				 * best value to use.
-				 */
-				retry_count++;
-				usleep_range(10000, 10000);
-			} else {
-				success = 1;
-				break;
-			}
-		}
-		if (wr_size != msg_size) {
-			pr_err("diag: In %s, proc %d fail STM update %d, tried %d",
-				__func__, smd_info->peripheral, wr_size,
-				msg_size);
-			success = 0;
-		}
-	} else {
-		pr_err("diag: In %s, ch invalid, STM update on proc %d\n",
-				__func__, smd_info->peripheral);
-	}
-	return success;
-}
-
-static int diag_smd_cntl_probe(struct platform_device *pdev)
-{
-	int r = 0;
-	int index = -1;
-	const char *channel_name = NULL;
-
-	/* open control ports only on 8960 & newer targets */
-	if (chk_apps_only()) {
-		if (pdev->id == SMD_APPS_MODEM) {
-			index = MODEM_DATA;
-			channel_name = "DIAG_CNTL";
-		}
-		else if (pdev->id == SMD_APPS_QDSP) {
-			index = LPASS_DATA;
-			channel_name = "DIAG_CNTL";
-		}
-		else if (pdev->id == SMD_APPS_WCNSS) {
-			index = WCNSS_DATA;
-			channel_name = "APPS_RIVA_CTRL";
-		}
-
-		if (index != -1) {
-			r = smd_named_open_on_edge(channel_name,
-				pdev->id,
-				&driver->smd_cntl[index].ch,
-				&driver->smd_cntl[index],
-				diag_smd_notify);
-			driver->smd_cntl[index].ch_save =
-				driver->smd_cntl[index].ch;
-		}
-		pr_debug("diag: In %s, open SMD CNTL port, Id = %d, r = %d\n",
-			__func__, pdev->id, r);
+	switch (params->mode) {
+	case DIAG_BUFFERING_MODE_STREAMING:
+		mode = MODE_REALTIME;
+		break;
+	case DIAG_BUFFERING_MODE_THRESHOLD:
+	case DIAG_BUFFERING_MODE_CIRCULAR:
+		mode = MODE_NONREALTIME;
+		break;
+	default:
+		pr_err("diag: In %s, invalid tx mode %d\n", __func__,
+		       params->mode);
+		return -EINVAL;
 	}
 
-	return 0;
+	if (!driver->feature[peripheral].peripheral_buffering) {
+		pr_debug("diag: In %s, peripheral %d doesn't support buffering\n",
+			 __func__, peripheral);
+		return -EIO;
+	}
+
+	/*
+	 * Perform sanity on watermark values. These values must be
+	 * checked irrespective of the buffering mode.
+	 */
+	if (((params->high_wm_val > DIAG_MAX_WM_VAL) ||
+	     (params->low_wm_val > DIAG_MAX_WM_VAL)) ||
+	    (params->low_wm_val > params->high_wm_val) ||
+	    ((params->low_wm_val == params->high_wm_val) &&
+	     (params->low_wm_val != DIAG_MIN_WM_VAL))) {
+		pr_err("diag: In %s, invalid watermark values, high: %d, low: %d, peripheral: %d\n",
+		       __func__, params->high_wm_val, params->low_wm_val,
+		       peripheral);
+		return -EINVAL;
+	}
+
+	mutex_lock(&driver->mode_lock);
+	err = diag_send_buffering_tx_mode_pkt(peripheral, params);
+	if (err) {
+		pr_err("diag: In %s, unable to send buffering mode packet to peripheral %d, err: %d\n",
+		       __func__, peripheral, err);
+		goto fail;
+	}
+	err = diag_send_buffering_wm_values(peripheral, params);
+	if (err) {
+		pr_err("diag: In %s, unable to send buffering wm value packet to peripheral %d, err: %d\n",
+		       __func__, peripheral, err);
+		goto fail;
+	}
+	err = diag_send_real_time_update(peripheral, mode);
+	if (err) {
+		pr_err("diag: In %s, unable to send mode update to peripheral %d, mode: %d, err: %d\n",
+		       __func__, peripheral, mode, err);
+		goto fail;
+	}
+	driver->buffering_mode[peripheral].peripheral = peripheral;
+	driver->buffering_mode[peripheral].mode = params->mode;
+	driver->buffering_mode[peripheral].low_wm_val = params->low_wm_val;
+	driver->buffering_mode[peripheral].high_wm_val = params->high_wm_val;
+fail:
+	mutex_unlock(&driver->mode_lock);
+	return err;
 }
 
-static int diagfwd_cntl_runtime_suspend(struct device *dev)
+int diag_send_stm_state(uint8_t peripheral, uint8_t stm_control_data)
 {
-	dev_dbg(dev, "pm_runtime: suspending...\n");
-	return 0;
+	struct diag_ctrl_msg_stm stm_msg;
+	int msg_size = sizeof(struct diag_ctrl_msg_stm);
+	int err = 0;
+
+	if (peripheral >= NUM_PERIPHERALS)
+		return -EIO;
+
+	if (!driver->diagfwd_cntl[peripheral] ||
+	    !driver->diagfwd_cntl[peripheral]->ch_open) {
+		pr_debug("diag: In %s, control channel is not open, p: %d\n",
+			 __func__, peripheral);
+		return -ENODEV;
+	}
+
+	if (driver->feature[peripheral].stm_support == DISABLE_STM)
+		return -EINVAL;
+
+	stm_msg.ctrl_pkt_id = 21;
+	stm_msg.ctrl_pkt_data_len = 5;
+	stm_msg.version = 1;
+	stm_msg.control_data = stm_control_data;
+	err = diagfwd_write(peripheral, TYPE_CNTL, &stm_msg, msg_size);
+	if (err && err != -ENODEV) {
+		pr_err("diag: In %s, unable to write to smd, peripheral: %d, type: %d, len: %d, err: %d\n",
+		       __func__, peripheral, TYPE_CNTL,
+		       msg_size, err);
+	}
+
+	return err;
 }
 
-static int diagfwd_cntl_runtime_resume(struct device *dev)
+int diag_send_peripheral_drain_immediate(uint8_t peripheral)
 {
-	dev_dbg(dev, "pm_runtime: resuming...\n");
-	return 0;
+	int err = 0;
+	struct diag_ctrl_drain_immediate ctrl_pkt;
+
+	if (!driver->feature[peripheral].peripheral_buffering) {
+		pr_debug("diag: In %s, peripheral  %d doesn't support buffering\n",
+			 __func__, peripheral);
+		return -EINVAL;
+	}
+
+	if (!driver->diagfwd_cntl[peripheral] ||
+	    !driver->diagfwd_cntl[peripheral]->ch_open) {
+		pr_debug("diag: In %s, control channel is not open, p: %d\n",
+			 __func__, peripheral);
+		return -ENODEV;
+	}
+
+	ctrl_pkt.pkt_id = DIAG_CTRL_MSG_PERIPHERAL_BUF_DRAIN_IMM;
+	/* The length of the ctrl pkt is size of version and stream id */
+	ctrl_pkt.len = sizeof(uint32_t) + sizeof(uint8_t);
+	ctrl_pkt.version = 1;
+	ctrl_pkt.stream_id = 1;
+
+	err = diagfwd_write(peripheral, TYPE_CNTL, &ctrl_pkt, sizeof(ctrl_pkt));
+	if (err && err != -ENODEV) {
+		pr_err("diag: Unable to send drain immediate ctrl packet to peripheral %d, err: %d\n",
+		       peripheral, err);
+	}
+
+	return err;
 }
 
-static const struct dev_pm_ops diagfwd_cntl_dev_pm_ops = {
-	.runtime_suspend = diagfwd_cntl_runtime_suspend,
-	.runtime_resume = diagfwd_cntl_runtime_resume,
-};
-
-static struct platform_driver msm_smd_ch1_cntl_driver = {
-
-	.probe = diag_smd_cntl_probe,
-	.driver = {
-		.name = "DIAG_CNTL",
-		.owner = THIS_MODULE,
-		.pm   = &diagfwd_cntl_dev_pm_ops,
-	},
-};
-
-static struct platform_driver diag_smd_lite_cntl_driver = {
-
-	.probe = diag_smd_cntl_probe,
-	.driver = {
-		.name = "APPS_RIVA_CTRL",
-		.owner = THIS_MODULE,
-		.pm   = &diagfwd_cntl_dev_pm_ops,
-	},
-};
-
-void diagfwd_cntl_init(void)
+int diag_send_buffering_tx_mode_pkt(uint8_t peripheral,
+				    struct diag_buffering_mode_t *params)
 {
-	int success;
-	int i;
+	int err = 0;
+	struct diag_ctrl_peripheral_tx_mode ctrl_pkt;
 
+	if (!params)
+		return -EIO;
+
+	if (peripheral >= NUM_PERIPHERALS)
+		return -EINVAL;
+
+	if (!driver->feature[peripheral].peripheral_buffering) {
+		pr_debug("diag: In %s, peripheral  %d doesn't support buffering\n",
+			 __func__, peripheral);
+		return -EINVAL;
+	}
+
+	if (params->peripheral != peripheral)
+		return -EINVAL;
+
+	switch (params->mode) {
+	case DIAG_BUFFERING_MODE_STREAMING:
+	case DIAG_BUFFERING_MODE_THRESHOLD:
+	case DIAG_BUFFERING_MODE_CIRCULAR:
+		break;
+	default:
+		pr_err("diag: In %s, invalid tx mode: %d\n", __func__,
+		       params->mode);
+		return -EINVAL;
+	}
+
+	ctrl_pkt.pkt_id = DIAG_CTRL_MSG_CONFIG_PERIPHERAL_TX_MODE;
+	/* Control packet length is size of version, stream_id and tx_mode */
+	ctrl_pkt.len = sizeof(uint32_t) +  (2 * sizeof(uint8_t));
+	ctrl_pkt.version = 1;
+	ctrl_pkt.stream_id = 1;
+	ctrl_pkt.tx_mode = params->mode;
+
+	err = diagfwd_write(peripheral, TYPE_CNTL, &ctrl_pkt, sizeof(ctrl_pkt));
+	if (err && err != -ENODEV) {
+		pr_err("diag: Unable to send tx_mode ctrl packet to peripheral %d, err: %d\n",
+		       peripheral, err);
+		goto fail;
+	}
+	driver->buffering_mode[peripheral].mode = params->mode;
+
+fail:
+	return err;
+}
+
+int diag_send_buffering_wm_values(uint8_t peripheral,
+				  struct diag_buffering_mode_t *params)
+{
+	int err = 0;
+	struct diag_ctrl_set_wq_val ctrl_pkt;
+
+	if (!params)
+		return -EIO;
+
+	if (peripheral >= NUM_PERIPHERALS)
+		return -EINVAL;
+
+	if (!driver->feature[peripheral].peripheral_buffering) {
+		pr_debug("diag: In %s, peripheral  %d doesn't support buffering\n",
+			 __func__, peripheral);
+		return -EINVAL;
+	}
+
+	if (!driver->diagfwd_cntl[peripheral] ||
+	    !driver->diagfwd_cntl[peripheral]->ch_open) {
+		pr_debug("diag: In %s, control channel is not open, p: %d\n",
+			 __func__, peripheral);
+		return -ENODEV;
+	}
+
+	if (params->peripheral != peripheral)
+		return -EINVAL;
+
+	switch (params->mode) {
+	case DIAG_BUFFERING_MODE_STREAMING:
+	case DIAG_BUFFERING_MODE_THRESHOLD:
+	case DIAG_BUFFERING_MODE_CIRCULAR:
+		break;
+	default:
+		pr_err("diag: In %s, invalid tx mode: %d\n", __func__,
+		       params->mode);
+		return -EINVAL;
+	}
+
+	ctrl_pkt.pkt_id = DIAG_CTRL_MSG_CONFIG_PERIPHERAL_WMQ_VAL;
+	/* Control packet length is size of version, stream_id and wmq values */
+	ctrl_pkt.len = sizeof(uint32_t) + (3 * sizeof(uint8_t));
+	ctrl_pkt.version = 1;
+	ctrl_pkt.stream_id = 1;
+	ctrl_pkt.high_wm_val = params->high_wm_val;
+	ctrl_pkt.low_wm_val = params->low_wm_val;
+
+	err = diagfwd_write(peripheral, TYPE_CNTL, &ctrl_pkt,
+			    sizeof(ctrl_pkt));
+	if (err && err != -ENODEV) {
+		pr_err("diag: Unable to send watermark values to peripheral %d, err: %d\n",
+		       peripheral, err);
+	}
+
+	return err;
+}
+
+int diagfwd_cntl_init(void)
+{
 	reg_dirty = 0;
 	driver->polling_reg_flag = 0;
 	driver->log_on_demand_support = 1;
-	driver->diag_cntl_wq = create_singlethread_workqueue("diag_cntl_wq");
+	driver->stm_peripheral = 0;
+	driver->close_transport = 0;
+	mutex_init(&driver->cntl_lock);
+	INIT_WORK(&(driver->stm_update_work), diag_stm_update_work_fn);
+	INIT_WORK(&(driver->mask_update_work), diag_mask_update_work_fn);
+	INIT_WORK(&(driver->close_transport_work),
+		  diag_close_transport_work_fn);
 
-	for (i = 0; i < NUM_SMD_CONTROL_CHANNELS; i++) {
-		success = diag_smd_constructor(&driver->smd_cntl[i], i,
-							SMD_CNTL_TYPE);
-		if (!success)
-			goto err;
+	driver->cntl_wq = create_singlethread_workqueue("diag_cntl_wq");
+	if (!driver->cntl_wq)
+		return -ENOMEM;
+
+	return 0;
+}
+
+void diagfwd_cntl_channel_init(void)
+{
+	uint8_t peripheral;
+
+	for (peripheral = 0; peripheral < NUM_PERIPHERALS; peripheral++) {
+		diagfwd_early_open(peripheral);
+		diagfwd_open(peripheral, TYPE_CNTL);
 	}
-
-	platform_driver_register(&msm_smd_ch1_cntl_driver);
-	platform_driver_register(&diag_smd_lite_cntl_driver);
-
-	return;
-err:
-	pr_err("diag: Could not initialize diag buffers");
-
-	for (i = 0; i < NUM_SMD_CONTROL_CHANNELS; i++)
-		diag_smd_destructor(&driver->smd_cntl[i]);
-
-	if (driver->diag_cntl_wq)
-		destroy_workqueue(driver->diag_cntl_wq);
 }
 
 void diagfwd_cntl_exit(void)
 {
-	int i;
-
-	for (i = 0; i < NUM_SMD_CONTROL_CHANNELS; i++)
-		diag_smd_destructor(&driver->smd_cntl[i]);
-
-	destroy_workqueue(driver->diag_cntl_wq);
-	destroy_workqueue(driver->diag_real_time_wq);
-
-	platform_driver_unregister(&msm_smd_ch1_cntl_driver);
-	platform_driver_unregister(&diag_smd_lite_cntl_driver);
+	if (driver->cntl_wq)
+		destroy_workqueue(driver->cntl_wq);
+	return;
 }

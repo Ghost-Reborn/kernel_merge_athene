@@ -45,7 +45,6 @@
 #include <linux/usb/audio.h>
 #include <linux/usb/audio-v2.h>
 #include <linux/module.h>
-#include <linux/switch.h>
 
 #include <sound/control.h>
 #include <sound/core.h>
@@ -84,7 +83,6 @@ static int nrpacks = 8;		/* max. number of packets per urb */
 static int device_setup[SNDRV_CARDS]; /* device parameter for this card */
 static bool ignore_ctl_error;
 static bool autoclock = true;
-struct switch_dev *usbaudiosdev;
 
 module_param_array(index, int, NULL, 0444);
 MODULE_PARM_DESC(index, "Index value for the USB audio adapter.");
@@ -224,6 +222,7 @@ static int snd_usb_create_streams(struct snd_usb_audio *chip, int ctrlif)
 	struct usb_interface *usb_iface;
 	void *control_header;
 	int i, protocol;
+	int rest_bytes;
 
 	usb_iface = usb_ifnum_to_if(dev, ctrlif);
 	if (!usb_iface) {
@@ -250,6 +249,15 @@ static int snd_usb_create_streams(struct snd_usb_audio *chip, int ctrlif)
 		return -EINVAL;
 	}
 
+	rest_bytes = (void *)(host_iface->extra + host_iface->extralen) -
+		control_header;
+
+	/* just to be sure -- this shouldn't hit at all */
+	if (rest_bytes <= 0) {
+		dev_err(&dev->dev, "invalid control header\n");
+		return -EINVAL;
+	}
+
 	switch (protocol) {
 	default:
 		snd_printdd(KERN_WARNING "unknown interface protocol %#02x, assuming v1\n",
@@ -259,8 +267,18 @@ static int snd_usb_create_streams(struct snd_usb_audio *chip, int ctrlif)
 	case UAC_VERSION_1: {
 		struct uac1_ac_header_descriptor *h1 = control_header;
 
+		if (rest_bytes < sizeof(*h1)) {
+			dev_err(&dev->dev, "too short v1 buffer descriptor\n");
+			return -EINVAL;
+		}
+
 		if (!h1->bInCollection) {
 			snd_printk(KERN_INFO "skipping empty audio interface (v1)\n");
+			return -EINVAL;
+		}
+
+		if (rest_bytes < h1->bLength) {
+			dev_err(&dev->dev, "invalid buffer length (v1)\n");
 			return -EINVAL;
 		}
 
@@ -308,7 +326,6 @@ static int snd_usb_create_streams(struct snd_usb_audio *chip, int ctrlif)
 		break;
 	}
 	}
-	switch_set_state(usbaudiosdev, 1);
 	return 0;
 }
 
@@ -321,6 +338,11 @@ static int snd_usb_create_streams(struct snd_usb_audio *chip, int ctrlif)
 
 static int snd_usb_audio_free(struct snd_usb_audio *chip)
 {
+	struct list_head *p, *n;
+
+	list_for_each_safe(p, n, &chip->ep_list)
+		snd_usb_endpoint_free(p);
+
 	mutex_destroy(&chip->mutex);
 	kfree(chip);
 	return 0;
@@ -597,7 +619,7 @@ static void snd_usb_audio_disconnect(struct usb_device *dev,
 				     struct snd_usb_audio *chip)
 {
 	struct snd_card *card;
-	struct list_head *p, *n;
+	struct list_head *p;
 
 	if (chip == (void *)-1L)
 		return;
@@ -610,14 +632,16 @@ static void snd_usb_audio_disconnect(struct usb_device *dev,
 	mutex_lock(&register_mutex);
 	chip->num_interfaces--;
 	if (chip->num_interfaces <= 0) {
+		struct snd_usb_endpoint *ep;
+
 		snd_card_disconnect(card);
 		/* release the pcm resources */
 		list_for_each(p, &chip->pcm_list) {
 			snd_usb_stream_disconnect(p);
 		}
 		/* release the endpoint resources */
-		list_for_each_safe(p, n, &chip->ep_list) {
-			snd_usb_endpoint_free(p);
+		list_for_each_entry(ep, &chip->ep_list, list) {
+			snd_usb_endpoint_release(ep);
 		}
 		/* release the midi resources */
 		list_for_each(p, &chip->midi_list) {
@@ -633,7 +657,6 @@ static void snd_usb_audio_disconnect(struct usb_device *dev,
 	} else {
 		mutex_unlock(&register_mutex);
 	}
-	switch_set_state(usbaudiosdev, 0);
 }
 
 /*
@@ -771,32 +794,17 @@ static struct usb_driver usb_audio_driver = {
 
 static int __init snd_usb_audio_init(void)
 {
-	int err;
 	if (nrpacks < 1 || nrpacks > MAX_PACKS) {
 		printk(KERN_WARNING "invalid nrpacks value.\n");
 		return -EINVAL;
 	}
 
-	usbaudiosdev = kzalloc(sizeof(*usbaudiosdev), GFP_KERNEL);
-	if (!usbaudiosdev) {
-		pr_err("Usb audio device memory allocation failed.\n");
-		return -ENOMEM;
-	}
-
-	usbaudiosdev->name = "usb_audio";
-
-	err = switch_dev_register(usbaudiosdev);
-	if (err)
-		pr_err("Usb-audio switch registration failed\n");
-	else
-		pr_debug("usb hs_detected\n");
 	return usb_register(&usb_audio_driver);
 }
 
 static void __exit snd_usb_audio_cleanup(void)
 {
 	usb_deregister(&usb_audio_driver);
-	kfree(usbaudiosdev);
 }
 
 module_init(snd_usb_audio_init);

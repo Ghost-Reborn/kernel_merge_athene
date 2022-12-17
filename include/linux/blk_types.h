@@ -75,6 +75,13 @@ struct bio {
 #endif
 
 	/*
+	 * When using dircet-io (O_DIRECT), we can't get the inode from a bio
+	 * by walking bio->bi_io_vec->bv_page->mapping->host
+	 * since the page is anon.
+	 */
+	struct inode		*bi_dio_inode;
+
+	/*
 	 * Everything starting with bi_max_vecs will be preserved by bio_reset()
 	 */
 
@@ -126,6 +133,7 @@ struct bio {
  * at the dm level
  */
 #define BIO_DONTFREE 14
+#define BIO_INLINECRYPT 15
 
 #define bio_flagged(bio, flag)	((bio)->bi_flags & (1 << (flag)))
 
@@ -177,7 +185,9 @@ enum rq_flag_bits {
 	__REQ_ELVPRIV,		/* elevator private data attached */
 	__REQ_FAILED,		/* set if the request failed */
 	__REQ_QUIET,		/* don't worry about errors */
-	__REQ_PREEMPT,		/* set for "ide_preempt" requests */
+	__REQ_PREEMPT,		/* set for "ide_preempt" requests and also
+				   for requests for which the SCSI "quiesce"
+				   state must be ignored. */
 	__REQ_ALLOCED,		/* request came from our alloc pool */
 	__REQ_COPY_USER,	/* contains copies of user pages */
 	__REQ_FLUSH_SEQ,	/* request for flush sequence */

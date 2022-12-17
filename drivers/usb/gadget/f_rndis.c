@@ -96,7 +96,7 @@ struct f_rndis {
 static struct f_rndis *__rndis;
 
 int
-rndis_rx_trigger(void)
+rndis_rx_trigger(bool write)
 {
 	struct f_rndis *rndis = __rndis;
 
@@ -104,6 +104,8 @@ rndis_rx_trigger(void)
 		pr_err("can't set rx trigger\n");
 		return -EINVAL;
 	}
+	if (!write)
+		return rndis->port.rx_triggered;
 
 	if (rndis->port.rx_triggered)
 		return 0;
@@ -407,11 +409,11 @@ static struct sk_buff *rndis_add_header(struct gether *port,
 	struct sk_buff *skb2;
 	struct rndis_packet_msg_type *header = NULL;
 	struct f_rndis *rndis = func_to_rndis(&port->func);
+	struct usb_composite_dev *cdev = port->func.config->cdev;
 
-	if (rndis->port.multi_pkt_xfer) {
+	if (rndis->port.multi_pkt_xfer || cdev->gadget->sg_supported) {
 		if (port->header) {
 			header = port->header;
-			memset(header, 0, sizeof(*header));
 			header->MessageType = cpu_to_le32(RNDIS_MSG_PACKET);
 			header->MessageLength = cpu_to_le32(skb->len +
 							sizeof(*header));
@@ -422,6 +424,7 @@ static struct sk_buff *rndis_add_header(struct gether *port,
 						header->DataLength);
 			return skb;
 		} else {
+			dev_kfree_skb_any(skb);
 			pr_err("RNDIS header is NULL.\n");
 			return NULL;
 		}
@@ -447,6 +450,8 @@ static void rndis_response_available(void *_rndis)
 	if (atomic_inc_return(&rndis->notify_count) != 1)
 		return;
 
+	if (!rndis->notify->driver_data)
+		return;
 	/* Send RNDIS RESPONSE_AVAILABLE notification; a
 	 * USB_CDC_NOTIFY_RESPONSE_AVAILABLE "should" work too
 	 *
@@ -528,11 +533,28 @@ static void rndis_command_complete(struct usb_ep *ep, struct usb_request *req)
 	buf = (rndis_init_msg_type *)req->buf;
 
 	if (buf->MessageType == RNDIS_MSG_INIT) {
+		if (cdev->gadget->sg_supported) {
+			rndis->port.dl_max_xfer_size = buf->MaxTransferSize;
+			gether_update_dl_max_xfer_size(&rndis->port,
+					rndis->port.dl_max_xfer_size);
+
+			/* if SG is enabled multiple packets can be put
+			 * together too quickly. However, module param
+			 * is not honored.
+			 */
+			rndis->port.dl_max_pkts_per_xfer = 3;
+
+			gether_update_dl_max_pkts_per_xfer(&rndis->port,
+					 rndis->port.dl_max_pkts_per_xfer);
+
+			return;
+		}
+
 		if (buf->MaxTransferSize > 2048)
 			rndis->port.multi_pkt_xfer = 1;
 		else
 			rndis->port.multi_pkt_xfer = 0;
-		DBG(cdev, "%s: MaxTransferSize: %d : Multi_pkt_txr: %s\n",
+		pr_info("%s: MaxTransferSize: %d : Multi_pkt_txr: %s\n",
 				__func__, buf->MaxTransferSize,
 				rndis->port.multi_pkt_xfer ? "enabled" :
 							    "disabled");
@@ -676,7 +698,8 @@ static int rndis_set_alt(struct usb_function *f, unsigned intf, unsigned alt)
 		 */
 		rndis->port.cdc_filter = 0;
 
-		DBG(cdev, "RNDIS RX/TX early activation ... \n");
+		DBG(cdev, "RNDIS RX/TX early activation ...\n");
+		gether_enable_sg(&rndis->port, true);
 		net = gether_connect(&rndis->port);
 		if (IS_ERR(net))
 			return PTR_ERR(net);
@@ -800,7 +823,8 @@ rndis_bind(struct usb_configuration *c, struct usb_function *f)
 	rndis->notify_req = usb_ep_alloc_request(ep, GFP_KERNEL);
 	if (!rndis->notify_req)
 		goto fail;
-	rndis->notify_req->buf = kmalloc(STATUS_BYTECOUNT, GFP_KERNEL);
+	rndis->notify_req->buf = kmalloc(STATUS_BYTECOUNT +
+			cdev->gadget->extra_buf_alloc, GFP_KERNEL);
 	if (!rndis->notify_req->buf)
 		goto fail;
 	rndis->notify_req->length = STATUS_BYTECOUNT;

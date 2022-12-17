@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -39,6 +39,7 @@ struct dsi_buf {
 	int size;	/* size of buffer */
 	char *data;	/* buffer */
 	int len;	/* data length */
+	int read_cnt;	/* DSI read count */
 	dma_addr_t dmap; /* mapped dma addr */
 };
 
@@ -57,7 +58,8 @@ struct dsi_buf {
 #define DTYPE_GEN_READ1		0x14	/* long read, 1 parameter */
 #define DTYPE_GEN_READ2		0x24	/* long read, 2 parameter */
 
-#define DTYPE_TEAR_ON		0x35	/* set tear on */
+#define DTYPE_COMPRESSION_MODE	0x07	/* compression mode */
+#define DTYPE_PPS		0x0a	/* pps */
 #define DTYPE_MAX_PKTSIZE	0x37	/* set max packet size */
 #define DTYPE_NULL_PKT		0x09	/* null packet, no data */
 #define DTYPE_BLANK_PKT		0x19	/* blankiing packet, no data */
@@ -97,8 +99,11 @@ struct dsi_cmd_desc {
 #define CMD_REQ_RX      0x0001
 #define CMD_REQ_COMMIT  0x0002
 #define CMD_CLK_CTRL    0x0004
+#define CMD_REQ_UNICAST 0x0008
+#define CMD_REQ_DMA_TPG 0x0040
 #define CMD_REQ_NO_MAX_PKT_SIZE 0x0008
 #define CMD_REQ_LP_MODE 0x0010
+#define CMD_REQ_HS_MODE 0x0020
 
 struct dcs_cmd_req {
 	struct dsi_cmd_desc *cmds;
@@ -121,14 +126,15 @@ char *mdss_dsi_buf_unreserve(struct dsi_buf *dp, int len);
 char *mdss_dsi_buf_push(struct dsi_buf *dp, int len);
 char *mdss_dsi_buf_reserve_hdr(struct dsi_buf *dp, int hlen);
 char *mdss_dsi_buf_init(struct dsi_buf *dp);
-int mdss_dsi_buf_alloc(struct dsi_buf *dp, int size);
+int mdss_dsi_buf_alloc(struct device *ctrl_dev, struct dsi_buf *dp, int size);
 int mdss_dsi_cmd_dma_add(struct dsi_buf *dp, struct dsi_cmd_desc *cm);
 int mdss_dsi_short_read1_resp(struct dsi_buf *rp);
 int mdss_dsi_short_read2_resp(struct dsi_buf *rp);
 int mdss_dsi_long_read_resp(struct dsi_buf *rp);
 void mdss_dsi_set_tear_on(struct mdss_dsi_ctrl_pdata *ctrl);
 void mdss_dsi_set_tear_off(struct mdss_dsi_ctrl_pdata *ctrl);
-struct dcs_cmd_req *mdss_dsi_cmdlist_get(struct mdss_dsi_ctrl_pdata *ctrl);
+struct dcs_cmd_req *mdss_dsi_cmdlist_get(struct mdss_dsi_ctrl_pdata *ctrl,
+					int from_mdp);
 int mdss_dsi_cmdlist_put(struct mdss_dsi_ctrl_pdata *ctrl,
 				struct dcs_cmd_req *cmdreq);
 #endif

@@ -11,6 +11,8 @@ menuconfig INPUT_TOUCHSCREEN
 
 if INPUT_TOUCHSCREEN
 
+source "drivers/input/touchscreen/synaptics_dsx/Kconfig"
+
 config TOUCHSCREEN_88PM860X
 	tristate "Marvell 88PM860x touchscreen"
 	depends on MFD_88PM860X
@@ -371,7 +373,7 @@ config TOUCHSCREEN_MCS5000
 
 config TOUCHSCREEN_MMS114
 	tristate "MELFAS MMS114 touchscreen"
-	depends on I2C && GENERIC_HARDIRQS
+	depends on I2C
 	help
 	  Say Y here if you have the MELFAS MMS114 touchscreen controller
 	  chip in your system.
@@ -839,7 +841,7 @@ config TOUCHSCREEN_TSC_SERIO
 
 config TOUCHSCREEN_TSC2005
         tristate "TSC2005 based touchscreens"
-        depends on SPI_MASTER && GENERIC_HARDIRQS
+        depends on SPI_MASTER
         help
           Say Y here if you have a TSC2005 based touchscreen.
 
@@ -935,6 +937,34 @@ config TOUCHSCREEN_FT5X06
          To compile this driver as a module, choose M here: the
          module will be called ft5x06_ts.
 
+config TOUCHSCREEN_FT5X06_PSENSOR
+       tristate "FocalTech proximity feature support"
+       depends on TOUCHSCREEN_FT5X06 && SENSORS
+       help
+         Say Y here if you want to support ft5x06's proximity
+         feature.
+
+         If unsure, say N.
+
+config TOUCHSCREEN_FT5X06_GESTURE
+       tristate "FocalTech gesture feature support"
+       depends on TOUCHSCREEN_FT5X06
+       help
+         Say Y here if you want to support ft5x06's gesture
+         feature.
+
+         If unsure, say N.
+
+config TOUCHSCREEN_SYNAPTICS_DSX_FW_UPDATE_EXTRA_SYSFS
+	bool "Synaptics DSX firmware update extra sysfs attributes"
+	depends on TOUCHSCREEN_SYNAPTICS_DSX_FW_UPDATE
+	help
+	  Say Y here to enable support for extra sysfs attributes
+	  supporting firmware update in a development environment.
+	  This does not affect the core or other subsystem attributes.
+
+	  If unsure, say N.
+
 config TOUCHSCREEN_GEN_VKEYS
        tristate "Touchscreen Virtual Keys Driver"
        help
@@ -990,10 +1020,10 @@ config TOUCHSCREEN_SYNAPTICS_DSX_FW_UPDATE
 
 config SECURE_TOUCH
 	bool "Secure Touch"
-	depends on TOUCHSCREEN_ATMEL_MXT
+	depends on (TOUCHSCREEN_ATMEL_MXT || TOUCHSCREEN_SYNAPTICS_I2C_RMI4 || \
+	  TOUCHSCREEN_SYNAPTICS_DSX_I2C_v21 || TOUCHSCREEN_ATMEL_MAXTOUCH_TS)
 	help
-	  Say Y here to enable Secure Touch support in the Atmel MXT
-	  driver.
+	  Say Y here to enable Secure Touch in supported drivers.
 
 	  If unsure, say N.
 
@@ -1008,5 +1038,104 @@ config TOUCHSCREEN_GT9XX
           If unsure, say N.
 
 source "drivers/input/touchscreen/gt9xx/Kconfig"
+
+config TOUCHSCREEN_BU21150
+	tristate "JDI AFE BU21150"
+	depends on SPI_MASTER
+	help
+	  This enables support for character device channel for
+	  Rohm BU21150 Touch AFE.
+
+	  Say Y here if you have a Rohm bu21150 AFE connected to
+	  your system.
+
+	  If unsure, say N.
+
+config INPUT_MT_WRAPPER
+	tristate "Input Multitouch Wrapper"
+	help
+	  This enables support for character device channel for
+	  passing to the input system a multi-touch coordinates.
+
+	  Say Y here if you want to enable the driver.
+
+	  If unsure, say N.
+
+config TOUCHSCREEN_IT7260_I2C
+	tristate "IT7260 Touchscreen Driver"
+	depends on I2C
+	help
+	  Say Y here if you have a IT7260 Touchscreen Driver
+	  connected to your system.
+
+	  If unsure, say N.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called it7258_ts_i2c.
+
+config TOUCHSCREEN_SYNAPTICS_DSX_I2C
+	tristate "Synaptics DSX I2C touchscreen"
+	depends on I2C
+	help
+	  Say Y here if you have a Synaptics DSX I2C touchscreen
+	  connected to your system.
+
+	  If unsure, say N.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called synaptics_dsx_i2c.
+
+config TOUCHSCREEN_SYNAPTICS_DSX_RMI_DEV_MMI
+	tristate "Synaptics DSX touchscreen char device"
+	depends on TOUCHSCREEN_SYNAPTICS_DSX_I2C
+	help
+	  This enables support for direct register access for Synaptics DSX
+	  touchscreens.
+
+config TOUCHSCREEN_SYNAPTICS_DSX_TEST_REPORTING
+	tristate "Synaptics DSX touchscreen test reporting"
+	depends on TOUCHSCREEN_SYNAPTICS_DSX_I2C
+	help
+	  This enables support for test reporting for Synaptics DSX
+	  touchscreens.
+
+config TOUCHSCREEN_SYNAPTICS_DSX_FW_UPDATE_MMI
+	tristate "Synaptics DSX touchscreen firmware update (MMI)"
+	depends on TOUCHSCREEN_SYNAPTICS_DSX_I2C
+	help
+	  This enables support for firmware update for Synaptics DSX
+	  touchscreens via the MMI design.
+
+config TOUCHSCREEN_SYNAPTICS_DSX_FW_UPDATE_EXTRA_SYSFS_MMI
+	bool "Synaptics DSX firmware update extra sysfs attributes (MMI)"
+	depends on TOUCHSCREEN_SYNAPTICS_DSX_FW_UPDATE_MMI
+	help
+	  Say Y here to enable support for extra sysfs attributes
+	  supporting firmware update in a development environment.
+	  This does not affect the core or other subsystem attributes.
+
+	  If unsure, say N.
+
+
+config TOUCHSCREEN_SYNAPTICS_DSX_CTRL_ACCESS_BLK
+	tristate "Synaptics I2C touchscreen control access block"
+	depends on TOUCHSCREEN_SYNAPTICS_DSX_I2C
+	help
+	  This enables export of Synaptics DSX I2C touchscreen control access
+          block.
+
+	  Say Y here if you intend to export Synaptics DSX I2C touchscreen
+	  control access block.
+
+	  If unsure, say N.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called synaptics_dsx_control_access_block
+
+config SWEEP2SLEEP
+        tristate "Sweep to put device to sleep"
+        default y
+        help
+          Say Y here to support sweep2sleep
 
 endif

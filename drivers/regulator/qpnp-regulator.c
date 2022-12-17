@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -104,6 +104,7 @@ enum qpnp_regulator_subtype {
 	QPNP_REGULATOR_SUBTYPE_OTG		= 0x11,
 	QPNP_REGULATOR_SUBTYPE_5V_BOOST		= 0x01,
 	QPNP_REGULATOR_SUBTYPE_FTS_CTL		= 0x08,
+	QPNP_REGULATOR_SUBTYPE_FTS2p5_CTL	= 0x09,
 	QPNP_REGULATOR_SUBTYPE_BB_2A		= 0x01,
 	QPNP_REGULATOR_SUBTYPE_ULT_HF_CTL1	= 0x0D,
 	QPNP_REGULATOR_SUBTYPE_ULT_HF_CTL2	= 0x0E,
@@ -120,6 +121,7 @@ enum qpnp_common_regulator_registers {
 	QPNP_COMMON_REG_MODE			= 0x45,
 	QPNP_COMMON_REG_ENABLE			= 0x46,
 	QPNP_COMMON_REG_PULL_DOWN		= 0x48,
+	QPNP_COMMON_REG_STEP_CTRL		= 0x61,
 };
 
 enum qpnp_ldo_registers {
@@ -193,6 +195,24 @@ enum qpnp_common_control_register_index {
 #define QPNP_VS_OCP_DEFAULT_RETRY_DELAY_MS	30
 #define QPNP_VS_OCP_FALL_DELAY_US		90
 #define QPNP_VS_OCP_FAULT_DELAY_US		20000
+
+#define QPNP_FTSMPS_STEP_CTRL_STEP_MASK		0x18
+#define QPNP_FTSMPS_STEP_CTRL_STEP_SHIFT	3
+#define QPNP_FTSMPS_STEP_CTRL_DELAY_MASK	0x07
+#define QPNP_FTSMPS_STEP_CTRL_DELAY_SHIFT	0
+
+/* Clock rate in kHz of the FTSMPS regulator reference clock. */
+#define QPNP_FTSMPS_CLOCK_RATE		19200
+
+/* Minimum voltage stepper delay for each step. */
+#define QPNP_FTSMPS_STEP_DELAY		8
+
+/*
+ * The ratio QPNP_FTSMPS_STEP_MARGIN_NUM/QPNP_FTSMPS_STEP_MARGIN_DEN is used to
+ * adjust the step rate in order to account for oscillator variance.
+ */
+#define QPNP_FTSMPS_STEP_MARGIN_NUM	4
+#define QPNP_FTSMPS_STEP_MARGIN_DEN	5
 
 /*
  * This voltage in uV is returned by get_voltage functions when there is no way
@@ -274,6 +294,7 @@ struct qpnp_regulator {
 	int					ocp_retry_delay_ms;
 	int					system_load;
 	int					hpm_min_load;
+	int					slew_rate;
 	u32					write_count;
 	u32					prev_write_count;
 	ktime_t					vs_enable_time;
@@ -356,6 +377,11 @@ static struct qpnp_voltage_range ftsmps_ranges[] = {
 	VOLTAGE_RANGE(1,       0, 1280000, 2040000, 2040000, 10000),
 };
 
+static struct qpnp_voltage_range ftsmps2p5_ranges[] = {
+	VOLTAGE_RANGE(0,   80000,  350000, 1355000, 1355000,  5000),
+	VOLTAGE_RANGE(1,  160000, 1360000, 2200000, 2200000, 10000),
+};
+
 static struct qpnp_voltage_range boost_ranges[] = {
 	VOLTAGE_RANGE(0, 4000000, 4000000, 5550000, 5550000, 50000),
 };
@@ -393,6 +419,8 @@ static struct qpnp_voltage_set_points ln_ldo_set_points
 static struct qpnp_voltage_set_points smps_set_points = SET_POINTS(smps_ranges);
 static struct qpnp_voltage_set_points ftsmps_set_points
 					= SET_POINTS(ftsmps_ranges);
+static struct qpnp_voltage_set_points ftsmps2p5_set_points
+					= SET_POINTS(ftsmps2p5_ranges);
 static struct qpnp_voltage_set_points boost_set_points
 					= SET_POINTS(boost_ranges);
 static struct qpnp_voltage_set_points boost_byp_set_points
@@ -415,6 +443,7 @@ static struct qpnp_voltage_set_points *all_set_points[] = {
 	&ln_ldo_set_points,
 	&smps_set_points,
 	&ftsmps_set_points,
+	&ftsmps2p5_set_points,
 	&boost_set_points,
 	&boost_byp_set_points,
 	&ult_lo_smps_set_points,
@@ -768,8 +797,17 @@ static int qpnp_regulator_common_set_voltage(struct regulator_dev *rdev,
 		int min_uV, int max_uV, unsigned *selector)
 {
 	struct qpnp_regulator *vreg = rdev_get_drvdata(rdev);
-	int rc, range_sel, voltage_sel;
+	int rc, range_sel, voltage_sel, voltage_old, voltage_new;
 	u8 buf[2];
+
+	if (vreg->slew_rate && vreg->rdesc.ops->get_voltage) {
+		voltage_old = vreg->rdesc.ops->get_voltage(rdev);
+		if (voltage_old < 0) {
+			vreg_err(vreg, "could not get current voltage, rc=%d\n",
+				voltage_old);
+			return voltage_old;
+		}
+	}
 
 	/*
 	 * Favor staying in the current voltage range if possible.  This avoids
@@ -803,10 +841,24 @@ static int qpnp_regulator_common_set_voltage(struct regulator_dev *rdev,
 			&vreg->ctrl_reg[QPNP_COMMON_IDX_VOLTAGE_RANGE], 2);
 	}
 
-	if (rc)
+	if (rc) {
 		vreg_err(vreg, "SPMI write failed, rc=%d\n", rc);
-	else
+	} else {
+		/* Delay for voltage slewing if a step rate is specified. */
+		if (vreg->slew_rate && vreg->rdesc.ops->get_voltage) {
+			voltage_new = vreg->rdesc.ops->get_voltage(rdev);
+			if (voltage_new < 0) {
+				vreg_err(vreg, "could not get new voltage, rc=%d\n",
+					voltage_new);
+				return voltage_new;
+			}
+
+			udelay(DIV_ROUND_UP(abs(voltage_new - voltage_old),
+						vreg->slew_rate));
+		}
+
 		qpnp_vreg_show_state(rdev, QPNP_REGULATOR_ACTION_VOLTAGE);
+	}
 
 	return rc;
 }
@@ -1427,6 +1479,8 @@ static const struct qpnp_regulator_mapping supported_regulators[] = {
 	QPNP_VREG_MAP(VS,    OTG,      0, INF, VS,     vs,     none,        0),
 	QPNP_VREG_MAP(BOOST, 5V_BOOST, 0, INF, BOOST,  boost,  boost,       0),
 	QPNP_VREG_MAP(FTS,   FTS_CTL,  0, INF, FTSMPS, ftsmps, ftsmps, 100000),
+	QPNP_VREG_MAP(FTS, FTS2p5_CTL, 0, INF, FTSMPS, ftsmps, ftsmps2p5,
+								       100000),
 	QPNP_VREG_MAP(BOOST_BYP, BB_2A, 0, INF, BOOST_BYP, boost, boost_byp, 0),
 	QPNP_VREG_MAP(ULT_BUCK, ULT_HF_CTL1, 0, INF, ULT_LO_SMPS, ult_lo_smps,
 							ult_lo_smps,   100000),
@@ -1502,6 +1556,57 @@ static int qpnp_regulator_match(struct qpnp_regulator *vreg)
 			break;
 		}
 	}
+
+	if (rc)
+		vreg_err(vreg, "unsupported regulator: type=0x%02X, subtype=0x%02X, dig major rev=0x%02X\n",
+			type, subtype, dig_major_rev);
+
+	return rc;
+}
+
+static int qpnp_regulator_ftsmps_init_slew_rate(struct qpnp_regulator *vreg)
+{
+	int rc;
+	u8 reg = 0;
+	int step = 0, delay, i, range_sel;
+	struct qpnp_voltage_range *range = NULL;
+
+	rc = qpnp_vreg_read(vreg, QPNP_COMMON_REG_STEP_CTRL, &reg, 1);
+	if (rc) {
+		vreg_err(vreg, "spmi read failed, rc=%d\n", rc);
+		return rc;
+	}
+
+	range_sel = vreg->ctrl_reg[QPNP_COMMON_IDX_VOLTAGE_RANGE];
+
+	for (i = 0; i < vreg->set_points->count; i++) {
+		if (vreg->set_points->range[i].range_sel == range_sel) {
+			range = &vreg->set_points->range[i];
+			break;
+		}
+	}
+
+	if (!range) {
+		vreg_err(vreg, "range %d is invalid\n", range_sel);
+		return -EINVAL;
+	}
+
+	step = (reg & QPNP_FTSMPS_STEP_CTRL_STEP_MASK)
+		>> QPNP_FTSMPS_STEP_CTRL_STEP_SHIFT;
+
+	delay = (reg & QPNP_FTSMPS_STEP_CTRL_DELAY_MASK)
+		>> QPNP_FTSMPS_STEP_CTRL_DELAY_SHIFT;
+
+	/* slew_rate has units of uV/us. */
+	vreg->slew_rate = QPNP_FTSMPS_CLOCK_RATE * range->step_uV * (1 << step);
+
+	vreg->slew_rate /= 1000 * (QPNP_FTSMPS_STEP_DELAY << delay);
+
+	vreg->slew_rate = vreg->slew_rate * QPNP_FTSMPS_STEP_MARGIN_NUM
+				/ QPNP_FTSMPS_STEP_MARGIN_DEN;
+
+	/* Ensure that the slew rate is greater than 0. */
+	vreg->slew_rate = max(vreg->slew_rate, 1);
 
 	return rc;
 }
@@ -1715,6 +1820,16 @@ static int qpnp_regulator_init_registers(struct qpnp_regulator *vreg,
 		}
 	}
 
+	/* Calculate the slew rate for FTSMPS regulators. */
+	if (type == QPNP_REGULATOR_LOGICAL_TYPE_FTSMPS) {
+		rc = qpnp_regulator_ftsmps_init_slew_rate(vreg);
+		if (rc) {
+			vreg_err(vreg, "failed to initialize step rate, rc=%d\n",
+				 rc);
+			return rc;
+		}
+	}
+
 	return rc;
 }
 
@@ -1884,10 +1999,8 @@ static int qpnp_regulator_probe(struct spmi_device *spmi)
 	dev_set_drvdata(&spmi->dev, vreg);
 
 	rc = qpnp_regulator_match(vreg);
-	if (rc) {
-		vreg_err(vreg, "regulator type unknown, rc=%d\n", rc);
+	if (rc)
 		goto bail;
-	}
 
 	if (is_dt && rdesc->ops) {
 		/* Fill in ops and mode masks when using device tree. */

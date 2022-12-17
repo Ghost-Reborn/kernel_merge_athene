@@ -1,8 +1,12 @@
 MSM DBM (Device Bus Manager)
 
 Required properties :
-- compatible : should be "qcom,usb-dbm-<dbm version number>"
+- compatible : must be one of "qcom,usb-dbm-1p4", or "qcom,usb-dbm-1p5"
 - reg : offset and length of the register set in the memory map.
+
+Optional properties :
+- qcom,reset-ep-after-lpm-resume: If present, dbm requires ep reset after
+	going to lpm
 
 Example MSM DBM (Device Bus Manager) device node :
 	dbm_1p4: dbm@f92f8000 {

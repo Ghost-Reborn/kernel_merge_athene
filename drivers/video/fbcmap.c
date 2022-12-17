@@ -196,7 +196,7 @@ int fb_cmap_to_user(const struct fb_cmap *from, struct fb_cmap_user *to)
 	int tooff = 0, fromoff = 0;
 	int size;
 
-	if (!to || !from)
+	if (!to || !from || (int)(to->start) < 0)
 		return -EINVAL;
 
 	if (to->start > from->start)
@@ -299,8 +299,8 @@ int fb_set_user_cmap(struct fb_cmap_user *cmap, struct fb_info *info)
 		rc = -ENODEV;
 		goto out;
 	}
-	if (cmap->start < 0 || (!info->fbops->fb_setcolreg &&
-				!info->fbops->fb_setcmap)) {
+	if (!info->fbops->fb_setcolreg &&
+				!info->fbops->fb_setcmap) {
 		rc = -EINVAL;
 		goto out1;
 	}

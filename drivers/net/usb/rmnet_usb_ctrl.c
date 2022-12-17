@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2011-2014, 2017, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -174,6 +174,11 @@ static void get_encap_work(struct work_struct *w)
 
 	if (!test_bit(RMNET_CTRL_DEV_READY, &dev->status))
 		return;
+
+	if (dev->rcvurb->anchor) {
+		dev->ignore_encap_work++;
+		return;
+	}
 
 	udev = interface_to_usbdev(dev->intf);
 
@@ -474,15 +479,34 @@ static int rmnet_usb_ctrl_write_cmd(struct rmnet_ctrl_udev *dev, u8 req,
 	if (ret < 0)
 		dev->tx_ctrl_err_cnt++;
 
-	usb_autopm_put_interface(dev->intf);
+	/* if we are here after device disconnect
+	 * usb_unbind_interface() takes care of
+	 * residual pm_autopm_get_interface_* calls
+	 */
+	if (test_bit(RMNET_CTRL_DEV_READY, &dev->status))
+		usb_autopm_put_interface(dev->intf);
 
 	return ret;
 }
 
+static void rmnet_usb_ctrl_free_rx_list(struct rmnet_ctrl_dev *dev)
+{
+	unsigned long flag;
+	struct ctrl_pkt_list_elem *list_elem = NULL;
+
+	spin_lock_irqsave(&dev->rx_lock, flag);
+	while (!list_empty(&dev->rx_list)) {
+		list_elem = list_first_entry(&dev->rx_list,
+				struct ctrl_pkt_list_elem, list);
+		list_del(&list_elem->list);
+		kfree(list_elem->cpkt.data);
+		kfree(list_elem);
+	}
+	spin_unlock_irqrestore(&dev->rx_lock, flag);
+}
+
 static int rmnet_ctl_open(struct inode *inode, struct file *file)
 {
-	struct ctrl_pkt_list_elem	*list_elem = NULL;
-	unsigned long			flag;
 	int				retval = 0;
 	struct rmnet_ctrl_dev		*dev =
 		container_of(inode->i_cdev, struct rmnet_ctrl_dev, cdev);
@@ -490,8 +514,13 @@ static int rmnet_ctl_open(struct inode *inode, struct file *file)
 	if (!dev)
 		return -ENODEV;
 
-	if (test_bit(RMNET_CTRL_DEV_OPEN, &dev->status))
+	mutex_lock(&dev->dev_lock);
+	if (test_bit(RMNET_CTRL_DEV_OPEN, &dev->status)) {
+		mutex_unlock(&dev->dev_lock);
 		goto already_opened;
+	}
+	set_bit(RMNET_CTRL_DEV_OPEN, &dev->status);
+	mutex_unlock(&dev->dev_lock);
 
 	if (dev->mdm_wait_timeout &&
 			!test_bit(RMNET_CTRL_DEV_READY, &dev->cudev->status)) {
@@ -503,10 +532,15 @@ static int rmnet_ctl_open(struct inode *inode, struct file *file)
 		if (retval == 0) {
 			dev_err(dev->devicep, "%s: Timeout opening %s\n",
 						__func__, dev->name);
-			return -ETIMEDOUT;
-		} else if (retval < 0) {
+			retval = -ETIMEDOUT;
+		} else if (retval < 0)
 			dev_err(dev->devicep, "%s: Error waiting for %s\n",
 						__func__, dev->name);
+
+		if (retval < 0) {
+			mutex_lock(&dev->dev_lock);
+			clear_bit(RMNET_CTRL_DEV_OPEN, &dev->status);
+			mutex_unlock(&dev->dev_lock);
 			return retval;
 		}
 	}
@@ -514,23 +548,14 @@ static int rmnet_ctl_open(struct inode *inode, struct file *file)
 	if (!test_bit(RMNET_CTRL_DEV_READY, &dev->cudev->status)) {
 		dev_dbg(dev->devicep, "%s: Connection timedout opening %s\n",
 					__func__, dev->name);
+		mutex_lock(&dev->dev_lock);
+		clear_bit(RMNET_CTRL_DEV_OPEN, &dev->status);
+		mutex_unlock(&dev->dev_lock);
 		return -ETIMEDOUT;
 	}
 
 	/* clear stale data if device close called but channel was ready */
-	spin_lock_irqsave(&dev->rx_lock, flag);
-	while (!list_empty(&dev->rx_list)) {
-		list_elem = list_first_entry(
-				&dev->rx_list,
-				struct ctrl_pkt_list_elem,
-				list);
-		list_del(&list_elem->list);
-		kfree(list_elem->cpkt.data);
-		kfree(list_elem);
-	}
-	spin_unlock_irqrestore(&dev->rx_lock, flag);
-
-	set_bit(RMNET_CTRL_DEV_OPEN, &dev->status);
+	rmnet_usb_ctrl_free_rx_list(dev);
 
 	file->private_data = dev;
 
@@ -542,9 +567,7 @@ already_opened:
 
 static int rmnet_ctl_release(struct inode *inode, struct file *file)
 {
-	struct ctrl_pkt_list_elem	*list_elem = NULL;
 	struct rmnet_ctrl_dev		*dev;
-	unsigned long			flag;
 
 	dev = file->private_data;
 	if (!dev)
@@ -552,19 +575,9 @@ static int rmnet_ctl_release(struct inode *inode, struct file *file)
 
 	DBG("%s Called on %s device\n", __func__, dev->name);
 
-	spin_lock_irqsave(&dev->rx_lock, flag);
-	while (!list_empty(&dev->rx_list)) {
-		list_elem = list_first_entry(
-				&dev->rx_list,
-				struct ctrl_pkt_list_elem,
-				list);
-		list_del(&list_elem->list);
-		kfree(list_elem->cpkt.data);
-		kfree(list_elem);
-	}
-	spin_unlock_irqrestore(&dev->rx_lock, flag);
-
+	mutex_lock(&dev->dev_lock);
 	clear_bit(RMNET_CTRL_DEV_OPEN, &dev->status);
+	mutex_unlock(&dev->dev_lock);
 
 	file->private_data = NULL;
 
@@ -575,20 +588,27 @@ static unsigned int rmnet_ctl_poll(struct file *file, poll_table *wait)
 {
 	unsigned int		mask = 0;
 	struct rmnet_ctrl_dev	*dev;
+	unsigned long		flags;
 
 	dev = file->private_data;
 	if (!dev)
 		return POLLERR;
 
 	poll_wait(file, &dev->read_wait_queue, wait);
-	if (!test_bit(RMNET_CTRL_DEV_READY, &dev->cudev->status)) {
-		dev_dbg(dev->devicep, "%s: Device not connected\n",
-			__func__);
+	if (!dev->poll_err &&
+			!test_bit(RMNET_CTRL_DEV_READY, &dev->cudev->status)) {
+		dev_dbg(dev->devicep, "%s: Device not connected\n", __func__);
+		dev->poll_err = true;
 		return POLLERR;
 	}
 
+	if (dev->poll_err)
+		dev->poll_err = false;
+
+	spin_lock_irqsave(&dev->rx_lock, flags);
 	if (!list_empty(&dev->rx_list))
 		mask |= POLLIN | POLLRDNORM;
+	spin_unlock_irqrestore(&dev->rx_lock, flags);
 
 	return mask;
 }
@@ -631,6 +651,7 @@ ctrl_read:
 
 	list_elem = list_first_entry(&dev->rx_list,
 				     struct ctrl_pkt_list_elem, list);
+	list_del(&list_elem->list);
 	bytes_to_read = (uint32_t)(list_elem->cpkt.data_size);
 	if (bytes_to_read > count) {
 		spin_unlock_irqrestore(&dev->rx_lock, flags);
@@ -647,11 +668,11 @@ ctrl_read:
 			dev_err(dev->devicep,
 				"%s: copy_to_user failed for %s\n",
 				__func__, dev->name);
+		spin_lock_irqsave(&dev->rx_lock, flags);
+		list_add(&list_elem->list, &dev->rx_list);
+		spin_unlock_irqrestore(&dev->rx_lock, flags);
 		return -EFAULT;
 	}
-	spin_lock_irqsave(&dev->rx_lock, flags);
-	list_del(&list_elem->list);
-	spin_unlock_irqrestore(&dev->rx_lock, flags);
 
 	kfree(list_elem->cpkt.data);
 	kfree(list_elem);
@@ -720,11 +741,14 @@ static ssize_t rmnet_ctl_write(struct file *file, const char __user * buf,
 	status = rmnet_usb_ctrl_write_cmd(dev->cudev,
 			USB_CDC_SEND_ENCAPSULATED_COMMAND, 0, cpkt->data,
 			cpkt->data_size);
-	if (status > 0)
-		dev->cudev->snd_encap_cmd_cnt++;
 
 	kfree(cpkt->data);
 	kfree(cpkt);
+
+	if (status > 0) {
+		dev->cudev->snd_encap_cmd_cnt++;
+		return size;
+	}
 
 	return status;
 }
@@ -921,6 +945,7 @@ void rmnet_usb_ctrl_disconnect(struct rmnet_ctrl_udev *dev)
 	if (test_bit(RMNET_CTRL_DEV_MUX_EN, &dev->status)) {
 		for (n = 0; n < insts_per_dev; n++) {
 			cdev = &ctrl_devs[dev->rdev_num][n];
+			rmnet_usb_ctrl_free_rx_list(cdev);
 			wake_up(&cdev->read_wait_queue);
 			mutex_lock(&cdev->dev_lock);
 			cdev->cbits_tolocal = ~ACM_CTRL_CD;
@@ -930,6 +955,7 @@ void rmnet_usb_ctrl_disconnect(struct rmnet_ctrl_udev *dev)
 	} else {
 		cdev = &ctrl_devs[dev->rdev_num][dev->ctrldev_id];
 		cdev->claimed = false;
+		rmnet_usb_ctrl_free_rx_list(cdev);
 		wake_up(&cdev->read_wait_queue);
 		mutex_lock(&cdev->dev_lock);
 		cdev->cbits_tolocal = ~ACM_CTRL_CD;
@@ -970,7 +996,7 @@ static ssize_t rmnet_usb_ctrl_read_stats(struct file *file, char __user *ubuf,
 			cdev = &ctrl_devs[i][n];
 			dev = cdev->cudev;
 			temp += scnprintf(buf + temp, DEBUG_BUF_SIZE - temp,
-					"\n#ctrl_dev: %p     Name: %s#\n"
+					"\n#ctrl_dev: %pK     Name: %s#\n"
 					"snd encap cmd cnt         %u\n"
 					"resp avail cnt:           %u\n"
 					"get encap resp cnt:       %u\n"
@@ -981,6 +1007,7 @@ static ssize_t rmnet_usb_ctrl_read_stats(struct file *file, char __user *ubuf,
 					"mdm_wait_timeout:         %u\n"
 					"zlp_cnt:                  %u\n"
 					"get_encap_failure_cnt     %u\n"
+					"ignore_encap_work         %u\n"
 					"invalid mux id cnt        %u\n"
 					"RMNET_CTRL_DEV_MUX_EN:    %d\n"
 					"RMNET_CTRL_DEV_OPEN:      %d\n"
@@ -996,6 +1023,7 @@ static ssize_t rmnet_usb_ctrl_read_stats(struct file *file, char __user *ubuf,
 					cdev->mdm_wait_timeout,
 					dev->zlp_cnt,
 					dev->get_encap_failure_cnt,
+					dev->ignore_encap_work,
 					dev->invalid_mux_id_cnt,
 					test_bit(RMNET_CTRL_DEV_MUX_EN,
 							&dev->status),
@@ -1030,6 +1058,7 @@ static ssize_t rmnet_usb_ctrl_reset_stats(struct file *file, const char __user *
 			dev->tx_ctrl_err_cnt = 0;
 			dev->zlp_cnt = 0;
 			dev->invalid_mux_id_cnt = 0;
+			dev->ignore_encap_work = 0;
 		}
 	}
 	return count;
@@ -1064,6 +1093,17 @@ static void rmnet_usb_ctrl_debugfs_exit(void)
 static void rmnet_usb_ctrl_debugfs_init(void) { }
 static void rmnet_usb_ctrl_debugfs_exit(void) { }
 #endif
+
+static void free_rmnet_ctrl_udev(struct rmnet_ctrl_udev *cudev)
+{
+	kfree(cudev->in_ctlreq);
+	kfree(cudev->rcvbuf);
+	kfree(cudev->intbuf);
+	usb_free_urb(cudev->rcvurb);
+	usb_free_urb(cudev->inturb);
+	destroy_workqueue(cudev->wq);
+	kfree(cudev);
+}
 
 int rmnet_usb_ctrl_init(int no_rmnet_devs, int no_rmnet_insts_per_dev,
 		unsigned long mux_info)
@@ -1110,6 +1150,50 @@ int rmnet_usb_ctrl_init(int no_rmnet_devs, int no_rmnet_insts_per_dev,
 			snprintf(dev->name, CTRL_DEV_MAX_LEN, "%s%d",
 				 rmnet_dev_names[i], n);
 
+			/* ctrl usb dev inits */
+			cmux_enabled = test_bit(i, &mux_info);
+			if (n && cmux_enabled)
+				/* for mux config one cudev maps to n dev */
+				goto skip_cudev_init;
+
+			cudev = kzalloc(sizeof(*cudev), GFP_KERNEL);
+			if (!cudev) {
+				pr_err("Error allocating rmnet usb ctrl dev\n");
+				kfree(dev);
+				return -ENOMEM;
+			}
+
+			cudev->rdev_num = i;
+			cudev->wq = create_singlethread_workqueue(dev->name);
+			if (!cudev->wq) {
+				pr_err("unable to allocate workqueue");
+				kfree(cudev);
+				kfree(dev);
+				return -ENOMEM;
+			}
+
+			init_usb_anchor(&cudev->tx_submitted);
+			init_usb_anchor(&cudev->rx_submitted);
+			INIT_WORK(&cudev->get_encap_work, get_encap_work);
+
+			status = rmnet_usb_ctrl_alloc_rx(cudev);
+			if (status) {
+				destroy_workqueue(cudev->wq);
+				kfree(cudev);
+				kfree(dev);
+				return status;
+			}
+
+skip_cudev_init:
+			/* ctrl dev inits */
+			dev->cudev = cudev;
+
+			if (cmux_enabled) {
+				set_bit(RMNET_CTRL_DEV_MUX_EN, &dev->status);
+				set_bit(RMNET_CTRL_DEV_MUX_EN,
+						&dev->cudev->status);
+			}
+
 			dev->ch_id = n;
 
 			mutex_init(&dev->dev_lock);
@@ -1125,6 +1209,7 @@ int rmnet_usb_ctrl_init(int no_rmnet_devs, int no_rmnet_insts_per_dev,
 			if (status) {
 				pr_err("%s: cdev_add() ret %i\n", __func__,
 					status);
+				free_rmnet_ctrl_udev(dev->cudev);
 				kfree(dev);
 				return status;
 			}
@@ -1134,11 +1219,13 @@ int rmnet_usb_ctrl_init(int no_rmnet_devs, int no_rmnet_insts_per_dev,
 						     "%s%d", rmnet_dev_names[i],
 						     n);
 			if (IS_ERR(dev->devicep)) {
+				long status = PTR_ERR(dev->devicep);
 				pr_err("%s: device_create() returned %ld\n",
-					__func__, PTR_ERR(dev->devicep));
+					__func__, status);
 				cdev_del(&dev->cdev);
+				free_rmnet_ctrl_udev(dev->cudev);
 				kfree(dev);
-				return PTR_ERR(dev->devicep);
+				return status;
 			}
 
 			/*create /sys/class/hsicctl/hsicctlx/modem_wait*/
@@ -1148,65 +1235,11 @@ int rmnet_usb_ctrl_init(int no_rmnet_devs, int no_rmnet_insts_per_dev,
 				device_destroy(dev->devicep->class,
 					       dev->devicep->devt);
 				cdev_del(&dev->cdev);
+				free_rmnet_ctrl_udev(dev->cudev);
 				kfree(dev);
 				return status;
 			}
 			dev_set_drvdata(dev->devicep, dev);
-
-			cmux_enabled = test_bit(i, &mux_info);
-			if (n && cmux_enabled) {
-				dev->cudev = cudev;
-				set_bit(RMNET_CTRL_DEV_MUX_EN, &dev->status);
-				continue;
-			}
-			cudev = kzalloc(sizeof(*cudev), GFP_KERNEL);
-			if (!cudev) {
-				pr_err("Error allocating rmnet usb ctrl dev\n");
-				device_remove_file(dev->devicep,
-						   &dev_attr_modem_wait);
-				device_destroy(dev->devicep->class,
-						   dev->devicep->devt);
-				cdev_del(&dev->cdev);
-				kfree(dev);
-				return -ENOMEM;
-			}
-
-			cudev->rdev_num = i;
-			cudev->wq = create_singlethread_workqueue(dev->name);
-			if (!cudev->wq) {
-				pr_err("unable to allocate workqueue");
-				kfree(cudev);
-				device_remove_file(dev->devicep,
-						   &dev_attr_modem_wait);
-				device_destroy(dev->devicep->class,
-						   dev->devicep->devt);
-				cdev_del(&dev->cdev);
-				kfree(dev);
-				return -ENOMEM;
-			}
-
-			init_usb_anchor(&cudev->tx_submitted);
-			init_usb_anchor(&cudev->rx_submitted);
-			INIT_WORK(&cudev->get_encap_work, get_encap_work);
-
-			status = rmnet_usb_ctrl_alloc_rx(cudev);
-			if (status) {
-				destroy_workqueue(cudev->wq);
-				kfree(cudev);
-				device_remove_file(dev->devicep,
-						   &dev_attr_modem_wait);
-				device_destroy(dev->devicep->class,
-					       dev->devicep->devt);
-				cdev_del(&dev->cdev);
-				kfree(dev);
-				return status;
-			}
-
-			dev->cudev = cudev;
-			if (cmux_enabled) {
-				set_bit(RMNET_CTRL_DEV_MUX_EN, &dev->status);
-				set_bit(RMNET_CTRL_DEV_MUX_EN, &cudev->status);
-			}
 		}
 	}
 
@@ -1221,17 +1254,6 @@ static void free_rmnet_ctrl_dev(struct rmnet_ctrl_dev *dev)
 	cdev_del(&dev->cdev);
 	device_destroy(dev->devicep->class,
 		       dev->devicep->devt);
-}
-
-static void free_rmnet_ctrl_udev(struct rmnet_ctrl_udev *cudev)
-{
-	kfree(cudev->in_ctlreq);
-	kfree(cudev->rcvbuf);
-	kfree(cudev->intbuf);
-	usb_free_urb(cudev->rcvurb);
-	usb_free_urb(cudev->inturb);
-	destroy_workqueue(cudev->wq);
-	kfree(cudev);
 }
 
 void rmnet_usb_ctrl_exit(int no_rmnet_devs, int no_rmnet_insts_per_dev,

@@ -12,6 +12,7 @@
 
 #include <linux/delay.h>
 #include <linux/workqueue.h>
+#include <linux/reboot.h>
 #include "esoc.h"
 
 enum {
@@ -26,26 +27,38 @@ enum {
 	 PEER_CRASH,
 };
 
-#define MDM_BOOT_TIMEOUT	60000L
-
 struct mdm_drv {
 	unsigned mode;
 	struct esoc_eng cmd_eng;
 	struct completion boot_done;
+	struct completion req_eng_wait;
 	struct esoc_clink *esoc_clink;
 	bool boot_fail;
 	struct workqueue_struct *mdm_queue;
 	struct work_struct ssr_work;
+	struct notifier_block esoc_restart;
 };
-
 #define to_mdm_drv(d)	container_of(d, struct mdm_drv, cmd_eng)
 
+static int esoc_msm_restart_handler(struct notifier_block *nb,
+		unsigned long action, void *data)
+{
+	struct mdm_drv *mdm_drv = container_of(nb, struct mdm_drv,
+					esoc_restart);
+	struct esoc_clink *esoc_clink = mdm_drv->esoc_clink;
+	const struct esoc_clink_ops const *clink_ops = esoc_clink->clink_ops;
+	if (action == SYS_RESTART) {
+		dev_dbg(&esoc_clink->dev, "Notifying esoc of cold reboot\n");
+		clink_ops->notify(ESOC_PRIMARY_REBOOT, esoc_clink);
+	}
+	return NOTIFY_OK;
+}
 static void mdm_handle_clink_evt(enum esoc_evt evt,
 					struct esoc_eng *eng)
 {
 	struct mdm_drv *mdm_drv = to_mdm_drv(eng);
 	switch (evt) {
-	case ESOC_BOOT_FAIL:
+	case ESOC_INVALID_STATE:
 		mdm_drv->boot_fail = true;
 		complete(&mdm_drv->boot_done);
 		break;
@@ -61,6 +74,9 @@ static void mdm_handle_clink_evt(enum esoc_evt evt,
 		mdm_drv->mode = CRASH;
 		queue_work(mdm_drv->mdm_queue, &mdm_drv->ssr_work);
 		break;
+	case ESOC_REQ_ENG_ON:
+		complete(&mdm_drv->req_eng_wait);
+		break;
 	default:
 		break;
 	}
@@ -68,20 +84,12 @@ static void mdm_handle_clink_evt(enum esoc_evt evt,
 
 static void mdm_ssr_fn(struct work_struct *work)
 {
-	int ret;
 	struct mdm_drv *mdm_drv = container_of(work, struct mdm_drv, ssr_work);
-	struct esoc_clink *esoc_clink = mdm_drv->esoc_clink;
-	const struct esoc_clink_ops const *clink_ops = esoc_clink->clink_ops;
 
 	/*
-	 * If esoc bus cannot allow restart, then forcibly shut down the
-	 * esoc
+	 * If restarting esoc fails, the SSR framework triggers a kernel panic
 	 */
-	ret = esoc_clink_request_ssr(mdm_drv->esoc_clink);
-	if (ret) {
-		dev_err(&esoc_clink->dev, "ssr request refused\n");
-		clink_ops->cmd_exe(ESOC_PWR_OFF, esoc_clink);
-	}
+	esoc_clink_request_ssr(mdm_drv->esoc_clink);
 	return;
 }
 
@@ -112,8 +120,12 @@ static int mdm_subsys_shutdown(const struct subsys_desc *crashed_subsys,
 			return ret;
 		}
 		mdm_drv->mode = IN_DEBUG;
-	} else {
-		ret = clink_ops->cmd_exe(ESOC_PWR_OFF, esoc_clink);
+	} else if (!force_stop) {
+		if (esoc_clink->subsys.sysmon_shutdown_ret)
+			ret = clink_ops->cmd_exe(ESOC_FORCE_PWR_OFF,
+							esoc_clink);
+		else
+			ret = clink_ops->cmd_exe(ESOC_PWR_OFF, esoc_clink);
 		if (ret) {
 			dev_err(&esoc_clink->dev, "failed to exe power off\n");
 			return ret;
@@ -132,6 +144,10 @@ static int mdm_subsys_powerup(const struct subsys_desc *crashed_subsys)
 	struct mdm_drv *mdm_drv = esoc_get_drv_data(esoc_clink);
 	const struct esoc_clink_ops const *clink_ops = esoc_clink->clink_ops;
 
+	if (!esoc_req_eng_enabled(esoc_clink)) {
+		dev_dbg(&esoc_clink->dev, "Wait for req eng registration\n");
+		wait_for_completion(&mdm_drv->req_eng_wait);
+	}
 	if (mdm_drv->mode == PWR_OFF) {
 		ret = clink_ops->cmd_exe(ESOC_PWR_ON, esoc_clink);
 		if (ret) {
@@ -144,11 +160,6 @@ static int mdm_subsys_powerup(const struct subsys_desc *crashed_subsys)
 			dev_err(&esoc_clink->dev, "cannot exit debug mode\n");
 			return ret;
 		}
-		ret = clink_ops->cmd_exe(ESOC_PWR_OFF, esoc_clink);
-		if (ret) {
-			dev_err(&esoc_clink->dev, "pwr off fail\n");
-			return ret;
-		}
 		mdm_drv->mode = PWR_OFF;
 		ret = clink_ops->cmd_exe(ESOC_PWR_ON, esoc_clink);
 		if (ret) {
@@ -156,11 +167,7 @@ static int mdm_subsys_powerup(const struct subsys_desc *crashed_subsys)
 			return ret;
 		}
 	}
-	if (!wait_for_completion_timeout(&mdm_drv->boot_done,
-					msecs_to_jiffies(MDM_BOOT_TIMEOUT))) {
-		dev_err(&esoc_clink->dev, "Unable to boot\n");
-		return -ETIMEDOUT;
-	}
+	wait_for_completion(&mdm_drv->boot_done);
 	if (mdm_drv->boot_fail) {
 		dev_err(&esoc_clink->dev, "booting failed\n");
 		return -EIO;
@@ -222,10 +229,15 @@ int esoc_ssr_probe(struct esoc_clink *esoc_clink)
 	}
 	esoc_set_drv_data(esoc_clink, mdm_drv);
 	init_completion(&mdm_drv->boot_done);
+	init_completion(&mdm_drv->req_eng_wait);
 	INIT_WORK(&mdm_drv->ssr_work, mdm_ssr_fn);
 	mdm_drv->esoc_clink = esoc_clink;
 	mdm_drv->mode = PWR_OFF;
 	mdm_drv->boot_fail = false;
+	mdm_drv->esoc_restart.notifier_call = esoc_msm_restart_handler;
+	ret = register_reboot_notifier(&mdm_drv->esoc_restart);
+	if (ret)
+		dev_err(&esoc_clink->dev, "register for reboot failed\n");
 	return 0;
 queue_err:
 	esoc_clink_unregister_ssr(esoc_clink);

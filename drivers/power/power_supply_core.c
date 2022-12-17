@@ -15,6 +15,7 @@
 #include <linux/init.h>
 #include <linux/slab.h>
 #include <linux/device.h>
+#include <linux/notifier.h>
 #include <linux/err.h>
 #include <linux/power_supply.h>
 #include <linux/thermal.h>
@@ -23,6 +24,9 @@
 /* exported for the APM Power driver, APM emulation */
 struct class *power_supply_class;
 EXPORT_SYMBOL_GPL(power_supply_class);
+
+ATOMIC_NOTIFIER_HEAD(power_supply_notifier);
+EXPORT_SYMBOL_GPL(power_supply_notifier);
 
 static struct device_type power_supply_dev_type;
 
@@ -51,6 +55,28 @@ static bool __power_supply_is_supplied_by(struct power_supply *supplier,
 
 	return false;
 }
+
+/**
+ * power_supply_set_voltage_limit - set current limit
+ * @psy:	the power supply to control
+ * @limit:	current limit in uV from the power supply.
+ *		0 will disable the power supply.
+ *
+ * This function will set a maximum supply current from a source
+ * and it will disable the charger when limit is 0.
+ */
+int power_supply_set_voltage_limit(struct power_supply *psy, int limit)
+{
+	const union power_supply_propval ret = {limit,};
+
+	if (psy->set_property)
+		return psy->set_property(psy, POWER_SUPPLY_PROP_VOLTAGE_MAX,
+								&ret);
+
+	return -ENXIO;
+}
+EXPORT_SYMBOL(power_supply_set_voltage_limit);
+
 
 /**
  * power_supply_set_current_limit - set current limit
@@ -160,6 +186,22 @@ int power_supply_set_scope(struct power_supply *psy, int scope)
 EXPORT_SYMBOL_GPL(power_supply_set_scope);
 
 /**
+ * power_supply_set_usb_otg - set otg of the usb power supply
+ * @psy:	the usb power supply to control
+ * @scope:	value to set the otg property to
+ */
+int power_supply_set_usb_otg(struct power_supply *psy, int otg)
+{
+	const union power_supply_propval ret = {otg, };
+
+	if (psy->set_property)
+		return psy->set_property(psy, POWER_SUPPLY_PROP_USB_OTG,
+								&ret);
+	return -ENXIO;
+}
+EXPORT_SYMBOL(power_supply_set_usb_otg);
+
+/**
  * power_supply_set_supply_type - set type of the power supply
  * @psy:	the power supply to control
  * @supply_type:	sets type property of power supply
@@ -194,6 +236,56 @@ int power_supply_set_charge_type(struct power_supply *psy, int charge_type)
 }
 EXPORT_SYMBOL_GPL(power_supply_set_charge_type);
 
+/**
+ * power_supply_set_hi_power_state - set power state for power_supply
+ * @psy:	the power supply to control
+ * @value:	value to be passed to the power_supply
+ *
+ */
+int power_supply_set_hi_power_state(struct power_supply *psy, int value)
+{
+	const union power_supply_propval ret = {value, };
+
+	if (psy->set_property)
+		return psy->set_property(psy, POWER_SUPPLY_PROP_HI_POWER,
+								&ret);
+	return -ENXIO;
+}
+EXPORT_SYMBOL(power_supply_set_hi_power_state);
+
+/**
+ * power_supply_set_low_power_state - set power state for power_supply
+ * @psy:	the power supply to control
+ * @value:	value to be passed to the power_supply
+ *
+ */
+int power_supply_set_low_power_state(struct power_supply *psy, int value)
+{
+	const union power_supply_propval ret = {value, };
+
+	if (psy->set_property)
+		return psy->set_property(psy, POWER_SUPPLY_PROP_LOW_POWER,
+								&ret);
+	return -ENXIO;
+}
+EXPORT_SYMBOL(power_supply_set_low_power_state);
+
+/**
+ * power_supply_set_dp_dm -
+ * @psy:	the power supply to control
+ * @value:	value to be passed to the power_supply
+ */
+int power_supply_set_dp_dm(struct power_supply *psy, int value)
+{
+	const union power_supply_propval ret = {value, };
+
+	if (psy->set_property)
+		return psy->set_property(psy, POWER_SUPPLY_PROP_DP_DM,
+				&ret);
+	return -ENXIO;
+}
+EXPORT_SYMBOL(power_supply_set_dp_dm);
+
 static int __power_supply_changed_work(struct device *dev, void *data)
 {
 	struct power_supply *psy = (struct power_supply *)data;
@@ -224,6 +316,8 @@ static void power_supply_changed_work(struct work_struct *work)
 				      __power_supply_changed_work);
 
 		power_supply_update_leds(psy);
+		atomic_notifier_call_chain(&power_supply_notifier,
+				PSY_EVENT_PROP_CHANGED, psy);
 
 		kobject_uevent(&psy->dev->kobj, KOBJ_CHANGE);
 		spin_lock_irqsave(&psy->changed_lock, flags);
@@ -482,6 +576,18 @@ static void power_supply_dev_release(struct device *dev)
 	pr_debug("device: '%s': %s\n", dev_name(dev), __func__);
 	kfree(dev);
 }
+
+int power_supply_reg_notifier(struct notifier_block *nb)
+{
+	return atomic_notifier_chain_register(&power_supply_notifier, nb);
+}
+EXPORT_SYMBOL_GPL(power_supply_reg_notifier);
+
+void power_supply_unreg_notifier(struct notifier_block *nb)
+{
+	atomic_notifier_chain_unregister(&power_supply_notifier, nb);
+}
+EXPORT_SYMBOL_GPL(power_supply_unreg_notifier);
 
 #ifdef CONFIG_THERMAL
 static int power_supply_read_temp(struct thermal_zone_device *tzd,

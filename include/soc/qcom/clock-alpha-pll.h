@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -19,11 +19,17 @@
 #include <linux/clk/msm-clk-provider.h>
 
 struct alpha_pll_masks {
-	u32 lock_mask;
-	u32 update_mask;
-	u32 vco_mask;
+	u32 lock_mask;		/* lock_det bit */
+	u32 active_mask;	/* active_flag in FSM mode */
+	u32 update_mask;	/* update bit for dynamic update */
+	u32 vco_mask;		/* vco_sel bits */
 	u32 vco_shift;
-	u32 alpha_en_mask;
+	u32 alpha_en_mask;	/* alpha_en bit */
+	u32 output_mask;	/* pllout_* bits */
+	u32 post_div_mask;
+	u32 config_ctl_mask;
+	u32 test_ctl_lo_mask;
+	u32 test_ctl_hi_mask;
 };
 
 struct alpha_pll_vco_tbl {
@@ -41,10 +47,24 @@ struct alpha_pll_vco_tbl {
 struct alpha_pll_clk {
 	struct alpha_pll_masks *masks;
 	void *const __iomem *base;
-	const u32 offset;
+	u32 offset;
+
+	/* if fsm_en_mask is set, config PLL to FSM mode */
+	u32 fsm_reg_offset;
+	u32 fsm_en_mask;
+
+	u32 enable_config;	/* bitmask of outputs to be enabled */
+	u32 post_div_config;	/* masked post divider setting */
+	u32 config_ctl_val;	/* configuration control settings */
+	u32 test_ctl_lo_val;	/* test control settings */
+	u32 test_ctl_hi_val;
 
 	struct alpha_pll_vco_tbl *vco_tbl;
 	u32 num_vco;
+	u32 current_vco_val;
+
+	bool inited;
+	bool slew;
 
 	struct clk c;
 };
@@ -56,3 +76,5 @@ static inline struct alpha_pll_clk *to_alpha_pll_clk(struct clk *c)
 #endif
 
 extern struct clk_ops clk_ops_alpha_pll;
+extern struct clk_ops clk_ops_fixed_alpha_pll;
+extern struct clk_ops clk_ops_dyna_alpha_pll;

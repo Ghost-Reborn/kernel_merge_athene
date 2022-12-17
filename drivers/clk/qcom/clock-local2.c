@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -26,6 +26,7 @@
 #include <linux/clk/msm-clk.h>
 #include <linux/clk/msm-clock-generic.h>
 #include <soc/qcom/clock-local2.h>
+#include <soc/qcom/msm-clock-controller.h>
 
 /*
  * When enabling/disabling a clock, check the halt bit up to this number
@@ -33,7 +34,7 @@
  */
 #define HALT_CHECK_MAX_LOOPS	500
 /* For clock without halt checking, wait this long after enables/disables. */
-#define HALT_CHECK_DELAY_US	10
+#define HALT_CHECK_DELAY_US	500
 
 /*
  * When updating an RCG configuration, check the update bit up to this number
@@ -54,6 +55,7 @@ struct clk_freq_tbl rcg_dummy_freq = F_END;
 #define RST_REG(x)	(*(x)->base + (x)->reset_reg)
 #define VOTE_REG(x)	(*(x)->base + (x)->vote_reg)
 #define GATE_EN_REG(x)	(*(x)->base + (x)->en_reg)
+#define MUX_REG(x)	(*(x)->base + (x)->offset)
 
 /*
  * Important clock bit positions and masks
@@ -76,6 +78,14 @@ struct clk_freq_tbl rcg_dummy_freq = F_END;
 enum branch_state {
 	BRANCH_ON,
 	BRANCH_OFF,
+};
+
+static struct clk_freq_tbl cxo_f = {
+	.freq_hz = 19200000,
+	.m_val = 0,
+	.n_val = 0,
+	.d_val = 0,
+	.div_src_val = 0,
 };
 
 /*
@@ -106,29 +116,46 @@ static void rcg_update_config(struct rcg_clk *rcg)
 	CLK_WARN(&rcg->c, count == 0, "rcg didn't update its configuration.");
 }
 
+static void rcg_on_check(struct rcg_clk *rcg)
+{
+	int count;
+
+	/* Wait for RCG to turn on */
+	for (count = UPDATE_CHECK_MAX_LOOPS; count > 0; count--) {
+		if (!(readl_relaxed(CMD_RCGR_REG(rcg)) &
+				CMD_RCGR_ROOT_STATUS_BIT))
+			return;
+		udelay(1);
+	}
+	CLK_WARN(&rcg->c, count == 0, "rcg didn't turn on.");
+}
+
 /* RCG set rate function for clocks with Half Integer Dividers. */
-void set_rate_hid(struct rcg_clk *rcg, struct clk_freq_tbl *nf)
+static void __set_rate_hid(struct rcg_clk *rcg, struct clk_freq_tbl *nf)
 {
 	u32 cfg_regval;
-	unsigned long flags;
 
-	spin_lock_irqsave(&local_clock_reg_lock, flags);
 	cfg_regval = readl_relaxed(CFG_RCGR_REG(rcg));
 	cfg_regval &= ~(CFG_RCGR_DIV_MASK | CFG_RCGR_SRC_SEL_MASK);
 	cfg_regval |= nf->div_src_val;
 	writel_relaxed(cfg_regval, CFG_RCGR_REG(rcg));
 
 	rcg_update_config(rcg);
+}
+
+void set_rate_hid(struct rcg_clk *rcg, struct clk_freq_tbl *nf)
+{
+	unsigned long flags;
+	spin_lock_irqsave(&local_clock_reg_lock, flags);
+	__set_rate_hid(rcg, nf);
 	spin_unlock_irqrestore(&local_clock_reg_lock, flags);
 }
 
 /* RCG set rate function for clocks with MND & Half Integer Dividers. */
-void set_rate_mnd(struct rcg_clk *rcg, struct clk_freq_tbl *nf)
+static void __set_rate_mnd(struct rcg_clk *rcg, struct clk_freq_tbl *nf)
 {
 	u32 cfg_regval;
-	unsigned long flags;
 
-	spin_lock_irqsave(&local_clock_reg_lock, flags);
 	cfg_regval = readl_relaxed(CFG_RCGR_REG(rcg));
 	writel_relaxed(nf->m_val, M_REG(rcg));
 	writel_relaxed(nf->n_val, N_REG(rcg));
@@ -145,10 +172,42 @@ void set_rate_mnd(struct rcg_clk *rcg, struct clk_freq_tbl *nf)
 	writel_relaxed(cfg_regval, CFG_RCGR_REG(rcg));
 
 	rcg_update_config(rcg);
+}
+
+void set_rate_mnd(struct rcg_clk *rcg, struct clk_freq_tbl *nf)
+{
+	unsigned long flags;
+	spin_lock_irqsave(&local_clock_reg_lock, flags);
+	__set_rate_mnd(rcg, nf);
 	spin_unlock_irqrestore(&local_clock_reg_lock, flags);
 }
 
-static int rcg_clk_prepare(struct clk *c)
+static void rcg_set_force_enable(struct rcg_clk *rcg)
+{
+	u32 cmd_rcgr_regval;
+	unsigned long flags;
+
+	spin_lock_irqsave(&local_clock_reg_lock, flags);
+	cmd_rcgr_regval = readl_relaxed(CMD_RCGR_REG(rcg));
+	cmd_rcgr_regval |= CMD_RCGR_ROOT_ENABLE_BIT;
+	writel_relaxed(cmd_rcgr_regval, CMD_RCGR_REG(rcg));
+	rcg_on_check(rcg);
+	spin_unlock_irqrestore(&local_clock_reg_lock, flags);
+}
+
+static void rcg_clear_force_enable(struct rcg_clk *rcg)
+{
+	u32 cmd_rcgr_regval;
+	unsigned long flags;
+
+	spin_lock_irqsave(&local_clock_reg_lock, flags);
+	cmd_rcgr_regval = readl_relaxed(CMD_RCGR_REG(rcg));
+	cmd_rcgr_regval &= ~CMD_RCGR_ROOT_ENABLE_BIT;
+	writel_relaxed(cmd_rcgr_regval, CMD_RCGR_REG(rcg));
+	spin_unlock_irqrestore(&local_clock_reg_lock, flags);
+}
+
+static int rcg_clk_enable(struct clk *c)
 {
 	struct rcg_clk *rcg = to_rcg_clk(c);
 
@@ -156,7 +215,37 @@ static int rcg_clk_prepare(struct clk *c)
 		"Attempting to prepare %s before setting its rate. "
 		"Set the rate first!\n", rcg->c.dbg_name);
 
+	if (!rcg->non_local_children || rcg->current_freq == &rcg_dummy_freq)
+		return 0;
+	/*
+	 * Switch from CXO to saved mux value. Force enable/disable while
+	 * switching. The current parent is already prepared and enabled
+	 * at this point, and the CXO source is always-on. Therefore the
+	 * RCG can safely execute a dynamic switch.
+	 */
+	rcg_set_force_enable(rcg);
+	rcg->set_rate(rcg, rcg->current_freq);
+	rcg_clear_force_enable(rcg);
+
 	return 0;
+}
+
+static void rcg_clk_disable(struct clk *c)
+{
+	struct rcg_clk *rcg = to_rcg_clk(c);
+
+	if (!rcg->non_local_children)
+		return;
+
+	/*
+	 * Save mux select and switch to CXO. Force enable/disable while
+	 * switching. The current parent is still prepared and enabled at this
+	 * point, and the CXO source is always-on. Therefore the RCG can safely
+	 * execute a dynamic switch.
+	 */
+	rcg_set_force_enable(rcg);
+	rcg->set_rate(rcg, &cxo_f);
+	rcg_clear_force_enable(rcg);
 }
 
 static int rcg_clk_set_rate(struct clk *c, unsigned long rate)
@@ -175,14 +264,42 @@ static int rcg_clk_set_rate(struct clk *c, unsigned long rate)
 
 	cf = rcg->current_freq;
 
+	if (nf->src_freq != FIXED_CLK_SRC) {
+		rc = clk_set_rate(nf->src_clk, nf->src_freq);
+		if (rc)
+			return rc;
+	}
+
 	rc = __clk_pre_reparent(c, nf->src_clk, &flags);
 	if (rc)
 		return rc;
 
 	BUG_ON(!rcg->set_rate);
 
-	/* Perform clock-specific frequency switch operations. */
-	rcg->set_rate(rcg, nf);
+	/*
+	 * Perform clock-specific frequency switch operations.
+	 *
+	 * For RCGs with non_local_children set to true:
+	 * If this RCG has at least one branch that is controlled by another
+	 * execution entity, ensure that the enable/disable and mux switch
+	 * are staggered.
+	 */
+	if (!rcg->non_local_children) {
+		rcg->set_rate(rcg, nf);
+	} else if (c->count) {
+		/*
+		 * Force enable the RCG here since there could be a disable
+		 * call happening between pre_reparent and set_rate.
+		 */
+		rcg_set_force_enable(rcg);
+		rcg->set_rate(rcg, nf);
+		rcg_clear_force_enable(rcg);
+	}
+	/*
+	 * If non_local_children is set and the RCG is not enabled,
+	 * the following operations switch parent in software and cache
+	 * the frequency. The mux switch will occur when the RCG is enabled.
+	 */
 	rcg->current_freq = nf;
 	c->parent = nf->src_clk;
 
@@ -220,17 +337,26 @@ static long rcg_clk_list_rate(struct clk *c, unsigned n)
 	return (rcg->freq_tbl + n)->freq_hz;
 }
 
-static struct clk *_rcg_clk_get_parent(struct rcg_clk *rcg, int has_mnd)
+static struct clk *_rcg_clk_get_parent(struct rcg_clk *rcg, bool has_mnd,
+								bool match_rate)
 {
 	u32 n_regval = 0, m_regval = 0, d_regval = 0;
-	u32 cfg_regval;
+	u32 cfg_regval, div, div_regval;
 	struct clk_freq_tbl *freq;
 	u32 cmd_rcgr_regval;
 
+	if (!rcg->freq_tbl) {
+		WARN(1, "No frequency table present for rcg %s\n",
+							rcg->c.dbg_name);
+		return NULL;
+	}
+
 	/* Is there a pending configuration? */
 	cmd_rcgr_regval = readl_relaxed(CMD_RCGR_REG(rcg));
-	if (cmd_rcgr_regval & CMD_RCGR_CONFIG_DIRTY_MASK)
+	if (cmd_rcgr_regval & CMD_RCGR_CONFIG_DIRTY_MASK) {
+		WARN(1, "Pending transaction for rcg %s\n", rcg->c.dbg_name);
 		return NULL;
+	}
 
 	/* Get values of m, n, d, div and src_sel registers. */
 	if (has_mnd) {
@@ -265,8 +391,23 @@ static struct clk *_rcg_clk_get_parent(struct rcg_clk *rcg, int has_mnd)
 
 	/* Figure out what rate the rcg is running at */
 	for (freq = rcg->freq_tbl; freq->freq_hz != FREQ_END; freq++) {
-		if (freq->div_src_val != cfg_regval)
+		/* source select does not match */
+		if ((freq->div_src_val & CFG_RCGR_SRC_SEL_MASK)
+		    != (cfg_regval & CFG_RCGR_SRC_SEL_MASK))
 			continue;
+		/*
+		 * Stop if we found the required parent in the frequency table
+		 * and only care if the source matches but dont care if the
+		 * frequency matches
+		 */
+		if (!match_rate)
+			break;
+		/* divider does not match */
+		div = freq->div_src_val & CFG_RCGR_DIV_MASK;
+		div_regval = cfg_regval & CFG_RCGR_DIV_MASK;
+		if (div != div_regval && (div > 1 || div_regval > 1))
+			continue;
+
 		if (has_mnd) {
 			if (freq->m_val != m_regval)
 				continue;
@@ -274,13 +415,26 @@ static struct clk *_rcg_clk_get_parent(struct rcg_clk *rcg, int has_mnd)
 				continue;
 			if (freq->d_val != d_regval)
 				continue;
+		} else if (freq->n_val) {
+			continue;
 		}
 		break;
 	}
 
 	/* No known frequency found */
-	if (freq->freq_hz == FREQ_END)
+	if (freq->freq_hz == FREQ_END) {
+		/*
+		 * If we can't recognize the frequency and non_local_children is
+		 * set, switch to safe frequency. It is assumed the current
+		 * parent has been turned on by the bootchain if the RCG is on.
+		 */
+		if (rcg->non_local_children) {
+			rcg->set_rate(rcg, &cxo_f);
+			WARN(1, "don't recognize rcg frequency for %s\n",
+				rcg->c.dbg_name);
+		}
 		return NULL;
+	}
 
 	rcg->current_freq = freq;
 	return freq->src_clk;
@@ -301,14 +455,19 @@ static enum handoff _rcg_clk_handoff(struct rcg_clk *rcg)
 	return HANDOFF_ENABLED_CLK;
 }
 
+static struct clk *display_clk_get_parent(struct clk *c)
+{
+	return _rcg_clk_get_parent(to_rcg_clk(c), false, false);
+}
+
 static struct clk *rcg_mnd_clk_get_parent(struct clk *c)
 {
-	return _rcg_clk_get_parent(to_rcg_clk(c), 1);
+	return _rcg_clk_get_parent(to_rcg_clk(c), true, true);
 }
 
 static struct clk *rcg_clk_get_parent(struct clk *c)
 {
-	return _rcg_clk_get_parent(to_rcg_clk(c), 0);
+	return _rcg_clk_get_parent(to_rcg_clk(c), false, true);
 }
 
 static enum handoff rcg_mnd_clk_handoff(struct clk *c)
@@ -403,12 +562,57 @@ static void branch_clk_halt_check(struct clk *c, u32 halt_check,
 	}
 }
 
+static int cbcr_set_flags(void * __iomem regaddr, unsigned flags)
+{
+	u32 cbcr_val;
+	unsigned long irq_flags;
+	int delay_us = 0, ret = 0;
+
+	spin_lock_irqsave(&local_clock_reg_lock, irq_flags);
+	cbcr_val = readl_relaxed(regaddr);
+	switch (flags) {
+	case CLKFLAG_RETAIN_PERIPH:
+		cbcr_val |= BIT(13);
+		delay_us = 1;
+		break;
+	case CLKFLAG_NORETAIN_PERIPH:
+		cbcr_val &= ~BIT(13);
+		break;
+	case CLKFLAG_RETAIN_MEM:
+		cbcr_val |= BIT(14);
+		delay_us = 1;
+		break;
+	case CLKFLAG_NORETAIN_MEM:
+		cbcr_val &= ~BIT(14);
+		break;
+	default:
+		ret = -EINVAL;
+	}
+	writel_relaxed(cbcr_val, regaddr);
+	/* Make sure power is enabled before returning. */
+	mb();
+	udelay(delay_us);
+
+	spin_unlock_irqrestore(&local_clock_reg_lock, irq_flags);
+
+	return ret;
+}
+
+static int branch_clk_set_flags(struct clk *c, unsigned flags)
+{
+	return cbcr_set_flags(CBCR_REG(to_branch_clk(c)), flags);
+}
+
 static int branch_clk_enable(struct clk *c)
 {
 	unsigned long flags;
 	u32 cbcr_val;
 	struct branch_clk *branch = to_branch_clk(c);
 
+	if (branch->toggle_memory) {
+		branch_clk_set_flags(c, CLKFLAG_RETAIN_MEM);
+		branch_clk_set_flags(c, CLKFLAG_RETAIN_PERIPH);
+	}
 	spin_lock_irqsave(&local_clock_reg_lock, flags);
 	cbcr_val = readl_relaxed(CBCR_REG(branch));
 	cbcr_val |= CBCR_BRANCH_ENABLE_BIT;
@@ -435,8 +639,14 @@ static void branch_clk_disable(struct clk *c)
 	spin_unlock_irqrestore(&local_clock_reg_lock, flags);
 
 	/* Wait for clock to disable before continuing. */
-	branch_clk_halt_check(c, branch->halt_check, CBCR_REG(branch),
-				BRANCH_OFF);
+	if (!branch->no_halt_check_on_disable)
+		branch_clk_halt_check(c, branch->halt_check, CBCR_REG(branch),
+					BRANCH_OFF);
+
+	if (branch->toggle_memory) {
+		branch_clk_set_flags(c, CLKFLAG_NORETAIN_MEM);
+		branch_clk_set_flags(c, CLKFLAG_NORETAIN_PERIPH);
+	}
 }
 
 static int branch_cdiv_set_rate(struct branch_clk *branch, unsigned long rate)
@@ -587,43 +797,6 @@ static int branch_clk_reset(struct clk *c, enum clk_reset_action action)
 	return __branch_clk_reset(BCR_REG(branch), action);
 }
 
-static int branch_clk_set_flags(struct clk *c, unsigned flags)
-{
-	u32 cbcr_val;
-	unsigned long irq_flags;
-	struct branch_clk *branch = to_branch_clk(c);
-	int delay_us = 0, ret = 0;
-
-	spin_lock_irqsave(&local_clock_reg_lock, irq_flags);
-	cbcr_val = readl_relaxed(CBCR_REG(branch));
-	switch (flags) {
-	case CLKFLAG_RETAIN_PERIPH:
-		cbcr_val |= BIT(13);
-		delay_us = 1;
-		break;
-	case CLKFLAG_NORETAIN_PERIPH:
-		cbcr_val &= ~BIT(13);
-		break;
-	case CLKFLAG_RETAIN_MEM:
-		cbcr_val |= BIT(14);
-		delay_us = 1;
-		break;
-	case CLKFLAG_NORETAIN_MEM:
-		cbcr_val &= ~BIT(14);
-		break;
-	default:
-		ret = -EINVAL;
-	}
-	writel_relaxed(cbcr_val, CBCR_REG(branch));
-	/* Make sure power is enabled before returning. */
-	mb();
-	udelay(delay_us);
-
-	spin_unlock_irqrestore(&local_clock_reg_lock, irq_flags);
-
-	return ret;
-}
-
 static void __iomem *branch_clk_list_registers(struct clk *c, int n,
 				struct clk_register_data **regs, u32 *size)
 {
@@ -724,12 +897,17 @@ static u32 run_measurement(unsigned ticks, void __iomem *ctl_reg,
 unsigned long measure_get_rate(struct clk *c)
 {
 	unsigned long flags;
-	u32 gcc_xo4_reg_backup;
+	u32 gcc_xo4_reg, regval;
 	u64 raw_count_short, raw_count_full;
 	unsigned ret;
 	u32 sample_ticks = 0x10000;
 	u32 multiplier = 0x1;
 	struct measure_clk_data *data = to_mux_clk(c)->priv;
+
+	regval = readl_relaxed(MUX_REG(to_mux_clk(c)));
+	/* clear post divider bits */
+	regval &= ~BM(15, 12);
+	writel_relaxed(regval, MUX_REG(to_mux_clk(c)));
 
 	ret = clk_prepare_enable(data->cxo);
 	if (ret) {
@@ -740,8 +918,9 @@ unsigned long measure_get_rate(struct clk *c)
 	spin_lock_irqsave(&local_clock_reg_lock, flags);
 
 	/* Enable CXO/4 and RINGOSC branch. */
-	gcc_xo4_reg_backup = readl_relaxed(*data->base + data->xo_div4_cbcr);
-	writel_relaxed(0x1, *data->base + data->xo_div4_cbcr);
+	gcc_xo4_reg = readl_relaxed(*data->base + data->xo_div4_cbcr);
+	gcc_xo4_reg |= CBCR_BRANCH_ENABLE_BIT;
+	writel_relaxed(gcc_xo4_reg, *data->base + data->xo_div4_cbcr);
 
 	/*
 	 * The ring oscillator counter will not reset if the measured clock
@@ -757,7 +936,9 @@ unsigned long measure_get_rate(struct clk *c)
 	raw_count_full = run_measurement(sample_ticks,
 					 *data->base + data->ctl_reg,
 					 *data->base + data->status_reg);
-	writel_relaxed(gcc_xo4_reg_backup, *data->base + data->xo_div4_cbcr);
+
+	gcc_xo4_reg &= ~CBCR_BRANCH_ENABLE_BIT;
+	writel_relaxed(gcc_xo4_reg, *data->base + data->xo_div4_cbcr);
 
 	/* Return 0 if the clock is off. */
 	if (raw_count_full == raw_count_short) {
@@ -828,6 +1009,34 @@ static struct frac_entry frac_table_810m[] = { /* Link rate of 162M */
 	{0, 0},
 };
 
+static bool is_same_rcg_config(struct rcg_clk *rcg, struct clk_freq_tbl *freq,
+			       bool has_mnd)
+{
+	u32 cfg;
+
+	/* RCG update pending */
+	if (readl_relaxed(CMD_RCGR_REG(rcg)) & CMD_RCGR_CONFIG_DIRTY_MASK)
+		return false;
+	if (has_mnd)
+		if (readl_relaxed(M_REG(rcg)) != freq->m_val ||
+		    readl_relaxed(N_REG(rcg)) != freq->n_val ||
+		    readl_relaxed(D_REG(rcg)) != freq->d_val)
+			return false;
+	/*
+	 * Both 0 and 1 represent same divider value in HW.
+	 * Always use 0 to simplify comparison.
+	 */
+	if ((freq->div_src_val & CFG_RCGR_DIV_MASK) == 1)
+		freq->div_src_val &= ~CFG_RCGR_DIV_MASK;
+	cfg = readl_relaxed(CFG_RCGR_REG(rcg));
+	if ((cfg & CFG_RCGR_DIV_MASK) == 1)
+		cfg &= ~CFG_RCGR_DIV_MASK;
+	if (cfg != freq->div_src_val)
+		return false;
+
+	return true;
+}
+
 static int set_rate_edp_pixel(struct clk *clk, unsigned long rate)
 {
 	struct rcg_clk *rcg = to_rcg_clk(clk);
@@ -836,6 +1045,7 @@ static int set_rate_edp_pixel(struct clk *clk, unsigned long rate)
 	int delta = 100000;
 	s64 request;
 	s64 src_rate;
+	unsigned long flags;
 
 	src_rate = clk_get_rate(clk->parent);
 
@@ -863,7 +1073,10 @@ static int set_rate_edp_pixel(struct clk *clk, unsigned long rate)
 			pixel_freq->n_val = ~(frac->den - frac->num);
 			pixel_freq->d_val = ~frac->den;
 		}
-		set_rate_mnd(rcg, pixel_freq);
+		spin_lock_irqsave(&local_clock_reg_lock, flags);
+		if (!is_same_rcg_config(rcg, pixel_freq, true))
+			__set_rate_mnd(rcg, pixel_freq);
+		spin_unlock_irqrestore(&local_clock_reg_lock, flags);
 		return 0;
 	}
 	return -EINVAL;
@@ -894,7 +1107,7 @@ static int set_rate_byte(struct clk *clk, unsigned long rate)
 {
 	struct rcg_clk *rcg = to_rcg_clk(clk);
 	struct clk *pll = clk->parent;
-	unsigned long source_rate, div;
+	unsigned long source_rate, div, flags;
 	struct clk_freq_tbl *byte_freq = rcg->current_freq;
 	int rc;
 
@@ -913,9 +1126,19 @@ static int set_rate_byte(struct clk *clk, unsigned long rate)
 	if (div > CFG_RCGR_DIV_MASK)
 		return -EINVAL;
 
+	/*
+	 * Both 0 and 1 represent same divider value in HW.
+	 * Always use 0 to simplify comparison.
+	 */
+	div = (div == 1) ? 0 : div;
+
 	byte_freq->div_src_val &= ~CFG_RCGR_DIV_MASK;
 	byte_freq->div_src_val |= BVAL(4, 0, div);
-	set_rate_hid(rcg, byte_freq);
+
+	spin_lock_irqsave(&local_clock_reg_lock, flags);
+	if (!is_same_rcg_config(rcg, byte_freq, false))
+		__set_rate_hid(rcg, byte_freq);
+	spin_unlock_irqrestore(&local_clock_reg_lock, flags);
 
 	return 0;
 }
@@ -1027,6 +1250,90 @@ static int set_rate_pixel(struct clk *clk, unsigned long rate)
 	return -EINVAL;
 }
 
+static int rcg_clk_set_parent(struct clk *clk, struct clk *parent_clk)
+{
+	struct rcg_clk *rcg = to_rcg_clk(clk);
+	struct clk *old_parent = clk->parent;
+	struct clk_freq_tbl *nf;
+	unsigned long flags;
+	int rc = 0;
+	unsigned int parent_rate, rate;
+	u32 m_val, n_val, d_val, div_val;
+	u32 cfg_regval;
+
+	/* Find the source clock freq tbl for the requested parent */
+	if (!rcg->freq_tbl)
+		return -ENXIO;
+
+	for (nf = rcg->freq_tbl; parent_clk != nf->src_clk; nf++) {
+		if (nf->freq_hz == FREQ_END)
+			return -ENXIO;
+	}
+
+	/* This implementation recommends that the RCG be unprepared
+	 * when switching RCG source since the divider configuration
+	 * remains unchanged.
+	 */
+	WARN(clk->prepare_count,
+		"Trying to switch RCG source while it is prepared!\n");
+
+	parent_rate = clk_get_rate(parent_clk);
+
+	div_val = (rcg->current_freq->div_src_val & CFG_RCGR_DIV_MASK);
+	if (div_val)
+		parent_rate /= ((div_val + 1) >> 1);
+
+	/* Update divisor. Source select bits should already be as expected */
+	nf->div_src_val &= ~CFG_RCGR_DIV_MASK;
+	nf->div_src_val |= div_val;
+
+	cfg_regval = readl_relaxed(CFG_RCGR_REG(rcg));
+
+	if ((cfg_regval & MND_MODE_MASK) == MND_DUAL_EDGE_MODE_BVAL) {
+		nf->m_val = m_val = readl_relaxed(M_REG(rcg));
+		n_val = readl_relaxed(N_REG(rcg));
+		d_val = readl_relaxed(D_REG(rcg));
+
+		/* Sign extend the n and d values as those in registers are not
+		 * sign extended.
+		 */
+		n_val |= (n_val >> 8) ? BM(31, 16) : BM(31, 8);
+		d_val |= (d_val >> 8) ? BM(31, 16) : BM(31, 8);
+
+		nf->n_val = n_val;
+		nf->d_val = d_val;
+
+		n_val = ~(n_val) + m_val;
+		rate = parent_rate * m_val;
+		if (n_val)
+			rate /= n_val;
+		else
+			WARN(1, "n_val was 0!!");
+	} else
+		rate = parent_rate;
+
+	/* Warn if switching to the new parent with the current m, n ,d values
+	 * violates the voltage constraints for the RCG.
+	 */
+	WARN(!is_rate_valid(clk, rate) && clk->prepare_count,
+		"Switch to new RCG parent violates voltage requirement!\n");
+
+	rc = __clk_pre_reparent(clk, nf->src_clk, &flags);
+	if (rc)
+		return rc;
+
+	/* Switch RCG source */
+	rcg->set_rate(rcg, nf);
+
+	rcg->current_freq = nf;
+	clk->parent = parent_clk;
+	clk->rate = rate;
+
+	__clk_post_reparent(clk, old_parent, &flags);
+
+	return 0;
+}
+
 /*
  * Unlike other clocks, the HDMI rate is adjusted through PLL
  * re-programming. It is also routed through an HID divider.
@@ -1128,6 +1435,8 @@ static int gate_clk_enable(struct clk *c)
 	regval |= g->en_mask;
 	writel_relaxed(regval, GATE_EN_REG(g));
 	spin_unlock_irqrestore(&local_clock_reg_lock, flags);
+	if (g->delay_us)
+		udelay(g->delay_us);
 
 	return 0;
 }
@@ -1143,6 +1452,8 @@ static void gate_clk_disable(struct clk *c)
 	regval &= ~(g->en_mask);
 	writel_relaxed(regval, GATE_EN_REG(g));
 	spin_unlock_irqrestore(&local_clock_reg_lock, flags);
+	if (g->delay_us)
+		udelay(g->delay_us);
 }
 
 static void __iomem *gate_clk_list_registers(struct clk *c, int n,
@@ -1172,6 +1483,11 @@ static enum handoff gate_clk_handoff(struct clk *c)
 	return HANDOFF_DISABLED_CLK;
 }
 
+static int gate_clk_set_flags(struct clk *c, unsigned flags)
+{
+	return cbcr_set_flags(GATE_EN_REG(to_gate_clk(c)), flags);
+}
+
 static int reset_clk_rst(struct clk *c, enum clk_reset_action action)
 {
 	struct reset_clk *rst = to_reset_clk(c);
@@ -1188,12 +1504,14 @@ static int mux_reg_enable(struct mux_clk *clk)
 {
 	u32 regval;
 	unsigned long flags;
-	u32 offset = clk->en_reg ? clk->en_offset : clk->offset;
+
+	if (!clk->en_mask)
+		return 0;
 
 	spin_lock_irqsave(&mux_reg_lock, flags);
-	regval = readl_relaxed(*clk->base + offset);
+	regval = readl_relaxed(*clk->base + clk->en_offset);
 	regval |= clk->en_mask;
-	writel_relaxed(regval, *clk->base + offset);
+	writel_relaxed(regval, *clk->base + clk->en_offset);
 	/* Ensure enable request goes through before returning */
 	mb();
 	spin_unlock_irqrestore(&mux_reg_lock, flags);
@@ -1205,12 +1523,14 @@ static void mux_reg_disable(struct mux_clk *clk)
 {
 	u32 regval;
 	unsigned long flags;
-	u32 offset = clk->en_reg ? clk->en_offset : clk->offset;
+
+	if (!clk->en_mask)
+		return;
 
 	spin_lock_irqsave(&mux_reg_lock, flags);
-	regval = readl_relaxed(*clk->base + offset);
+	regval = readl_relaxed(*clk->base + clk->en_offset);
 	regval &= ~clk->en_mask;
-	writel_relaxed(regval, *clk->base + offset);
+	writel_relaxed(regval, *clk->base + clk->en_offset);
 	spin_unlock_irqrestore(&mux_reg_lock, flags);
 }
 
@@ -1220,10 +1540,10 @@ static int mux_reg_set_mux_sel(struct mux_clk *clk, int sel)
 	unsigned long flags;
 
 	spin_lock_irqsave(&mux_reg_lock, flags);
-	regval = readl_relaxed(*clk->base + clk->offset);
+	regval = readl_relaxed(MUX_REG(clk));
 	regval &= ~(clk->mask << clk->shift);
 	regval |= (sel & clk->mask) << clk->shift;
-	writel_relaxed(regval, *clk->base + clk->offset);
+	writel_relaxed(regval, MUX_REG(clk));
 	/* Ensure switch request goes through before returning */
 	mb();
 	spin_unlock_irqrestore(&mux_reg_lock, flags);
@@ -1233,14 +1553,172 @@ static int mux_reg_set_mux_sel(struct mux_clk *clk, int sel)
 
 static int mux_reg_get_mux_sel(struct mux_clk *clk)
 {
-	u32 regval = readl_relaxed(*clk->base + clk->offset);
-	return !!((regval >> clk->shift) & clk->mask);
+	u32 regval = readl_relaxed(MUX_REG(clk));
+	return (regval >> clk->shift) & clk->mask;
 }
 
 static bool mux_reg_is_enabled(struct mux_clk *clk)
 {
-	u32 regval = readl_relaxed(*clk->base + clk->offset);
+	u32 regval = readl_relaxed(MUX_REG(clk));
 	return !!(regval & clk->en_mask);
+}
+
+static int div_reg_set_div(struct div_clk *clk, int div)
+{
+	u32 regval;
+	unsigned long flags;
+
+	/* Divider is not configurable */
+	if (!clk->mask)
+		return 0;
+
+	spin_lock_irqsave(&local_clock_reg_lock, flags);
+	regval = readl_relaxed(*clk->base + clk->offset);
+	regval &= ~(clk->mask << clk->shift);
+	regval |= (div & clk->mask) << clk->shift;
+	/* Ensure switch request goes through before returning */
+	mb();
+	spin_unlock_irqrestore(&local_clock_reg_lock, flags);
+
+	return 0;
+}
+
+static int div_reg_get_div(struct div_clk *clk)
+{
+	u32 regval;
+	/* Divider is not configurable */
+	if (!clk->mask)
+		return clk->data.div;
+
+	regval = readl_relaxed(*clk->base + clk->offset);
+	return (regval >> clk->shift) & clk->mask;
+}
+
+/* =================Half-integer RCG without MN counter================= */
+#define RCGR_CMD_REG(x) ((x)->base + (x)->div_offset)
+#define RCGR_DIV_REG(x) ((x)->base + (x)->div_offset + 4)
+#define RCGR_SRC_REG(x) ((x)->base + (x)->div_offset + 4)
+
+static int rcg_mux_div_update_config(struct mux_div_clk *md)
+{
+	u32 regval, count;
+
+	regval = readl_relaxed(RCGR_CMD_REG(md));
+	regval |= CMD_RCGR_CONFIG_UPDATE_BIT;
+	writel_relaxed(regval, RCGR_CMD_REG(md));
+
+	/* Wait for update to take effect */
+	for (count = UPDATE_CHECK_MAX_LOOPS; count > 0; count--) {
+		if (!(readl_relaxed(RCGR_CMD_REG(md)) &
+			    CMD_RCGR_CONFIG_UPDATE_BIT))
+			return 0;
+		udelay(1);
+	}
+
+	CLK_WARN(&md->c, true, "didn't update its configuration.");
+
+	return -EBUSY;
+}
+
+static void rcg_get_src_div(struct mux_div_clk *md, u32 *src_sel, u32 *div)
+{
+	u32 regval;
+	unsigned long flags;
+
+	spin_lock_irqsave(&local_clock_reg_lock, flags);
+	/* Is there a pending configuration? */
+	regval = readl_relaxed(RCGR_CMD_REG(md));
+	if (regval & CMD_RCGR_CONFIG_DIRTY_MASK) {
+		CLK_WARN(&md->c, true, "it's a pending configuration.");
+		spin_unlock_irqrestore(&local_clock_reg_lock, flags);
+		return;
+	}
+
+	regval = readl_relaxed(RCGR_DIV_REG(md));
+	regval &= (md->div_mask << md->div_shift);
+	*div = regval >> md->div_shift;
+
+	/* bypass */
+	if (*div == 0)
+		*div = 1;
+	/* the div is doubled here*/
+	*div += 1;
+
+	regval = readl_relaxed(RCGR_SRC_REG(md));
+	regval &= (md->src_mask << md->src_shift);
+	*src_sel = regval >> md->src_shift;
+	spin_unlock_irqrestore(&local_clock_reg_lock, flags);
+}
+
+static int rcg_set_src_div(struct mux_div_clk *md, u32 src_sel, u32 div)
+{
+	u32 regval;
+	unsigned long flags;
+	int ret;
+
+	/* for half-integer divider, div here is doubled */
+	if (div)
+		div -= 1;
+
+	spin_lock_irqsave(&local_clock_reg_lock, flags);
+	regval = readl_relaxed(RCGR_DIV_REG(md));
+	regval &= ~(md->div_mask << md->div_shift);
+	regval |= div << md->div_shift;
+	writel_relaxed(regval, RCGR_DIV_REG(md));
+
+	regval = readl_relaxed(RCGR_SRC_REG(md));
+	regval &= ~(md->src_mask << md->src_shift);
+	regval |= src_sel << md->src_shift;
+	writel_relaxed(regval, RCGR_SRC_REG(md));
+
+	ret = rcg_mux_div_update_config(md);
+	spin_unlock_irqrestore(&local_clock_reg_lock, flags);
+	return ret;
+}
+
+static int rcg_enable(struct mux_div_clk *md)
+{
+	return rcg_set_src_div(md, md->src_sel, md->data.div);
+}
+
+static void rcg_disable(struct mux_div_clk *md)
+{
+	u32 src_sel;
+
+	if (!md->safe_freq)
+		return;
+
+	src_sel = parent_to_src_sel(md->parents, md->num_parents,
+				md->safe_parent);
+
+	rcg_set_src_div(md, src_sel, md->safe_div);
+}
+
+static bool rcg_is_enabled(struct mux_div_clk *md)
+{
+	u32 regval;
+
+	regval = readl_relaxed(RCGR_CMD_REG(md));
+	if (regval & CMD_RCGR_ROOT_STATUS_BIT)
+		return false;
+	else
+		return true;
+}
+
+static void __iomem *rcg_list_registers(struct mux_div_clk *md, int n,
+			struct clk_register_data **regs, u32 *size)
+{
+	static struct clk_register_data data[] = {
+		{"CMD_RCGR", 0x0},
+		{"CFG_RCGR", 0x4},
+	};
+
+	if (n)
+		return ERR_PTR(-EINVAL);
+
+	*regs = data;
+	*size = ARRAY_SIZE(data);
+	return RCGR_CMD_REG(md);
 }
 
 struct clk_ops clk_ops_empty;
@@ -1250,36 +1728,55 @@ struct clk_ops clk_ops_rst = {
 };
 
 struct clk_ops clk_ops_rcg = {
-	.enable = rcg_clk_prepare,
+	.enable = rcg_clk_enable,
+	.disable = rcg_clk_disable,
 	.set_rate = rcg_clk_set_rate,
 	.list_rate = rcg_clk_list_rate,
 	.round_rate = rcg_clk_round_rate,
 	.handoff = rcg_clk_handoff,
 	.get_parent = rcg_clk_get_parent,
+	.set_parent = rcg_clk_set_parent,
 	.list_registers = rcg_hid_clk_list_registers,
 };
 
 struct clk_ops clk_ops_rcg_mnd = {
-	.enable = rcg_clk_prepare,
+	.enable = rcg_clk_enable,
+	.disable = rcg_clk_disable,
 	.set_rate = rcg_clk_set_rate,
 	.list_rate = rcg_clk_list_rate,
 	.round_rate = rcg_clk_round_rate,
 	.handoff = rcg_mnd_clk_handoff,
 	.get_parent = rcg_mnd_clk_get_parent,
+	.set_parent = rcg_clk_set_parent,
 	.list_registers = rcg_mnd_clk_list_registers,
 };
 
 struct clk_ops clk_ops_pixel = {
-	.enable = rcg_clk_prepare,
+	.enable = rcg_clk_enable,
+	.disable = rcg_clk_disable,
 	.set_rate = set_rate_pixel,
 	.list_rate = rcg_clk_list_rate,
 	.round_rate = round_rate_pixel,
 	.handoff = pixel_rcg_handoff,
 	.list_registers = rcg_mnd_clk_list_registers,
+	.set_parent = rcg_clk_set_parent,
+};
+
+struct clk_ops clk_ops_pixel_multiparent = {
+	.enable = rcg_clk_enable,
+	.disable = rcg_clk_disable,
+	.set_rate = set_rate_pixel,
+	.list_rate = rcg_clk_list_rate,
+	.round_rate = round_rate_pixel,
+	.handoff = pixel_rcg_handoff,
+	.list_registers = rcg_mnd_clk_list_registers,
+	.get_parent = display_clk_get_parent,
+	.set_parent = rcg_clk_set_parent,
 };
 
 struct clk_ops clk_ops_edppixel = {
-	.enable = rcg_clk_prepare,
+	.enable = rcg_clk_enable,
+	.disable = rcg_clk_disable,
 	.set_rate = set_rate_edp_pixel,
 	.list_rate = rcg_clk_list_rate,
 	.round_rate = rcg_clk_round_rate,
@@ -1288,16 +1785,31 @@ struct clk_ops clk_ops_edppixel = {
 };
 
 struct clk_ops clk_ops_byte = {
-	.enable = rcg_clk_prepare,
+	.enable = rcg_clk_enable,
+	.disable = rcg_clk_disable,
 	.set_rate = set_rate_byte,
 	.list_rate = rcg_clk_list_rate,
 	.round_rate = rcg_clk_round_rate,
 	.handoff = byte_rcg_handoff,
 	.list_registers = rcg_hid_clk_list_registers,
+	.set_parent = rcg_clk_set_parent,
+};
+
+struct clk_ops clk_ops_byte_multiparent = {
+	.enable = rcg_clk_enable,
+	.disable = rcg_clk_disable,
+	.set_rate = set_rate_byte,
+	.list_rate = rcg_clk_list_rate,
+	.round_rate = rcg_clk_round_rate,
+	.handoff = byte_rcg_handoff,
+	.list_registers = rcg_hid_clk_list_registers,
+	.get_parent = display_clk_get_parent,
+	.set_parent = rcg_clk_set_parent,
 };
 
 struct clk_ops clk_ops_rcg_hdmi = {
-	.enable = rcg_clk_prepare,
+	.enable = rcg_clk_enable,
+	.disable = rcg_clk_disable,
 	.set_rate = rcg_clk_set_rate_hdmi,
 	.list_rate = rcg_clk_list_rate,
 	.round_rate = rcg_clk_round_rate,
@@ -1307,7 +1819,8 @@ struct clk_ops clk_ops_rcg_hdmi = {
 };
 
 struct clk_ops clk_ops_rcg_edp = {
-	.enable = rcg_clk_prepare,
+	.enable = rcg_clk_enable,
+	.disable = rcg_clk_disable,
 	.set_rate = rcg_clk_set_rate_edp,
 	.list_rate = rcg_clk_list_rate,
 	.round_rate = rcg_clk_round_rate,
@@ -1340,6 +1853,10 @@ struct clk_ops clk_ops_vote = {
 struct clk_ops clk_ops_gate = {
 	.enable = gate_clk_enable,
 	.disable = gate_clk_disable,
+	.set_rate = parent_set_rate,
+	.get_rate = parent_get_rate,
+	.round_rate = parent_round_rate,
+	.set_flags = gate_clk_set_flags,
 	.handoff = gate_clk_handoff,
 	.list_registers = gate_clk_list_registers,
 };
@@ -1351,3 +1868,628 @@ struct clk_mux_ops mux_reg_ops = {
 	.get_mux_sel = mux_reg_get_mux_sel,
 	.is_enabled = mux_reg_is_enabled,
 };
+
+struct clk_div_ops div_reg_ops = {
+	.set_div = div_reg_set_div,
+	.get_div = div_reg_get_div,
+};
+
+struct mux_div_ops rcg_mux_div_ops = {
+	.enable = rcg_enable,
+	.disable = rcg_disable,
+	.set_src_div = rcg_set_src_div,
+	.get_src_div = rcg_get_src_div,
+	.is_enabled = rcg_is_enabled,
+	.list_registers = rcg_list_registers,
+};
+
+static void *cbc_dt_parser(struct device *dev, struct device_node *np)
+{
+	struct msmclk_data *drv;
+	struct branch_clk *branch_clk;
+	u32 rc;
+
+	branch_clk = devm_kzalloc(dev, sizeof(*branch_clk), GFP_KERNEL);
+	if (!branch_clk) {
+		dt_err(np, "memory alloc failure\n");
+		return ERR_PTR(-ENOMEM);
+	}
+
+	drv = msmclk_parse_phandle(dev, np->parent->phandle);
+	if (IS_ERR_OR_NULL(drv))
+		return ERR_CAST(drv);
+	branch_clk->base = &drv->base;
+
+	rc = of_property_read_u32(np, "qcom,base-offset",
+						&branch_clk->cbcr_reg);
+	if (rc) {
+		dt_err(np, "missing/incorrect qcom,base-offset dt property\n");
+		return ERR_PTR(rc);
+	}
+
+	/* Optional property */
+	of_property_read_u32(np, "qcom,bcr-offset", &branch_clk->bcr_reg);
+
+	branch_clk->has_sibling = of_property_read_bool(np,
+							"qcom,has-sibling");
+
+	branch_clk->c.ops = &clk_ops_branch;
+
+	return msmclk_generic_clk_init(dev, np, &branch_clk->c);
+}
+MSMCLK_PARSER(cbc_dt_parser, "qcom,cbc", 0);
+
+static void *local_vote_clk_dt_parser(struct device *dev,
+						struct device_node *np)
+{
+	struct local_vote_clk *vote_clk;
+	struct msmclk_data *drv;
+	int rc, val;
+
+	vote_clk = devm_kzalloc(dev, sizeof(*vote_clk), GFP_KERNEL);
+	if (!vote_clk) {
+		dt_err(np, "failed to alloc memory\n");
+		return ERR_PTR(-ENOMEM);
+	}
+
+	drv = msmclk_parse_phandle(dev, np->parent->phandle);
+	if (IS_ERR_OR_NULL(drv))
+		return ERR_CAST(drv);
+	vote_clk->base = &drv->base;
+
+	rc = of_property_read_u32(np, "qcom,base-offset",
+						&vote_clk->cbcr_reg);
+	if (rc) {
+		dt_err(np, "missing/incorrect qcom,base-offset dt property\n");
+		return ERR_PTR(-EINVAL);
+	}
+
+	rc = of_property_read_u32(np, "qcom,en-offset", &vote_clk->vote_reg);
+	if (rc) {
+		dt_err(np, "missing/incorrect qcom,en-offset dt property\n");
+		return ERR_PTR(-EINVAL);
+	}
+
+	rc = of_property_read_u32(np, "qcom,en-bit", &val);
+	if (rc) {
+		dt_err(np, "missing/incorrect qcom,en-bit dt property\n");
+		return ERR_PTR(-EINVAL);
+	}
+	vote_clk->en_mask = BIT(val);
+
+	vote_clk->c.ops = &clk_ops_vote;
+
+	/* Optional property */
+	of_property_read_u32(np, "qcom,bcr-offset", &vote_clk->bcr_reg);
+
+	return msmclk_generic_clk_init(dev, np, &vote_clk->c);
+}
+MSMCLK_PARSER(local_vote_clk_dt_parser, "qcom,local-vote-clk", 0);
+
+static void *gate_clk_dt_parser(struct device *dev, struct device_node *np)
+{
+	struct gate_clk *gate_clk;
+	struct msmclk_data *drv;
+	u32 en_bit, rc;
+
+	gate_clk = devm_kzalloc(dev, sizeof(*gate_clk), GFP_KERNEL);
+	if (!gate_clk) {
+		dt_err(np, "memory alloc failure\n");
+		return ERR_PTR(-ENOMEM);
+	}
+
+	drv = msmclk_parse_phandle(dev, np->parent->phandle);
+	if (IS_ERR_OR_NULL(drv))
+		return ERR_CAST(drv);
+	gate_clk->base = &drv->base;
+
+	rc = of_property_read_u32(np, "qcom,en-offset", &gate_clk->en_reg);
+	if (rc) {
+		dt_err(np, "missing qcom,en-offset dt property\n");
+		return ERR_PTR(-EINVAL);
+	}
+
+	rc = of_property_read_u32(np, "qcom,en-bit", &en_bit);
+	if (rc) {
+		dt_err(np, "missing qcom,en-bit dt property\n");
+		return ERR_PTR(-EINVAL);
+	}
+	gate_clk->en_mask = BIT(en_bit);
+
+	/* Optional Property */
+	rc = of_property_read_u32(np, "qcom,delay", &gate_clk->delay_us);
+	if (rc)
+		gate_clk->delay_us = 0;
+
+	gate_clk->c.ops = &clk_ops_gate;
+	return msmclk_generic_clk_init(dev, np, &gate_clk->c);
+}
+MSMCLK_PARSER(gate_clk_dt_parser, "qcom,gate-clk", 0);
+
+
+static inline u32 rcg_calc_m(u32 m, u32 n)
+{
+	return m;
+}
+
+static inline u32 rcg_calc_n(u32 m, u32 n)
+{
+	n = n > 1 ? n : 0;
+	return ~((n)-(m)) * !!(n);
+}
+
+static inline u32 rcg_calc_duty_cycle(u32 m, u32 n)
+{
+	return ~n;
+}
+
+static inline u32 rcg_calc_div_src(u32 div_int, u32 div_frac, u32 src_sel)
+{
+	int div = 2 * div_int + (div_frac ? 1 : 0) - 1;
+	/* set bypass mode instead of a divider of 1 */
+	div = (div != 1) ? div : 0;
+	return BVAL(4, 0, max(div, 0))
+			| BVAL(10, 8, src_sel);
+}
+
+struct clk_src *msmclk_parse_clk_src(struct device *dev,
+				struct device_node *np, int *array_size)
+{
+	struct clk_src *clks;
+	const void *prop;
+	int num_parents, len, i, prop_len, rc;
+	char *name = "qcom,parents";
+
+	if (!array_size) {
+		dt_err(np, "array_size must be a valid pointer\n");
+		return ERR_PTR(-EINVAL);
+	}
+
+	prop = of_get_property(np, name, &prop_len);
+	if (!prop) {
+		dt_prop_err(np, name, "missing dt property\n");
+		return ERR_PTR(-EINVAL);
+	}
+
+	len = sizeof(phandle) + sizeof(u32);
+	if (prop_len % len) {
+		dt_prop_err(np, name, "invalid property length\n");
+		return ERR_PTR(-EINVAL);
+	}
+	num_parents = prop_len / len;
+
+	clks = devm_kzalloc(dev, sizeof(*clks) * num_parents, GFP_KERNEL);
+	if (!clks) {
+		dt_err(np, "memory alloc failure\n");
+		return ERR_PTR(-ENOMEM);
+	}
+
+	/* Assume that u32 and phandle have the same size */
+	for (i = 0; i < num_parents; i++) {
+		phandle p;
+		struct clk_src *a = &clks[i];
+
+		rc = of_property_read_u32_index(np, name, 2 * i, &a->sel);
+		rc |= of_property_read_phandle_index(np, name, 2 * i + 1, &p);
+
+		if (rc) {
+			dt_prop_err(np, name,
+				"unable to read parent clock or mux index\n");
+			return ERR_PTR(-EINVAL);
+		}
+
+		a->src = msmclk_parse_phandle(dev, p);
+		if (IS_ERR(a->src)) {
+			dt_prop_err(np, name, "hashtable lookup failed\n");
+			return ERR_CAST(a->src);
+		}
+	}
+
+	*array_size = num_parents;
+
+	return clks;
+}
+
+static int rcg_parse_freq_tbl(struct device *dev,
+			struct device_node *np, struct rcg_clk *rcg)
+{
+	const void *prop;
+	u32 prop_len, num_rows, i, j = 0;
+	struct clk_freq_tbl *tbl;
+	int rc;
+	char *name = "qcom,freq-tbl";
+
+	prop = of_get_property(np, name, &prop_len);
+	if (!prop) {
+		dt_prop_err(np, name, "missing dt property\n");
+		return -EINVAL;
+	}
+
+	prop_len /= sizeof(u32);
+	if (prop_len % 6) {
+		dt_prop_err(np, name, "bad length\n");
+		return -EINVAL;
+	}
+
+	num_rows = prop_len / 6;
+	/* Array is null terminated. */
+	rcg->freq_tbl = devm_kzalloc(dev,
+				sizeof(*rcg->freq_tbl) * (num_rows + 1),
+				GFP_KERNEL);
+
+	if (!rcg->freq_tbl) {
+		dt_err(np, "memory alloc failure\n");
+		return -ENOMEM;
+	}
+
+	tbl = rcg->freq_tbl;
+	for (i = 0; i < num_rows; i++, tbl++) {
+		phandle p;
+		u32 div_int, div_frac, m, n, src_sel, freq_hz;
+
+		rc = of_property_read_u32_index(np, name, j++, &freq_hz);
+		rc |= of_property_read_u32_index(np, name, j++, &div_int);
+		rc |= of_property_read_u32_index(np, name, j++, &div_frac);
+		rc |= of_property_read_u32_index(np, name, j++, &m);
+		rc |= of_property_read_u32_index(np, name, j++, &n);
+		rc |= of_property_read_u32_index(np, name, j++, &p);
+
+		if (rc) {
+			dt_prop_err(np, name, "unable to read u32\n");
+			return -EINVAL;
+		}
+
+		tbl->freq_hz = (unsigned long)freq_hz;
+		tbl->src_clk = msmclk_parse_phandle(dev, p);
+		if (IS_ERR_OR_NULL(tbl->src_clk)) {
+			dt_prop_err(np, name, "hashtable lookup failure\n");
+			return PTR_ERR(tbl->src_clk);
+		}
+
+		tbl->m_val = rcg_calc_m(m, n);
+		tbl->n_val = rcg_calc_n(m, n);
+		tbl->d_val = rcg_calc_duty_cycle(m, n);
+
+		src_sel = parent_to_src_sel(rcg->c.parents,
+					rcg->c.num_parents, tbl->src_clk);
+		tbl->div_src_val = rcg_calc_div_src(div_int, div_frac,
+								src_sel);
+	}
+	/* End table with special value */
+	tbl->freq_hz = FREQ_END;
+	return 0;
+}
+
+static void *rcg_clk_dt_parser(struct device *dev, struct device_node *np)
+{
+	struct rcg_clk *rcg;
+	struct msmclk_data *drv;
+	int rc;
+
+	rcg = devm_kzalloc(dev, sizeof(*rcg), GFP_KERNEL);
+	if (!rcg) {
+		dt_err(np, "memory alloc failure\n");
+		return ERR_PTR(-ENOMEM);
+	}
+
+	drv = msmclk_parse_phandle(dev, np->parent->phandle);
+	if (IS_ERR_OR_NULL(drv))
+		return drv;
+	rcg->base = &drv->base;
+
+	rcg->c.parents = msmclk_parse_clk_src(dev, np, &rcg->c.num_parents);
+	if (IS_ERR(rcg->c.parents)) {
+		dt_err(np, "unable to read parents\n");
+		return ERR_CAST(rcg->c.parents);
+	}
+
+	rc = of_property_read_u32(np, "qcom,base-offset", &rcg->cmd_rcgr_reg);
+	if (rc) {
+		dt_err(np, "missing qcom,base-offset dt property\n");
+		return ERR_PTR(rc);
+	}
+
+	rc = rcg_parse_freq_tbl(dev, np, rcg);
+	if (rc) {
+		dt_err(np, "unable to read freq_tbl\n");
+		return ERR_PTR(rc);
+	}
+	rcg->current_freq = &rcg_dummy_freq;
+
+	if (of_device_is_compatible(np, "qcom,rcg-hid")) {
+		rcg->c.ops = &clk_ops_rcg;
+		rcg->set_rate = set_rate_hid;
+	} else if (of_device_is_compatible(np, "qcom,rcg-mn")) {
+		rcg->c.ops = &clk_ops_rcg_mnd;
+		rcg->set_rate = set_rate_mnd;
+	} else {
+		dt_err(np, "unexpected compatible string\n");
+		return ERR_PTR(-EINVAL);
+	}
+
+	return msmclk_generic_clk_init(dev, np, &rcg->c);
+}
+MSMCLK_PARSER(rcg_clk_dt_parser, "qcom,rcg-hid", 0);
+MSMCLK_PARSER(rcg_clk_dt_parser, "qcom,rcg-mn", 1);
+
+static int parse_rec_parents(struct device *dev,
+			struct device_node *np, struct mux_clk *mux)
+{
+	int i, rc;
+	char *name = "qcom,recursive-parents";
+	phandle p;
+
+	mux->num_rec_parents = of_property_count_phandles(np, name);
+	if (mux->num_rec_parents <= 0)
+		return 0;
+
+	mux->rec_parents = devm_kzalloc(dev,
+			sizeof(*mux->rec_parents) * mux->num_rec_parents,
+			GFP_KERNEL);
+
+	if (!mux->rec_parents) {
+		dt_err(np, "memory alloc failure\n");
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < mux->num_rec_parents; i++) {
+		rc = of_property_read_phandle_index(np, name, i, &p);
+		if (rc) {
+			dt_prop_err(np, name, "unable to read u32\n");
+			return rc;
+		}
+
+		mux->rec_parents[i] = msmclk_parse_phandle(dev, p);
+		if (IS_ERR(mux->rec_parents[i])) {
+			dt_prop_err(np, name, "hashtable lookup failure\n");
+			return PTR_ERR(mux->rec_parents[i]);
+		}
+	}
+
+	return 0;
+}
+
+static void *mux_reg_clk_dt_parser(struct device *dev, struct device_node *np)
+{
+	struct mux_clk *mux;
+	struct msmclk_data *drv;
+	int rc;
+
+	mux = devm_kzalloc(dev, sizeof(*mux), GFP_KERNEL);
+	if (!mux) {
+		dt_err(np, "memory alloc failure\n");
+		return ERR_PTR(-ENOMEM);
+	}
+
+	mux->parents = msmclk_parse_clk_src(dev, np, &mux->num_parents);
+	if (IS_ERR(mux->parents))
+		return mux->parents;
+
+	mux->c.parents = mux->parents;
+	mux->c.num_parents = mux->num_parents;
+
+	drv = msmclk_parse_phandle(dev, np->parent->phandle);
+	if (IS_ERR_OR_NULL(drv))
+		return drv;
+	mux->base = &drv->base;
+
+	rc = parse_rec_parents(dev, np, mux);
+	if (rc) {
+		dt_err(np, "Incorrect qcom,recursive-parents dt property\n");
+		return ERR_PTR(rc);
+	}
+
+	rc = of_property_read_u32(np, "qcom,offset", &mux->offset);
+	if (rc) {
+		dt_err(np, "missing qcom,offset dt property\n");
+		return ERR_PTR(-EINVAL);
+	}
+
+	rc = of_property_read_u32(np, "qcom,mask", &mux->mask);
+	if (rc) {
+		dt_err(np, "missing qcom,mask dt property\n");
+		return ERR_PTR(-EINVAL);
+	}
+
+	rc = of_property_read_u32(np, "qcom,shift", &mux->shift);
+	if (rc) {
+		dt_err(np, "missing qcom,shift dt property\n");
+		return ERR_PTR(-EINVAL);
+	}
+
+	mux->c.ops = &clk_ops_gen_mux;
+	mux->ops = &mux_reg_ops;
+
+	/* Optional Properties */
+	of_property_read_u32(np, "qcom,en-offset", &mux->en_offset);
+	of_property_read_u32(np, "qcom,en-mask", &mux->en_mask);
+
+	return msmclk_generic_clk_init(dev, np, &mux->c);
+};
+MSMCLK_PARSER(mux_reg_clk_dt_parser, "qcom,mux-reg", 0);
+
+static void *measure_clk_dt_parser(struct device *dev,
+					struct device_node *np)
+{
+	struct mux_clk *mux;
+	struct clk *c;
+	struct measure_clk_data *p;
+	struct clk_ops *clk_ops_measure_mux;
+	phandle cxo;
+	int rc;
+
+	c = mux_reg_clk_dt_parser(dev, np);
+	if (IS_ERR(c))
+		return c;
+
+	mux = to_mux_clk(c);
+
+	p = devm_kzalloc(dev, sizeof(*p), GFP_KERNEL);
+	if (!p) {
+		dt_err(np, "memory alloc failure\n");
+		return ERR_PTR(-ENOMEM);
+	}
+
+	rc = of_property_read_phandle_index(np, "qcom,cxo", 0, &cxo);
+	if (rc) {
+		dt_err(np, "missing qcom,cxo\n");
+		return ERR_PTR(-EINVAL);
+	}
+	p->cxo = msmclk_parse_phandle(dev, cxo);
+	if (IS_ERR_OR_NULL(p->cxo)) {
+		dt_prop_err(np, "qcom,cxo", "hashtable lookup failure\n");
+		return p->cxo;
+	}
+
+	rc = of_property_read_u32(np, "qcom,xo-div4-cbcr", &p->xo_div4_cbcr);
+	if (rc) {
+		dt_err(np, "missing qcom,xo-div4-cbcr dt property\n");
+		return ERR_PTR(-EINVAL);
+	}
+
+	rc = of_property_read_u32(np, "qcom,test-pad-config", &p->plltest_val);
+	if (rc) {
+		dt_err(np, "missing qcom,test-pad-config dt property\n");
+		return ERR_PTR(-EINVAL);
+	}
+
+	p->base = mux->base;
+	p->ctl_reg = mux->offset + 0x4;
+	p->status_reg = mux->offset + 0x8;
+	p->plltest_reg = mux->offset + 0xC;
+	mux->priv = p;
+
+	clk_ops_measure_mux = devm_kzalloc(dev, sizeof(*clk_ops_measure_mux),
+								GFP_KERNEL);
+	if (!clk_ops_measure_mux) {
+		dt_err(np, "memory alloc failure\n");
+		return ERR_PTR(-ENOMEM);
+	}
+
+	*clk_ops_measure_mux = clk_ops_gen_mux;
+	clk_ops_measure_mux->get_rate = measure_get_rate;
+
+	mux->c.ops = clk_ops_measure_mux;
+
+	/* Already did generic clk init */
+	return &mux->c;
+};
+MSMCLK_PARSER(measure_clk_dt_parser, "qcom,measure-mux", 0);
+
+static void *div_clk_dt_parser(struct device *dev,
+					struct device_node *np)
+{
+	struct div_clk *div_clk;
+	struct msmclk_data *drv;
+	int rc;
+
+	div_clk = devm_kzalloc(dev, sizeof(*div_clk), GFP_KERNEL);
+	if (!div_clk) {
+		dt_err(np, "memory alloc failed\n");
+		return ERR_PTR(-ENOMEM);
+	}
+
+	rc = of_property_read_u32(np, "qcom,max-div", &div_clk->data.max_div);
+	if (rc) {
+		dt_err(np, "missing qcom,max-div\n");
+		return ERR_PTR(-EINVAL);
+	}
+
+	rc = of_property_read_u32(np, "qcom,min-div", &div_clk->data.min_div);
+	if (rc) {
+		dt_err(np, "missing qcom,min-div\n");
+		return ERR_PTR(-EINVAL);
+	}
+
+	rc = of_property_read_u32(np, "qcom,base-offset", &div_clk->offset);
+	if (rc) {
+		dt_err(np, "missing qcom,base-offset\n");
+		return ERR_PTR(-EINVAL);
+	}
+
+	rc = of_property_read_u32(np, "qcom,mask", &div_clk->mask);
+	if (rc) {
+		dt_err(np, "missing qcom,mask\n");
+		return ERR_PTR(-EINVAL);
+	}
+
+	rc = of_property_read_u32(np, "qcom,shift", &div_clk->shift);
+	if (rc) {
+		dt_err(np, "missing qcom,shift\n");
+		return ERR_PTR(-EINVAL);
+	}
+
+	if (of_property_read_bool(np, "qcom,slave-div"))
+		div_clk->c.ops = &clk_ops_slave_div;
+	else
+		div_clk->c.ops = &clk_ops_div;
+	div_clk->ops = &div_reg_ops;
+
+	drv = msmclk_parse_phandle(dev, np->parent->phandle);
+	if (IS_ERR_OR_NULL(drv))
+		return ERR_CAST(drv);
+	div_clk->base = &drv->base;
+
+	return msmclk_generic_clk_init(dev, np, &div_clk->c);
+};
+MSMCLK_PARSER(div_clk_dt_parser, "qcom,div-clk", 0);
+
+static void *fixed_div_clk_dt_parser(struct device *dev,
+						struct device_node *np)
+{
+	struct div_clk *div_clk;
+	int rc;
+
+	div_clk = devm_kzalloc(dev, sizeof(*div_clk), GFP_KERNEL);
+	if (!div_clk) {
+		dt_err(np, "memory alloc failed\n");
+		return ERR_PTR(-ENOMEM);
+	}
+
+	rc = of_property_read_u32(np, "qcom,div", &div_clk->data.div);
+	if (rc) {
+		dt_err(np, "missing qcom,div\n");
+		return ERR_PTR(-EINVAL);
+	}
+	div_clk->data.min_div = div_clk->data.div;
+	div_clk->data.max_div = div_clk->data.div;
+
+	if (of_property_read_bool(np, "qcom,slave-div"))
+		div_clk->c.ops = &clk_ops_slave_div;
+	else
+		div_clk->c.ops = &clk_ops_div;
+	div_clk->ops = &div_reg_ops;
+
+	return msmclk_generic_clk_init(dev, np, &div_clk->c);
+}
+MSMCLK_PARSER(fixed_div_clk_dt_parser, "qcom,fixed-div-clk", 0);
+
+static void *reset_clk_dt_parser(struct device *dev,
+					struct device_node *np)
+{
+	struct reset_clk *reset_clk;
+	struct msmclk_data *drv;
+	int rc;
+
+	reset_clk = devm_kzalloc(dev, sizeof(*reset_clk), GFP_KERNEL);
+	if (!reset_clk) {
+		dt_err(np, "memory alloc failed\n");
+		return ERR_PTR(-ENOMEM);
+	}
+
+	rc = of_property_read_u32(np, "qcom,base-offset",
+						&reset_clk->reset_reg);
+	if (rc) {
+		dt_err(np, "missing qcom,base-offset\n");
+		return ERR_PTR(-EINVAL);
+	}
+
+	drv = msmclk_parse_phandle(dev, np->parent->phandle);
+	if (IS_ERR_OR_NULL(drv))
+		return ERR_CAST(drv);
+	reset_clk->base = &drv->base;
+
+	reset_clk->c.ops = &clk_ops_rst;
+	return msmclk_generic_clk_init(dev, np, &reset_clk->c);
+};
+MSMCLK_PARSER(reset_clk_dt_parser, "qcom,reset-clk", 0);

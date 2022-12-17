@@ -659,10 +659,12 @@ struct request_queue *blk_alloc_queue_node(gfp_t gfp_mask, int node_id)
 	__set_bit(QUEUE_FLAG_BYPASS, &q->queue_flags);
 
 	if (blkcg_init_queue(q))
-		goto fail_id;
+		goto fail_bdi;
 
 	return q;
 
+fail_bdi:
+	bdi_destroy(&q->backing_dev_info);
 fail_id:
 	ida_simple_remove(&blk_queue_ida, q->id);
 fail_q:
@@ -753,9 +755,17 @@ blk_init_allocated_queue(struct request_queue *q, request_fn_proc *rfn,
 
 	q->sg_reserved_size = INT_MAX;
 
+	/* Protect q->elevator from elevator_change */
+	mutex_lock(&q->sysfs_lock);
+
 	/* init elevator */
-	if (elevator_init(q, NULL))
+	if (elevator_init(q, NULL)) {
+		mutex_unlock(&q->sysfs_lock);
 		return NULL;
+	}
+
+	mutex_unlock(&q->sysfs_lock);
+
 	return q;
 }
 EXPORT_SYMBOL(blk_init_allocated_queue);
@@ -1913,6 +1923,27 @@ void generic_make_request(struct bio *bio)
 }
 EXPORT_SYMBOL(generic_make_request);
 
+#ifdef CONFIG_BLK_DEV_IO_TRACE
+static inline struct task_struct *get_dirty_task(struct bio *bio)
+{
+	/*
+	 * Not all the pages in the bio are dirtied by the
+	 * same task but most likely it will be, since the
+	 * sectors accessed on the device must be adjacent.
+	 */
+	if (bio->bi_io_vec && bio->bi_io_vec->bv_page &&
+		bio->bi_io_vec->bv_page->tsk_dirty)
+			return bio->bi_io_vec->bv_page->tsk_dirty;
+	else
+		return current;
+}
+#else
+static inline struct task_struct *get_dirty_task(struct bio *bio)
+{
+	return current;
+}
+#endif
+
 /**
  * submit_bio - submit a bio to the block device layer for I/O
  * @rw: whether to %READ or %WRITE, or maybe to %READA (read ahead)
@@ -1948,8 +1979,11 @@ void submit_bio(int rw, struct bio *bio)
 
 		if (unlikely(block_dump)) {
 			char b[BDEVNAME_SIZE];
+			struct task_struct *tsk;
+
+			tsk = get_dirty_task(bio);
 			printk(KERN_DEBUG "%s(%d): %s block %Lu on %s (%u sectors)\n",
-			current->comm, task_pid_nr(current),
+				tsk->comm, task_pid_nr(tsk),
 				(rw & WRITE) ? "WRITE" : "READ",
 				(unsigned long long)bio->bi_sector,
 				bdevname(bio->bi_bdev, b),
@@ -2103,6 +2137,8 @@ static void blk_account_io_completion(struct request *req, unsigned int bytes)
 		cpu = part_stat_lock();
 		part = req->part;
 		part_stat_add(cpu, part, sectors[rw], bytes >> 9);
+		if (rw == WRITE && !(req->cmd_flags & REQ_DISCARD))
+			part_stat_add(cpu, part, data_sectors, bytes >> 9);
 		part_stat_unlock();
 	}
 }
@@ -2309,6 +2345,7 @@ void blk_start_request(struct request *req)
 	if (unlikely(blk_bidi_rq(req)))
 		req->next_rq->resid_len = blk_rq_bytes(req->next_rq);
 
+	BUG_ON(test_bit(REQ_ATOM_COMPLETE, &req->atomic_flags));
 	blk_add_timer(req);
 }
 EXPORT_SYMBOL(blk_start_request);
@@ -2368,7 +2405,7 @@ bool blk_update_request(struct request *req, int error, unsigned int nr_bytes)
 	if (!req->bio)
 		return false;
 
-	trace_block_rq_complete(req->q, req);
+	trace_block_rq_complete(req->q, req, nr_bytes);
 
 	/*
 	 * For fs requests, rq is just carrier of independent bio's

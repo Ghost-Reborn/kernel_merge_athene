@@ -139,6 +139,7 @@ config MACVLAN
 config MACVTAP
 	tristate "MAC-VLAN based tap driver"
 	depends on MACVLAN
+	depends on INET
 	help
 	  This adds a specialized tap character device driver that is based
 	  on the MAC-VLAN network interface, called macvtap. A macvtap device
@@ -209,6 +210,7 @@ config RIONET_RX_SIZE
 
 config TUN
 	tristate "Universal TUN/TAP device driver support"
+	depends on INET
 	select CRC32
 	---help---
 	  TUN/TAP provides packet reception and transmission for user space
@@ -306,6 +308,15 @@ source "drivers/net/wimax/Kconfig"
 source "drivers/net/wan/Kconfig"
 
 source "drivers/net/ieee802154/Kconfig"
+
+config DANIPC
+	tristate "DAN IPC network device"
+	depends on PACKET
+	help
+		Linux implementation of DANIPC (Inter Processor Communication)
+		driver. DANIPC is a hardware block providing the means to
+		enable an efficient and reliable communication between
+		the different processors in the SoC.
 
 config XEN_NETDEV_FRONTEND
 	tristate "Xen network device frontend driver"

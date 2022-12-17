@@ -17,26 +17,23 @@
 #include "perf_trace_counters.h"
 
 static unsigned int tp_pid_state;
-
+DEFINE_PER_CPU(u32, cntenset_val);
+DEFINE_PER_CPU(unsigned long, l2_enmask);
 DEFINE_PER_CPU(u32, previous_ccnt);
 DEFINE_PER_CPU(u32[NUM_L1_CTRS], previous_l1_cnts);
 DEFINE_PER_CPU(u32[NUM_L2_PERCPU], previous_l2_cnts);
 DEFINE_PER_CPU(u32, old_pid);
+DEFINE_PER_CPU(u32, hotplug_flag);
 /* Reset per_cpu variables that store counter values uppn CPU hotplug */
 static int tracectr_cpu_hotplug_notifier(struct notifier_block *self,
 				    unsigned long action, void *hcpu)
 {
 	int ret = NOTIFY_OK;
 	int cpu = (int)hcpu;
-	int i;
 
-	if ((action & (~CPU_TASKS_FROZEN)) == CPU_UP_PREPARE) {
-		per_cpu(previous_ccnt, cpu) = 0;
-		for (i = 0; i < NUM_L1_CTRS; i++)
-			per_cpu(previous_l1_cnts[i], cpu) = 0;
-		for (i = 0; i < NUM_L2_PERCPU; i++)
-			per_cpu(previous_l2_cnts[i], cpu) = 0;
-	}
+	if ((action & (~CPU_TASKS_FROZEN)) == CPU_STARTING)
+		per_cpu(hotplug_flag, cpu) = 1;
+
 	return ret;
 }
 
@@ -44,20 +41,87 @@ static struct notifier_block tracectr_cpu_hotplug_notifier_block = {
 	.notifier_call = tracectr_cpu_hotplug_notifier,
 };
 
+static void setup_prev_cnts(u32 cpu, u32 cnten_val)
+{
+	int i;
+
+	if (cnten_val & CC) {
+		/* Read value */
+		asm volatile("mrc p15, 0, %0, c9, c13, 0"
+			: "=r"(per_cpu(previous_ccnt, cpu)));
+	}
+
+	for (i = 0; i < NUM_L1_CTRS; i++) {
+		if (cnten_val & (1 << i)) {
+			/* Select */
+			asm volatile("mcr p15, 0, %0, c9, c12, 5"
+				: : "r"(i));
+			/* Read value */
+			asm volatile("mrc p15, 0, %0, c9, c13, 2"
+				: "=r"(per_cpu(previous_l1_cnts[i], cpu)));
+		}
+	}
+}
+
 static int tracectr_notifier(struct notifier_block *self, unsigned long cmd,
 		void *v)
 {
+	u32 cnten_val;
+	u32 l2_cnten_val;
+	u32 val;
+	u32 bit;
+	int i;
+	int num_l2ctrs;
 	struct thread_info *thread = v;
 	int current_pid;
 	u32 cpu = thread->cpu;
+	unsigned long idx;
+	u32 num_cores = nr_cpu_ids;
 
 	if (cmd != THREAD_NOTIFY_SWITCH)
 		return -EFAULT;
 
 	current_pid = thread->task->pid;
-	if (per_cpu(old_pid, cpu) != -1)
-		trace_sched_switch_with_ctrs(per_cpu(old_pid, cpu),
-						current_pid);
+	if (per_cpu(old_pid, cpu) != -1) {
+		/* Read PMCNTENSET */
+		asm volatile("mrc p15, 0, %0, c9, c12, 1" : "=r"(cnten_val));
+		per_cpu(cntenset_val, cpu) = cnten_val;
+		/* Disable all the counters that were enabled */
+		asm volatile("mcr p15, 0, %0, c9, c12, 2" : : "r"(cnten_val));
+
+		if (per_cpu(hotplug_flag, cpu) == 1) {
+			per_cpu(hotplug_flag, cpu) = 0;
+			setup_prev_cnts(cpu, cnten_val);
+		} else {
+			/* check # L2 counters */
+			val = get_l2_indirect_reg(L2PMCR);
+			num_l2ctrs = ((val >> 11) & 0x1f) + 1;
+			l2_cnten_val = get_l2_indirect_reg(L2PMCNTENSET);
+			per_cpu(l2_enmask, cpu) = 0;
+			for (i = 0; i < NUM_L2_PERCPU; i++) {
+				/*
+				 * Assign L2 counters to cores sequentially
+				 * starting from zero. A core could have
+				 * multiple L2 counters allocated if # L2
+				 * counters is more than the # cores
+				 */
+				idx = cpu + (num_cores * i);
+				bit = BIT(idx);
+				if (idx < num_l2ctrs && (l2_cnten_val & bit)) {
+					/* Disable */
+					set_l2_indirect_reg(L2PMCNTENCLR, bit);
+					per_cpu(l2_enmask, cpu) |= bit;
+				}
+			}
+			trace_sched_switch_with_ctrs(per_cpu(old_pid, cpu),
+				current_pid);
+			/* Enable L2*/
+			set_l2_indirect_reg(L2PMCNTENSET,
+					per_cpu(l2_enmask, cpu));
+		}
+		/* Enable all the counters that were disabled */
+		asm volatile("mcr p15, 0, %0, c9, c12, 1" : : "r"(cnten_val));
+	}
 	per_cpu(old_pid, cpu) = current_pid;
 	return NOTIFY_OK;
 }

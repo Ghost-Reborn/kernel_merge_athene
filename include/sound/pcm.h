@@ -65,18 +65,21 @@ struct snd_pcm_ops {
 	int (*close)(struct snd_pcm_substream *substream);
 	int (*ioctl)(struct snd_pcm_substream * substream,
 		     unsigned int cmd, void *arg);
+	int (*compat_ioctl)(struct snd_pcm_substream *substream,
+		     unsigned int cmd, void *arg);
 	int (*hw_params)(struct snd_pcm_substream *substream,
 			 struct snd_pcm_hw_params *params);
 	int (*hw_free)(struct snd_pcm_substream *substream);
 	int (*prepare)(struct snd_pcm_substream *substream);
 	int (*trigger)(struct snd_pcm_substream *substream, int cmd);
 	snd_pcm_uframes_t (*pointer)(struct snd_pcm_substream *substream);
+	int (*delay_blk)(struct snd_pcm_substream *substream);
 	int (*wall_clock)(struct snd_pcm_substream *substream,
 			  struct timespec *audio_ts);
 	int (*copy)(struct snd_pcm_substream *substream, int channel,
 		    snd_pcm_uframes_t pos,
 		    void __user *buf, snd_pcm_uframes_t count);
-	int (*silence)(struct snd_pcm_substream *substream, int channel, 
+	int (*silence)(struct snd_pcm_substream *substream, int channel,
 		       snd_pcm_uframes_t pos, snd_pcm_uframes_t count);
 	struct page *(*page)(struct snd_pcm_substream *substream,
 			     unsigned long offset);
@@ -99,7 +102,7 @@ struct snd_pcm_ops {
 #define SNDRV_PCM_IOCTL1_TRUE		((void *)1)
 
 #define SNDRV_PCM_IOCTL1_RESET		0
-#define SNDRV_PCM_IOCTL1_INFO		1
+/* 1 is absent slot. */
 #define SNDRV_PCM_IOCTL1_CHANNEL_INFO	2
 #define SNDRV_PCM_IOCTL1_GSTATE		3
 #define SNDRV_PCM_IOCTL1_FIFO_SIZE	4
@@ -133,6 +136,7 @@ struct snd_pcm_ops {
 #define SNDRV_PCM_RATE_96000		(1<<10)		/* 96000Hz */
 #define SNDRV_PCM_RATE_176400		(1<<11)		/* 176400Hz */
 #define SNDRV_PCM_RATE_192000		(1<<12)		/* 192000Hz */
+#define SNDRV_PCM_RATE_384000		(1<<13)		/* 384000Hz */
 
 #define SNDRV_PCM_RATE_CONTINUOUS	(1<<30)		/* continuous range */
 #define SNDRV_PCM_RATE_KNOT		(1<<31)		/* supports more non-continuos rates */
@@ -395,6 +399,7 @@ struct snd_pcm_substream {
 	struct snd_pcm_ops *ops;
 	/* -- runtime information -- */
 	struct snd_pcm_runtime *runtime;
+	spinlock_t runtime_lock;
         /* -- timer section -- */
 	struct snd_timer *timer;		/* timer */
 	unsigned timer_running: 1;	/* time is running */
@@ -453,6 +458,7 @@ struct snd_pcm_str {
 #endif
 	struct snd_kcontrol *chmap_kctl; /* channel-mapping controls */
 	struct snd_kcontrol *vol_kctl; /* volume controls */
+	struct snd_kcontrol *usr_kctl; /* user controls */
 };
 
 struct snd_pcm {
@@ -885,10 +891,11 @@ void snd_pcm_set_ops(struct snd_pcm * pcm, int direction, struct snd_pcm_ops *op
 void snd_pcm_set_sync(struct snd_pcm_substream *substream);
 int snd_pcm_lib_interleave_len(struct snd_pcm_substream *substream);
 int snd_pcm_lib_ioctl(struct snd_pcm_substream *substream,
-		      unsigned int cmd, void *arg);                      
+		      unsigned int cmd, void *arg);
 int snd_pcm_update_state(struct snd_pcm_substream *substream,
 			 struct snd_pcm_runtime *runtime);
 int snd_pcm_update_hw_ptr(struct snd_pcm_substream *substream);
+int snd_pcm_update_delay_blk(struct snd_pcm_substream *substream);
 int snd_pcm_playback_xrun_check(struct snd_pcm_substream *substream);
 int snd_pcm_capture_xrun_check(struct snd_pcm_substream *substream);
 int snd_pcm_playback_xrun_asap(struct snd_pcm_substream *substream);
@@ -1172,5 +1179,29 @@ int snd_pcm_add_volume_ctls(struct snd_pcm *pcm, int stream,
 			   int max_length,
 			   unsigned long private_value,
 			   struct snd_pcm_volume **info_ret);
+
+/*
+ * PCM User control API
+ */
+/* array element of usr elem */
+struct snd_pcm_usr_elem {
+	int val[128];
+};
+
+/* pp information; retrieved via snd_kcontrol_chip() */
+struct snd_pcm_usr {
+	struct snd_pcm *pcm;	/* assigned PCM instance */
+	int stream;		/* PLAYBACK or CAPTURE */
+	struct snd_kcontrol *kctl;
+	const struct snd_pcm_usr_elem *usr;
+	int max_length;
+	void *private_data;	/* optional: private data pointer */
+};
+
+int snd_pcm_add_usr_ctls(struct snd_pcm *pcm, int stream,
+			 const struct snd_pcm_usr_elem *usr,
+			 int max_length, int max_control_str_len,
+			 unsigned long private_value,
+			 struct snd_pcm_usr **info_ret);
 
 #endif /* __SOUND_PCM_H */

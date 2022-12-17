@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2011-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -54,6 +54,7 @@ struct rr_header_v1 {
  * @version: Version information.
  * @type: IPC Router Message Type.
  * @control_flag: Flags to indicate flow control, optional header etc.
+ * @opt_len: Combined size of the all optional headers in units of words.
  * @size: Size of the IPC Router payload.
  * @src_node_id: Source Node ID of the message.
  * @src_port_id: Source Port ID of the message.
@@ -63,7 +64,8 @@ struct rr_header_v1 {
 struct rr_header_v2 {
 	uint8_t version;
 	uint8_t type;
-	uint16_t control_flag;
+	uint8_t control_flag;
+	uint8_t opt_len;
 	uint32_t size;
 	uint16_t src_node_id;
 	uint16_t src_port_id;
@@ -76,18 +78,31 @@ union rr_header {
 	struct rr_header_v2 hdr_v2;
 };
 
+/**
+ * rr_opt_hdr - Optional header for IPC Router header version 2
+ * @len: Total length of the optional header.
+ * @data: Pointer to the actual optional header.
+ */
+struct rr_opt_hdr {
+	size_t len;
+	unsigned char *data;
+};
+
 #define IPC_ROUTER_HDR_SIZE sizeof(union rr_header)
+#define IPCR_WORD_SIZE 4
 
 /**
  * rr_packet - Router to Router packet structure
  * @list: Pointer to prev & next packets in a port's rx list.
  * @hdr: Header information extracted from or prepended to a packet.
+ * @opt_hdr: Optinal header information.
  * @pkt_fragment_q: Queue of SKBs containing payload.
  * @length: Length of data in the chain of SKBs
  */
 struct rr_packet {
 	struct list_head list;
 	struct rr_header_v1 hdr;
+	struct rr_opt_hdr opt_hdr;
 	struct sk_buff_head *pkt_fragment_q;
 	uint32_t length;
 };
@@ -128,11 +143,29 @@ void msm_ipc_router_xprt_notify(struct msm_ipc_router_xprt *xprt,
 				unsigned event,
 				void *data);
 
-
+/**
+ * create_pkt() - Create a Router packet
+ * @data: SKB queue to be contained inside the packet.
+ *
+ * @return: pointer to packet on success, NULL on failure.
+ */
+struct rr_packet *create_pkt(struct sk_buff_head *data);
 struct rr_packet *clone_pkt(struct rr_packet *pkt);
 void release_pkt(struct rr_packet *pkt);
 
-#if defined CONFIG_MSM_IPC_ROUTER_SMD_XPRT
+/**
+ * ipc_router_peek_pkt_size() - Peek into the packet header to get potential packet size
+ * @data: Starting address of the packet which points to router header.
+ *
+ * @returns: potential packet size on success, < 0 on error.
+ *
+ * This function is used by the underlying transport abstraction layer to
+ * peek into the potential packet size of an incoming packet. This information
+ * is used to perform link layer fragmentation and re-assembly
+ */
+int ipc_router_peek_pkt_size(char *data);
+
+#if defined CONFIG_MSM_IPC_ROUTER_SMD_XPRT || CONFIG_MSM_IPC_ROUTER_GLINK_XPRT
 extern void *msm_ipc_load_default_node(void);
 
 extern void msm_ipc_unload_default_node(void *pil);

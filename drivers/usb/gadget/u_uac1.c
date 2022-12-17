@@ -1,7 +1,7 @@
 /*
  * u_audio.c -- ALSA audio utilities for Gadget stack
  *
- * Copyright (c) 2012, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
  * Copyright (C) 2008 Bryan Wu <cooloney@kernel.org>
  * Copyright (C) 2008 Analog Devices, Inc
  *
@@ -44,6 +44,10 @@ MODULE_PARM_DESC(fn_cap, "Capture PCM device file name");
 static char *fn_cntl = FILE_CONTROL;
 module_param(fn_cntl, charp, S_IRUGO);
 MODULE_PARM_DESC(fn_cntl, "Control device file name");
+
+static unsigned sample_rate = 16000;
+module_param(sample_rate, uint, S_IRUGO|S_IWUSR);
+MODULE_PARM_DESC(sample_rate, "Sample rate for playback and capture");
 
 static struct gaudio *the_card;
 
@@ -144,18 +148,21 @@ static int playback_prepare_params(struct gaudio_snd_dev *snd)
 {
 	struct snd_pcm_substream *substream = snd->substream;
 	struct snd_pcm_hw_params *params;
+	struct snd_pcm_sw_params *swparams;
+	unsigned long period_size;
+	unsigned long buffer_size;
 	snd_pcm_sframes_t result;
 
        /*
 	* SNDRV_PCM_ACCESS_RW_INTERLEAVED,
 	* SNDRV_PCM_FORMAT_S16_LE
-	* CHANNELS: 2
-	* RATE: 8000
+	* CHANNELS: 1
+	* RATE: 16K default, user configurable
 	*/
 	snd->access = SNDRV_PCM_ACCESS_RW_INTERLEAVED;
 	snd->format = SNDRV_PCM_FORMAT_S16_LE;
-	snd->channels = 2;
-	snd->rate = 8000;
+	snd->channels = 1;
+	snd->rate = sample_rate;
 
 	params = kzalloc(sizeof(*params), GFP_KERNEL);
 	if (!params)
@@ -194,6 +201,31 @@ static int playback_prepare_params(struct gaudio_snd_dev *snd)
 	snd->channels = params_channels(params);
 	snd->rate = params_rate(params);
 
+	/* Set SW params */
+	swparams = kzalloc(sizeof(*swparams), GFP_KERNEL);
+	if (!swparams) {
+		pr_err("Failed to allocate sw params");
+		return -ENOMEM;
+	}
+
+	buffer_size = pcm_buffer_size(params);
+	period_size = pcm_period_size(params);
+	swparams->avail_min = period_size/2;
+	swparams->xfer_align = period_size/2;
+
+	swparams->tstamp_mode = SNDRV_PCM_TSTAMP_NONE;
+	swparams->period_step = 1;
+	swparams->start_threshold = 1;
+	swparams->stop_threshold = INT_MAX;
+	swparams->silence_size = 0;
+	swparams->silence_threshold = 0;
+
+	result = snd_pcm_kernel_ioctl(substream,
+				      SNDRV_PCM_IOCTL_SW_PARAMS, swparams);
+	if (result < 0)
+		pr_err("SNDRV_PCM_IOCTL_SW_PARAMS failed: %d\n", (int)result);
+	kfree(swparams);
+
 	kfree(params);
 
 	pr_debug("playback params: access %x, format %x, channels %d, rate %d\n",
@@ -216,12 +248,12 @@ static int capture_prepare_params(struct gaudio_snd_dev *snd)
 	 * SNDRV_PCM_ACCESS_RW_INTERLEAVED,
 	 * SNDRV_PCM_FORMAT_S16_LE
 	 * CHANNELS: 1
-	 * RATE: 8000
+	 * RATE: 16K default, user configurable
 	 */
 	snd->access = SNDRV_PCM_ACCESS_RW_INTERLEAVED;
 	snd->format = SNDRV_PCM_FORMAT_S16_LE;
 	snd->channels = 1;
-	snd->rate = 8000;
+	snd->rate = sample_rate;
 
 	params = kzalloc(sizeof(*params), GFP_KERNEL);
 	if (!params) {
@@ -264,8 +296,6 @@ static int capture_prepare_params(struct gaudio_snd_dev *snd)
 
 	runtime->frame_bits = snd_pcm_format_physical_width(runtime->format);
 
-	kfree(params);
-
 	swparams = kzalloc(sizeof(*swparams), GFP_KERNEL);
 	if (!swparams) {
 		pr_err("Failed to allocate sw params");
@@ -290,6 +320,7 @@ static int capture_prepare_params(struct gaudio_snd_dev *snd)
 		pr_err("SNDRV_PCM_IOCTL_SW_PARAMS failed: %d\n", (int)result);
 
 	kfree(swparams);
+	kfree(params);
 
 	pr_debug("capture params: access %x, format %x, channels %d, rate %d\n",
 		snd->access, snd->format, snd->channels, snd->rate);
@@ -307,13 +338,13 @@ static int playback_default_hw_params(struct gaudio_snd_dev *snd)
        /*
 	* SNDRV_PCM_ACCESS_RW_INTERLEAVED,
 	* SNDRV_PCM_FORMAT_S16_LE
-	* CHANNELS: 2
-	* RATE: 8000
+	* CHANNELS: 1
+	* RATE: 16K default, user configurable
 	*/
 	snd->access = SNDRV_PCM_ACCESS_RW_INTERLEAVED;
 	snd->format = SNDRV_PCM_FORMAT_S16_LE;
-	snd->channels = 2;
-	snd->rate = 8000;
+	snd->channels = 1;
+	snd->rate = sample_rate;
 
 	params = kzalloc(sizeof(*params), GFP_KERNEL);
 	if (!params)
@@ -351,12 +382,12 @@ static int capture_default_hw_params(struct gaudio_snd_dev *snd)
 	 * SNDRV_PCM_ACCESS_RW_INTERLEAVED,
 	 * SNDRV_PCM_FORMAT_S16_LE
 	 * CHANNELS: 1
-	 * RATE: 8000
+	 * RATE: 16K default, user configurable
 	 */
 	snd->access = SNDRV_PCM_ACCESS_RW_INTERLEAVED;
 	snd->format = SNDRV_PCM_FORMAT_S16_LE;
 	snd->channels = 1;
-	snd->rate = 8000;
+	snd->rate = sample_rate;
 
 	params = kzalloc(sizeof(*params), GFP_KERNEL);
 	if (!params)
@@ -528,7 +559,7 @@ try_again:
 	old_fs = get_fs();
 	set_fs(KERNEL_DS);
 
-	pr_debug("frames = %d, count = %d", (int)frames, count);
+	pr_debug("frames = %d, count = %zd", (int)frames, count);
 
 	result = snd_pcm_lib_read(substream, buf, frames);
 	if (result != frames) {

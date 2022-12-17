@@ -1,4 +1,4 @@
-/* Copyright (c) 2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2013-2016, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -148,7 +148,7 @@ static int q6_hfi_iface_eventq_read(struct q6_hfi_device *device, void *pkt)
 	struct q6_iface_q_info *q_info;
 	unsigned long flags = 0;
 
-	if (!pkt) {
+	if (!device || !pkt) {
 		dprintk(VIDC_ERR, "Invalid Params\n");
 		return -EINVAL;
 	}
@@ -202,7 +202,7 @@ static int q6_hfi_register_iommu_domains(struct q6_hfi_device *device)
 	struct iommu_info *iommu_map;
 
 	if (!device || !device->res) {
-		dprintk(VIDC_ERR, "Invalid parameter: %p\n", device);
+		dprintk(VIDC_ERR, "Invalid parameter: %pK\n", device);
 		return -EINVAL;
 	}
 
@@ -220,7 +220,7 @@ static int q6_hfi_register_iommu_domains(struct q6_hfi_device *device)
 		domain = iommu_group_get_iommudata(iommu_map->group);
 		if (IS_ERR_OR_NULL(domain)) {
 			dprintk(VIDC_ERR,
-					"Failed to get domain data for group %p\n",
+					"Failed to get domain data for group %pK\n",
 					iommu_map->group);
 			rc = -EINVAL;
 			goto fail_group;
@@ -228,7 +228,7 @@ static int q6_hfi_register_iommu_domains(struct q6_hfi_device *device)
 		iommu_map->domain = msm_find_domain_no(domain);
 		if (iommu_map->domain < 0) {
 			dprintk(VIDC_ERR,
-					"Failed to get domain index for domain %p\n",
+					"Failed to get domain index for domain %pK\n",
 					domain);
 			rc = -EINVAL;
 			goto fail_group;
@@ -254,7 +254,7 @@ static void q6_hfi_deregister_iommu_domains(struct q6_hfi_device *device)
 	int i = 0;
 
 	if (!device || !device->res) {
-		dprintk(VIDC_ERR, "Invalid parameter: %p\n", device);
+		dprintk(VIDC_ERR, "Invalid parameter: %pK\n", device);
 		return;
 	}
 
@@ -347,7 +347,7 @@ static void *q6_hfi_get_device(u32 device_id,
 	int rc = 0;
 
 	if (!callback) {
-		dprintk(VIDC_ERR, "%s Invalid params:  %p\n",
+		dprintk(VIDC_ERR, "%s Invalid params:  %pK\n",
 			__func__, callback);
 		return NULL;
 	}
@@ -364,6 +364,13 @@ static void *q6_hfi_get_device(u32 device_id,
 			dprintk(VIDC_ERR, "Failed to init resources: %d\n", rc);
 		goto err_fail_init_res;
 	}
+
+	device->pkt_ops = hfi_get_pkt_ops_handle(HFI_PACKETIZATION_LEGACY);
+	if (!device->pkt_ops) {
+		dprintk(VIDC_ERR, "Failed to get pkt_ops handle\n");
+		goto err_fail_init_res;
+	}
+
 	return device;
 
 err_fail_init_res:
@@ -510,7 +517,7 @@ static int q6_hfi_core_init(void *device)
 
 	q6_hfi_add_apr_hdr(dev, &apr.hdr, sizeof(apr));
 
-	rc = create_pkt_cmd_sys_init(&apr.pkt, HFI_VIDEO_ARCH_OX);
+	rc = call_hfi_pkt_op(dev, sys_init, &apr.pkt, HFI_VIDEO_ARCH_OX);
 	if (rc) {
 		dprintk(VIDC_ERR, "Failed to create sys init pkt\n");
 		goto err_core_init;
@@ -541,7 +548,7 @@ static int q6_hfi_core_release(void *device)
 	return 0;
 }
 
-static void *q6_hfi_session_init(void *device, u32 session_id,
+static void *q6_hfi_session_init(void *device, void *session_id,
 	enum hal_domain session_type, enum hal_video_codec codec_type)
 {
 	struct q6_apr_cmd_sys_session_init_packet apr;
@@ -556,7 +563,11 @@ static void *q6_hfi_session_init(void *device, u32 session_id,
 
 	new_session = (struct hal_session *)
 		kzalloc(sizeof(struct hal_session), GFP_KERNEL);
-	new_session->session_id = (u32) session_id;
+	if (!new_session) {
+		dprintk(VIDC_ERR, "new session fail: Out of memory\n");
+		return NULL;
+	}
+	new_session->session_id = session_id;
 	if (session_type == 1)
 		new_session->is_decoder = 0;
 	else if (session_type == 2)
@@ -565,8 +576,8 @@ static void *q6_hfi_session_init(void *device, u32 session_id,
 
 	q6_hfi_add_apr_hdr(dev, &apr.hdr, sizeof(apr));
 
-	if (create_pkt_cmd_sys_session_init(&apr.pkt, (u32)new_session,
-					session_type, codec_type)) {
+	if (call_hfi_pkt_op(dev, session_init,
+			&apr.pkt, new_session, session_type, codec_type)) {
 		dprintk(VIDC_ERR, "session_init: failed to create packet\n");
 		goto err_session_init;
 	}
@@ -615,7 +626,7 @@ static int q6_hal_send_session_cmd(void *sess,
 
 	q6_hfi_add_apr_hdr(dev, &apr.hdr, sizeof(apr));
 
-	rc = create_pkt_cmd_session_cmd(&apr.pkt, pkt_type, (u32)session);
+	rc = call_hfi_pkt_op(dev, session_cmd, &apr.pkt, pkt_type, session);
 	if (rc) {
 		dprintk(VIDC_ERR, "send session cmd: create pkt failed\n");
 		goto err_create_pkt;
@@ -652,7 +663,7 @@ static int q6_hfi_session_clean(void *session)
 		return -EINVAL;
 	}
 	sess_close = session;
-	dprintk(VIDC_DBG, "deleted the session: 0x%x\n",
+	dprintk(VIDC_DBG, "deleted the session: 0x%pK\n",
 			sess_close->session_id);
 	mutex_lock(&((struct q6_hfi_device *)
 			sess_close->device)->session_lock);
@@ -684,8 +695,9 @@ static int q6_hfi_session_set_buffers(void *sess,
 
 	q6_hfi_add_apr_hdr(dev, &apr->hdr, VIDC_IFACEQ_VAR_LARGE_PKT_SIZE);
 
-	rc = create_pkt_cmd_session_set_buffers(&apr->pkt,
-			(u32)session, buffer_info);
+
+	rc = call_hfi_pkt_op(dev, session_set_buffers,
+			&apr->pkt, session, buffer_info);
 	if (rc) {
 		dprintk(VIDC_ERR, "set buffers: failed to create packet\n");
 		goto err_create_pkt;
@@ -726,8 +738,8 @@ static int q6_hfi_session_release_buffers(void *sess,
 
 	q6_hfi_add_apr_hdr(dev, &apr->hdr, VIDC_IFACEQ_VAR_LARGE_PKT_SIZE);
 
-	rc = create_pkt_cmd_session_release_buffers(&apr->pkt,
-					(u32)session, buffer_info);
+	rc = call_hfi_pkt_op(dev, session_release_buffers,
+			&apr->pkt, session, buffer_info);
 	if (rc) {
 		dprintk(VIDC_ERR, "release buffers: failed to create packet\n");
 		goto err_create_pkt;
@@ -770,18 +782,6 @@ static int q6_hfi_session_stop(void *sess)
 		HFI_CMD_SESSION_STOP);
 }
 
-static int q6_hfi_session_suspend(void *sess)
-{
-	return q6_hal_send_session_cmd(sess,
-		HFI_CMD_SESSION_SUSPEND);
-}
-
-static int q6_hfi_session_resume(void *sess)
-{
-	return q6_hal_send_session_cmd(sess,
-		HFI_CMD_SESSION_RESUME);
-}
-
 static int q6_hfi_session_etb(void *sess,
 			struct vidc_frame_data *input_frame)
 {
@@ -800,16 +800,16 @@ static int q6_hfi_session_etb(void *sess,
 		struct q6_apr_cmd_session_empty_buffer_compressed_packet apr;
 		q6_hfi_add_apr_hdr(dev, &apr.hdr, sizeof(apr));
 
-		rc = create_pkt_cmd_session_etb_decoder(&apr.pkt,
-					(u32)session, input_frame);
+		rc = call_hfi_pkt_op(dev, session_etb_decoder,
+				&apr.pkt, session, input_frame);
 		if (rc) {
 			dprintk(VIDC_ERR,
 				"Session etb decoder: failed to create pkt\n");
 			goto err_create_pkt;
 		}
 		dprintk(VIDC_DBG, "Q DECODER INPUT BUFFER\n");
-		dprintk(VIDC_DBG, "addr = 0x%x ts = %lld\n",
-			input_frame->device_addr, input_frame->timestamp);
+		dprintk(VIDC_DBG, "addr = 0x%pa ts = %lld\n",
+			&input_frame->device_addr, input_frame->timestamp);
 		rc = apr_send_pkt(dev->apr, (uint32_t *)&apr);
 		if (rc != apr.hdr.pkt_size) {
 			dprintk(VIDC_ERR, "%s: apr_send_pkt failed rc: %d\n",
@@ -822,8 +822,8 @@ static int q6_hfi_session_etb(void *sess,
 		q6_apr_cmd_session_empty_buffer_uncompressed_plane0_packet apr;
 		q6_hfi_add_apr_hdr(dev, &apr.hdr, sizeof(apr));
 
-		rc =  create_pkt_cmd_session_etb_encoder(&apr.pkt,
-					(u32)session, input_frame);
+		rc = call_hfi_pkt_op(dev, session_etb_encoder,
+				&apr.pkt, session, input_frame);
 		if (rc) {
 			dprintk(VIDC_ERR,
 				"Session etb encoder: failed to create pkt\n");
@@ -858,7 +858,8 @@ static int q6_hfi_session_ftb(void *sess,
 
 	q6_hfi_add_apr_hdr(dev, &apr.hdr, sizeof(apr));
 
-	rc = create_pkt_cmd_session_ftb(&apr.pkt, (u32)session, output_frame);
+	rc = call_hfi_pkt_op(dev, session_ftb,
+			&apr.pkt, session, output_frame);
 	if (rc) {
 		dprintk(VIDC_ERR, "Session ftb: failed to create pkt\n");
 		goto err_create_pkt;
@@ -895,8 +896,8 @@ static int q6_hfi_session_parse_seq_hdr(void *sess,
 
 	q6_hfi_add_apr_hdr(dev, &apr->hdr, VIDC_IFACEQ_VAR_SMALL_PKT_SIZE);
 
-	rc = create_pkt_cmd_session_parse_seq_header(&apr->pkt,
-					(u32)session, seq_hdr);
+	rc = call_hfi_pkt_op(dev, session_parse_seq_header,
+			&apr->pkt, session, seq_hdr);
 	if (rc) {
 		dprintk(VIDC_ERR,
 			"Session parse seq hdr: failed to create pkt\n");
@@ -933,8 +934,8 @@ static int q6_hfi_session_get_seq_hdr(void *sess,
 
 	q6_hfi_add_apr_hdr(dev, &apr->hdr, VIDC_IFACEQ_VAR_SMALL_PKT_SIZE);
 
-	rc = create_pkt_cmd_session_get_seq_hdr(&apr->pkt, (u32)session,
-						seq_hdr);
+	rc = call_hfi_pkt_op(dev, session_get_seq_hdr,
+			&apr->pkt, session, seq_hdr);
 	if (rc) {
 		dprintk(VIDC_ERR, "Session get seqhdr: failed to create pkt\n");
 		goto err_create_pkt;
@@ -967,7 +968,8 @@ static int q6_hfi_session_get_buf_req(void *sess)
 
 	q6_hfi_add_apr_hdr(dev, &apr.hdr, sizeof(apr));
 
-	rc = create_pkt_cmd_session_get_buf_req(&apr.pkt, (u32)session);
+	rc = call_hfi_pkt_op(dev, session_get_buf_req,
+			&apr.pkt, session);
 	if (rc) {
 		dprintk(VIDC_ERR, "Session get bufreq: failed to create pkt\n");
 		goto err_create_pkt;
@@ -999,7 +1001,8 @@ static int q6_hfi_session_flush(void *sess, enum hal_flush flush_mode)
 
 	q6_hfi_add_apr_hdr(dev, &apr.hdr, sizeof(apr));
 
-	rc = create_pkt_cmd_session_flush(&apr.pkt, (u32)session, flush_mode);
+	rc = call_hfi_pkt_op(dev, session_flush,
+			&apr.pkt, session, flush_mode);
 	if (rc) {
 		dprintk(VIDC_ERR, "Session flush: failed to create pkt\n");
 		goto err_create_pkt;
@@ -1031,13 +1034,18 @@ static int q6_hfi_session_set_property(void *sess,
 		dprintk(VIDC_ERR, "Invalid Params\n");
 		return -EINVAL;
 	}
+	if (ptype == HAL_PARAM_VDEC_CONTINUE_DATA_TRANSFER) {
+		dprintk(VIDC_WARN, "Smoothstreaming is not supported\n");
+		return -ENOTSUPP;
+	}
+
 	dev = session->device;
 	dprintk(VIDC_DBG, "in set_prop,with prop id: 0x%x\n", ptype);
 
 	q6_hfi_add_apr_hdr(dev, &apr->hdr, VIDC_IFACEQ_VAR_LARGE_PKT_SIZE);
 
-	rc = create_pkt_cmd_session_set_property(&apr->pkt,
-				(u32)session, ptype, pdata);
+	rc = call_hfi_pkt_op(dev, session_set_property,
+			&apr->pkt, session, ptype, pdata);
 	if (rc) {
 		dprintk(VIDC_ERR, "set property: failed to create packet\n");
 		goto err_create_pkt;
@@ -1179,14 +1187,6 @@ static int q6_hfi_session_get_property(void *sess,
 	return 0;
 }
 
-static int q6_hfi_unset_ocmem(void *dev)
-{
-	(void)dev;
-
-	/* Q6 does not support ocmem */
-	return -EINVAL;
-}
-
 static int q6_hfi_iommu_get_domain_partition(void *dev, u32 flags,
 	u32 buffer_type, int *domain, int *partition)
 {
@@ -1207,7 +1207,7 @@ static int q6_hfi_iommu_attach(struct q6_hfi_device *device)
 	struct iommu_info *iommu_map;
 
 	if (!device || !device->res) {
-		dprintk(VIDC_ERR, "Invalid parameter: %p\n", device);
+		dprintk(VIDC_ERR, "Invalid parameter: %pK\n", device);
 		return -EINVAL;
 	}
 
@@ -1219,10 +1219,10 @@ static int q6_hfi_iommu_attach(struct q6_hfi_device *device)
 		if (IS_ERR_OR_NULL(domain)) {
 			dprintk(VIDC_ERR, "Failed to get domain: %s\n",
 					iommu_map->name);
-			rc = IS_ERR(domain) ? PTR_ERR(domain) : -EINVAL;
+			rc = PTR_ERR(domain) ?: -EINVAL;
 			break;
 		}
-		dprintk(VIDC_DBG, "Attaching domain(id:%d) %p to group %p\n",
+		dprintk(VIDC_DBG, "Attaching domain(id:%d) %pK to group %pK\n",
 				iommu_map->domain, domain, group);
 		rc = iommu_attach_group(domain, group);
 		if (rc) {
@@ -1253,7 +1253,7 @@ static void q6_hfi_iommu_detach(struct q6_hfi_device *device)
 	int i;
 
 	if (!device || !device->res) {
-		dprintk(VIDC_ERR, "Invalid parameter: %p\n", device);
+		dprintk(VIDC_ERR, "Invalid parameter: %pK\n", device);
 		return;
 	}
 
@@ -1275,6 +1275,7 @@ static int q6_hfi_load_fw(void *dev)
 	if (!device)
 		return -EINVAL;
 
+	trace_msm_v4l2_vidc_fw_load_start("msm_v4l2_vidc adsp_fw load start");
 	if (!device->resources.fw.cookie)
 		device->resources.fw.cookie = subsystem_get("adsp");
 
@@ -1304,6 +1305,7 @@ static int q6_hfi_load_fw(void *dev)
 		goto fail_iommu_attach;
 	}
 
+	trace_msm_v4l2_vidc_fw_load_end("msm_v4l2_vidc adsp_fw load end");
 	return rc;
 
 fail_iommu_attach:
@@ -1313,6 +1315,7 @@ fail_apr_register:
 	subsystem_put(device->resources.fw.cookie);
 	device->resources.fw.cookie = NULL;
 fail_subsystem_get:
+	trace_msm_v4l2_vidc_fw_load_end("msm_v4l2_vidc adsp_fw load end");
 	return rc;
 }
 
@@ -1357,8 +1360,6 @@ static void q6_init_hfi_callbacks(struct hfi_device *hdev)
 	hdev->session_release_res = q6_hfi_session_release_res;
 	hdev->session_start = q6_hfi_session_start;
 	hdev->session_stop = q6_hfi_session_stop;
-	hdev->session_suspend = q6_hfi_session_suspend;
-	hdev->session_resume = q6_hfi_session_resume;
 	hdev->session_etb = q6_hfi_session_etb;
 	hdev->session_ftb = q6_hfi_session_ftb;
 	hdev->session_parse_seq_hdr = q6_hfi_session_parse_seq_hdr;
@@ -1367,7 +1368,6 @@ static void q6_init_hfi_callbacks(struct hfi_device *hdev)
 	hdev->session_flush = q6_hfi_session_flush;
 	hdev->session_set_property = q6_hfi_session_set_property;
 	hdev->session_get_property = q6_hfi_session_get_property;
-	hdev->unset_ocmem = q6_hfi_unset_ocmem;
 	hdev->iommu_get_domain_partition = q6_hfi_iommu_get_domain_partition;
 	hdev->load_fw = q6_hfi_load_fw;
 	hdev->unload_fw = q6_hfi_unload_fw;
@@ -1382,7 +1382,7 @@ int q6_hfi_initialize(struct hfi_device *hdev, u32 device_id,
 	int rc = 0;
 
 	if (!hdev || !res || !callback) {
-		dprintk(VIDC_ERR, "Invalid params: %p %p %p\n",
+		dprintk(VIDC_ERR, "Invalid params: %pK %pK %pK\n",
 				hdev, res, callback);
 		rc = -EINVAL;
 		goto err_hfi_init;
@@ -1390,8 +1390,7 @@ int q6_hfi_initialize(struct hfi_device *hdev, u32 device_id,
 	hdev->hfi_device_data = q6_hfi_get_device(device_id, res, callback);
 
 	if (IS_ERR_OR_NULL(hdev->hfi_device_data)) {
-		rc = PTR_ERR(hdev->hfi_device_data);
-		rc = !rc ? -EINVAL : rc;
+		rc = PTR_ERR(hdev->hfi_device_data) ?: -EINVAL;
 		goto err_hfi_init;
 	}
 

@@ -15,12 +15,6 @@
 		serial0 = &blsp2_uart1;
 	};
 
-	memory {
-		fb_mem: fb_region@0 {
-			reg = <0 0 0 0x4400000>;
-		};
-	};
-
 	bt_qca6174 {
 		compatible = "qca,qca6174";
 		qca,bt-reset-gpio = <&pma8084_gpios 4 0>; /* BT_EN */
@@ -66,6 +60,20 @@
 		qcom,cdc-micbias2-headset-only;
 	};
 
+	gpio_keys {
+		compatible = "gpio-keys";
+		input-name = "gpio-keys";
+
+		vol_up {
+			label = "volume_up";
+			gpios = <&pma8084_gpios 2 0x1>;
+			linux,input-type = <1>;
+			linux,code = <115>;
+			gpio-key,wakeup;
+			debounce-interval = <15>;
+		};
+	};
+
 	gnss_qca1530: qca,qca1530@0 {
 		compatible = "qca,qca1530";
 		qca,reset-gpio = <&msmgpio 128 0>;
@@ -108,7 +116,7 @@
 	qcom,rx-gpio = <&msmgpio 44 0x00>;
 	qcom,cts-gpio = <&msmgpio 45 0x00>;
 	qcom,rfr-gpio = <&msmgpio 46 0x00>;
-	qcom,inject-rx-on-wakeup = <1>;
+	qcom,inject-rx-on-wakeup;
 	qcom,rx-char-to-inject = <0xFD>;
 };
 
@@ -129,6 +137,7 @@
 
 &blsp2_uart4 {
 	status = "ok";
+	qcom,no-suspend-delay;
 	qcom,config-gpio = <2>;
 	qcom,tx-gpio = <&msmgpio 112 0>;
 	qcom,rx-gpio = <&msmgpio 113 0>;
@@ -148,6 +157,10 @@
 
 &i2c_2 {
 	status = "disabled";
+};
+
+&xhci_hsic_host {
+   status = "disabled";
 };
 
 &ufsphy1 {
@@ -226,10 +239,9 @@
 	qcom,vdd-io-voltage-level = <1800000 1800000>;
 	qcom,vdd-io-current-level = <200 154000>;
 
-	qcom,pad-pull-on = <0x0 0x3 0x3 0x1>; /* no-pull, pull-up, pull-up, pull-down */
-	qcom,pad-pull-off = <0x0 0x3 0x3 0x1>; /* no-pull, pull-up, pull-up, pull-down */
-	qcom,pad-drv-on = <0x7 0x4 0x4>; /* 16mA, 10mA, 10mA */
-	qcom,pad-drv-off = <0x0 0x0 0x0>; /* 2mA, 2mA, 2mA */
+	pinctrl-names = "active", "sleep";
+	pinctrl-0 = <&sdc1_clk_on &sdc1_cmd_on &sdc1_data_on &sdc1_rclk_on>;
+	pinctrl-1 = <&sdc1_clk_off &sdc1_cmd_off &sdc1_data_off &sdc1_rclk_off>;
 
 	qcom,clk-rates = <400000 20000000 25000000 50000000 100000000 192000000 384000000>;
 	qcom,nonremovable;
@@ -246,10 +258,9 @@
 	qcom,vdd-io-voltage-level = <1800000 2950000>;
 	qcom,vdd-io-current-level = <200 22000>;
 
-	qcom,pad-pull-on = <0x0 0x3 0x3>; /* no-pull, pull-up, pull-up */
-	qcom,pad-pull-off = <0x0 0x3 0x3>; /* no-pull, pull-up, pull-up */
-	qcom,pad-drv-on = <0x7 0x4 0x4>; /* 16mA, 10mA, 10mA */
-	qcom,pad-drv-off = <0x0 0x0 0x0>; /* 2mA, 2mA, 2mA */
+	pinctrl-names = "active", "sleep";
+	pinctrl-0 = <&sdc2_clk_on &sdc2_cmd_on &sdc2_data_on &sdhc2_cd_on>;
+	pinctrl-1 = <&sdc2_clk_off &sdc2_cmd_off &sdc2_data_off &sdhc2_cd_off>;
 
 	qcom,clk-rates = <400000 20000000 25000000 50000000 100000000 200000000>;
 	qcom,bus-speed-mode = "SDR12", "SDR25", "SDR50", "DDR50", "SDR104";
@@ -297,10 +308,6 @@
 };
 
 &hsphy1 {
-	status = "ok";
-};
-
-&ssphy1 {
 	status = "ok";
 };
 
@@ -440,7 +447,7 @@
 
 	gpio@d300 { /* GPIO 20 */
 		/* LED2 */
-		qcom,mode = <1>;		        /* Digital output */
+		qcom,mode = <1>;		/* Digital output */
 		qcom,output-type = <0>;		/* CMOS logic */
 		qcom,pull = <4>;                /* Pull down */
 		qcom,invert = <0>;		/* Do not invert the output */
@@ -487,13 +494,6 @@
 	status = "disabled";
 };
 
-&pma8084_l17 {
-	status = "ok";
-	regulator-min-microvolt = <2850000>;
-	regulator-max-microvolt = <2850000>;
-	qcom,init-voltage = <2850000>;
-};
-
 &hdmi_vreg {
 	status = "disabled";
 };
@@ -517,15 +517,16 @@
 			reg = <0xc900 0x100>;
 			status = "okay";
 			qcom,led_gpio_10 {
-				label = "mpp";
+				label = "gpio";
 				linux,name = "led:notification";
+				qcom,max-current = <40>;
+				qcom,id = <8>;
 				linux,default-trigger = "notification";
 				qcom,default-state = "on";
-				qcom,max-current = <40>;
-				qcom,id = <6>;
+				qcom,turn-off-delay-ms = <1000>;
 				qcom,source-sel = <1>;
-				qcom,mode-ctrl = <0x60>;
-				qcom,mode = "manual";
+				qcom,mode-ctrl = <0x10>;
+				qcom,vin-ctrl = <0x02>;
 			};
 		};
 	};

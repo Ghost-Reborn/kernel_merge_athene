@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -14,7 +14,7 @@
 #include <linux/module.h>
 #include <linux/kthread.h>
 #include <linux/vmalloc.h>
-#include <mach/msm_tspp.h>
+#include <linux/qcom_tspp.h>
 #include "mpq_dvb_debug.h"
 #include "mpq_dmx_plugin_common.h"
 
@@ -112,6 +112,9 @@ static struct
 
 		/* Counter for data notifications on the pipe */
 		atomic_t data_cnt;
+
+		/* flag to indicate control operation is in progress */
+		atomic_t control_op;
 
 		/* ION handle used for TSPP data buffer allocation */
 		struct ion_handle *ch_mem_heap_handle;
@@ -369,25 +372,15 @@ static void mpq_dmx_tspp_aggregated_process(int tsif, int channel_id)
 	buff_start_addr_phys =
 		mpq_dmx_tspp_info.tsif[tsif].ch_mem_heap_phys_base;
 
-	/*
-	 * NOTE: the following casting to u32 must be done
-	 * as long as TZ does not support LPAE. Once TZ supports
-	 * LPAE SDMX interface needs to be updated accordingly.
-	 */
-	if (buff_start_addr_phys > 0xFFFFFFFF)
-		MPQ_DVB_ERR_PRINT(
-			"%s: WARNNING - physical address %pa is larger than 32bits!\n",
-			__func__, &buff_start_addr_phys);
-
-	input.base_addr = (void *)(u32)buff_start_addr_phys;
+	input.base_addr = (u64)buff_start_addr_phys;
 	input.size = mpq_dmx_tspp_info.tsif[tsif].buffer_count *
 		TSPP_DESCRIPTOR_SIZE;
 
 	if (mpq_sdmx_is_loaded() && mpq_demux->sdmx_filter_count) {
 		MPQ_DVB_DBG_PRINT(
-			"%s: SDMX Processing %d descriptors: %d bytes at start address 0x%x, read offset %d\n",
+			"%s: SDMX Processing %zu descriptors: %zu bytes at start address 0x%llx, read offset %d\n",
 			__func__, aggregate_count, aggregate_len,
-			(unsigned int)input.base_addr,
+			input.base_addr,
 			(int)(buff_current_addr_phys - buff_start_addr_phys));
 
 		mpq_sdmx_process(mpq_demux, &input, aggregate_len,
@@ -408,7 +401,7 @@ static void mpq_dmx_tspp_aggregated_process(int tsif, int channel_id)
  */
 static int mpq_dmx_tspp_thread(void *arg)
 {
-	int tsif = (int)arg;
+	int tsif = (int)(uintptr_t)arg;
 	struct mpq_demux *mpq_demux;
 	const struct tspp_data_descriptor *tspp_data_desc;
 	atomic_t *data_cnt;
@@ -420,8 +413,9 @@ static int mpq_dmx_tspp_thread(void *arg)
 	do {
 		ret = wait_event_interruptible(
 			mpq_dmx_tspp_info.tsif[tsif].wait_queue,
-			atomic_read(&mpq_dmx_tspp_info.tsif[tsif].data_cnt) ||
-			kthread_should_stop());
+			(atomic_read(&mpq_dmx_tspp_info.tsif[tsif].data_cnt) &&
+			!atomic_read(&mpq_dmx_tspp_info.tsif[tsif].control_op))
+			|| kthread_should_stop());
 
 		if ((ret < 0) || kthread_should_stop()) {
 			MPQ_DVB_ERR_PRINT("%s: exit\n", __func__);
@@ -500,7 +494,7 @@ static int mpq_dmx_tspp_thread(void *arg)
  */
 static void mpq_tspp_callback(int channel_id, void *user)
 {
-	int tsif = (int)user;
+	int tsif = (int)(uintptr_t)user;
 	struct mpq_demux *mpq_demux;
 
 	/* Save statistics on TSPP notifications */
@@ -973,8 +967,11 @@ static int mpq_tspp_dmx_add_channel(struct dvb_demux_feed *feed)
 		return -EINVAL;
 	}
 
-	if (mutex_lock_interruptible(&mpq_dmx_tspp_info.tsif[tsif].mutex))
+	atomic_inc(&mpq_dmx_tspp_info.tsif[tsif].control_op);
+	if (mutex_lock_interruptible(&mpq_dmx_tspp_info.tsif[tsif].mutex)) {
+		atomic_dec(&mpq_dmx_tspp_info.tsif[tsif].control_op);
 		return -ERESTARTSYS;
+	}
 
 	/*
 	 * It is possible that this PID was already requested before.
@@ -985,8 +982,7 @@ static int mpq_tspp_dmx_add_channel(struct dvb_demux_feed *feed)
 	if (slot >= 0) {
 		/* PID already configured */
 		mpq_dmx_tspp_info.tsif[tsif].filters[slot].ref_count++;
-		mutex_unlock(&mpq_dmx_tspp_info.tsif[tsif].mutex);
-		return 0;
+		goto out;
 	}
 
 	channel_id = TSPP_CHANNEL_ID(tsif, TSPP_CHANNEL);
@@ -1036,7 +1032,7 @@ static int mpq_tspp_dmx_add_channel(struct dvb_demux_feed *feed)
 		tspp_register_notification(0,
 					   channel_id,
 					   mpq_tspp_callback,
-					   (void *)tsif,
+					   (void *)(uintptr_t)tsif,
 					   tspp_channel_timeout);
 
 		/* register allocator and provide allocation function
@@ -1215,8 +1211,7 @@ static int mpq_tspp_dmx_add_channel(struct dvb_demux_feed *feed)
 	MPQ_DVB_DBG_PRINT("%s: success, current_filter_count = %d\n",
 		__func__, mpq_dmx_tspp_info.tsif[tsif].current_filter_count);
 
-	mutex_unlock(&mpq_dmx_tspp_info.tsif[tsif].mutex);
-	return 0;
+	goto out;
 
 add_channel_free_filter_slot:
 	/* restore internal database state */
@@ -1260,7 +1255,9 @@ add_channel_failed:
 		if (allocation_mode == MPQ_DMX_TSPP_CONTIGUOUS_PHYS_ALLOC)
 			mpq_dmx_channel_mem_free(tsif);
 
+out:
 	mutex_unlock(&mpq_dmx_tspp_info.tsif[tsif].mutex);
+	atomic_dec(&mpq_dmx_tspp_info.tsif[tsif].control_op);
 	return ret;
 }
 
@@ -1277,7 +1274,7 @@ add_channel_failed:
 static int mpq_tspp_dmx_remove_channel(struct dvb_demux_feed *feed)
 {
 	int tsif;
-	int ret;
+	int ret = 0;
 	int channel_id;
 	int slot;
 	atomic_t *data_cnt;
@@ -1309,8 +1306,11 @@ static int mpq_tspp_dmx_remove_channel(struct dvb_demux_feed *feed)
 		return -EINVAL;
 	}
 
-	if (mutex_lock_interruptible(&mpq_dmx_tspp_info.tsif[tsif].mutex))
+	atomic_inc(&mpq_dmx_tspp_info.tsif[tsif].control_op);
+	if (mutex_lock_interruptible(&mpq_dmx_tspp_info.tsif[tsif].mutex)) {
+		atomic_dec(&mpq_dmx_tspp_info.tsif[tsif].control_op);
 		return -ERESTARTSYS;
+	}
 
 	channel_id = TSPP_CHANNEL_ID(tsif, TSPP_CHANNEL);
 	channel_ref_count = &mpq_dmx_tspp_info.tsif[tsif].channel_ref;
@@ -1325,7 +1325,7 @@ static int mpq_tspp_dmx_remove_channel(struct dvb_demux_feed *feed)
 			channel_id);
 
 		ret = -EINVAL;
-		goto remove_channel_failed;
+		goto out;
 	}
 
 	slot = mpq_tspp_get_filter_slot(tsif, feed->pid);
@@ -1339,7 +1339,7 @@ static int mpq_tspp_dmx_remove_channel(struct dvb_demux_feed *feed)
 			tsif);
 
 		ret = -EINVAL;
-		goto remove_channel_failed;
+		goto out;
 	}
 
 	/* since filter was found, ref_count > 0 so it's ok to decrement it */
@@ -1350,8 +1350,7 @@ static int mpq_tspp_dmx_remove_channel(struct dvb_demux_feed *feed)
 		 * there are still references to this pid, do not
 		 * remove the filter yet
 		 */
-		mutex_unlock(&mpq_dmx_tspp_info.tsif[tsif].mutex);
-		return 0;
+		goto out;
 	}
 
 	if (feed->pid == TSPP_PASS_THROUGH_PID)
@@ -1479,8 +1478,7 @@ static int mpq_tspp_dmx_remove_channel(struct dvb_demux_feed *feed)
 			mpq_dmx_channel_mem_free(tsif);
 	}
 
-	mutex_unlock(&mpq_dmx_tspp_info.tsif[tsif].mutex);
-	return 0;
+	goto out;
 
 remove_channel_failed_restore_count:
 	/* restore internal database state */
@@ -1502,8 +1500,9 @@ remove_channel_failed_restore_count:
 	else if (feed->pid == TSPP_NULL_PACKETS_PID)
 		mpq_dmx_tspp_info.tsif[tsif].pass_nulls_flag = 1;
 
-remove_channel_failed:
+out:
 	mutex_unlock(&mpq_dmx_tspp_info.tsif[tsif].mutex);
+	atomic_dec(&mpq_dmx_tspp_info.tsif[tsif].control_op);
 	return ret;
 }
 
@@ -1623,7 +1622,8 @@ static int mpq_tspp_dmx_get_caps(struct dmx_demux *demux,
 	}
 
 	caps->caps = DMX_CAP_PULL_MODE | DMX_CAP_VIDEO_DECODER_DATA |
-		DMX_CAP_TS_INSERTION | DMX_CAP_VIDEO_INDEXING;
+		DMX_CAP_TS_INSERTION | DMX_CAP_VIDEO_INDEXING |
+		DMX_CAP_AUTO_BUFFER_FLUSH;
 	caps->recording_max_video_pids_indexed = 0;
 	caps->num_decoders = MPQ_ADAPTER_MAX_NUM_OF_INTERFACES;
 	caps->num_demux_devices = CONFIG_DVB_MPQ_NUM_DMX_DEVICES;
@@ -1769,6 +1769,7 @@ static int mpq_tspp_dmx_init(
 	mpq_demux->demux.set_cipher_op = mpq_dmx_set_cipher_ops;
 	mpq_demux->demux.oob_command = mpq_dmx_oob_command;
 	mpq_demux->demux.convert_ts = mpq_dmx_convert_tts;
+	mpq_demux->demux.flush_decoder_buffer = NULL;
 
 	/* Initialize dvb_demux object */
 	result = dvb_dmx_init(&mpq_demux->demux);
@@ -1844,6 +1845,7 @@ static int __init mpq_dmx_tspp_plugin_init(void)
 		mpq_dmx_tspp_info.tsif[i].ch_mem_heap_virt_base = NULL;
 		mpq_dmx_tspp_info.tsif[i].ch_mem_heap_phys_base = 0;
 		atomic_set(&mpq_dmx_tspp_info.tsif[i].data_cnt, 0);
+		atomic_set(&mpq_dmx_tspp_info.tsif[i].control_op, 0);
 
 		for (j = 0; j < TSPP_MAX_PID_FILTER_NUM; j++) {
 			mpq_dmx_tspp_info.tsif[i].filters[j].pid = -1;
@@ -1867,7 +1869,7 @@ static int __init mpq_dmx_tspp_plugin_init(void)
 		init_waitqueue_head(&mpq_dmx_tspp_info.tsif[i].wait_queue);
 		mpq_dmx_tspp_info.tsif[i].thread =
 			kthread_run(
-				mpq_dmx_tspp_thread, (void *)i,
+				mpq_dmx_tspp_thread, (void *)(uintptr_t)i,
 				mpq_dmx_tspp_info.tsif[i].name);
 
 		if (IS_ERR(mpq_dmx_tspp_info.tsif[i].thread)) {

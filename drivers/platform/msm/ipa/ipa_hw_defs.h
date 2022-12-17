@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2014, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -17,23 +17,29 @@
 /* This header defines various HW related data types */
 
 /* immediate command op-codes */
-#define IPA_DECIPH_INIT        (1)
-#define IPA_PPP_FRM_INIT       (2)
-#define IPA_IP_V4_FILTER_INIT  (3)
-#define IPA_IP_V6_FILTER_INIT  (4)
-#define IPA_IP_V4_NAT_INIT     (5)
-#define IPA_IP_V6_NAT_INIT     (6)
-#define IPA_IP_V4_ROUTING_INIT (7)
-#define IPA_IP_V6_ROUTING_INIT (8)
-#define IPA_HDR_INIT_LOCAL     (9)
-#define IPA_HDR_INIT_SYSTEM   (10)
-#define IPA_DECIPH_SETUP      (11)
-#define IPA_INSERT_NAT_RULE   (12)
-#define IPA_DELETE_NAT_RULE   (13)
-#define IPA_NAT_DMA           (14)
-#define IPA_IP_PACKET_TAG     (15)
-#define IPA_IP_PACKET_INIT    (16)
-#define IPA_DMA_SHARED_MEM    (19)
+#define IPA_DECIPH_INIT           (1)
+#define IPA_PPP_FRM_INIT          (2)
+#define IPA_IP_V4_FILTER_INIT     (3)
+#define IPA_IP_V6_FILTER_INIT     (4)
+#define IPA_IP_V4_NAT_INIT        (5)
+#define IPA_IP_V6_NAT_INIT        (6)
+#define IPA_IP_V4_ROUTING_INIT    (7)
+#define IPA_IP_V6_ROUTING_INIT    (8)
+#define IPA_HDR_INIT_LOCAL        (9)
+#define IPA_HDR_INIT_SYSTEM      (10)
+#define IPA_DECIPH_SETUP         (11)
+#define IPA_REGISTER_WRITE       (12)
+#define IPA_NAT_DMA              (14)
+#define IPA_IP_PACKET_TAG        (15)
+#define IPA_IP_PACKET_INIT       (16)
+#define IPA_DMA_SHARED_MEM       (19)
+#define IPA_IP_PACKET_TAG_STATUS (20)
+
+/* Processing context TLV type */
+#define IPA_PROC_CTX_TLV_TYPE_END 0
+#define IPA_PROC_CTX_TLV_TYPE_HDR_ADD 1
+#define IPA_PROC_CTX_TLV_TYPE_PROC_CMD 3
+
 
 /**
  * struct ipa_flt_rule_hw_hdr - HW header of IPA filter rule
@@ -72,6 +78,8 @@ struct ipa_flt_rule_hw_hdr {
  * @pipe_dest_idx: destination pipe index
  * @system: changed from local to system due to HW change
  * @hdr_offset: header offset
+ * @proc_ctx: whether hdr_offset points to header table or to
+ *	header processing context table
  */
 struct ipa_rt_rule_hw_hdr {
 	union {
@@ -82,6 +90,13 @@ struct ipa_rt_rule_hw_hdr {
 			u32 system:1;
 			u32 hdr_offset:10;
 		} hdr;
+		struct {
+			u32 en_rule:16;
+			u32 pipe_dest_idx:5;
+			u32 system:1;
+			u32 hdr_offset:9;
+			u32 proc_ctx:1;
+		} hdr_v2_5;
 	} u;
 };
 
@@ -163,6 +178,40 @@ struct ipa_hdr_init_system {
 	u64 rsvd:32;
 };
 
+/**
+ * struct ipa_hdr_proc_ctx_tlv -
+ * HW structure of IPA processing context header - TLV part
+ * @type: 0 - end type
+ *        1 - header addition type
+ *        3 - processing command type
+ * @length: number of bytes after tlv
+ *        for type:
+ *        0 - needs to be 0
+ *        1 - header addition length
+ *        3 - number of 32B including type and length.
+ * @value: specific value for type
+ *        for type:
+ *        0 - needs to be 0
+ *        1 - header length
+ *        3 - command ID (see IPA_HDR_UCP_* definitions)
+ */
+struct ipa_hdr_proc_ctx_tlv {
+	u32 type:8;
+	u32 length:8;
+	u32 value:16;
+};
+
+/**
+ * struct ipa_hdr_proc_ctx_hdr_add -
+ * HW structure of IPA processing context - add header tlv
+ * @tlv: IPA processing context TLV
+ * @hdr_addr: processing context header address
+ */
+struct ipa_hdr_proc_ctx_hdr_add {
+	struct ipa_hdr_proc_ctx_tlv tlv;
+	u32 hdr_addr;
+};
+
 #define IPA_A5_MUX_HDR_EXCP_FLAG_IP		BIT(7)
 #define IPA_A5_MUX_HDR_EXCP_FLAG_NAT		BIT(6)
 #define IPA_A5_MUX_HDR_EXCP_FLAG_SW_FLT	BIT(5)
@@ -185,6 +234,22 @@ struct ipa_a5_mux_hdr {
 	u8 src_pipe_index;
 	u8 flags;
 	u32 metadata;
+};
+
+/**
+ * struct ipa_register_write - IPA_REGISTER_WRITE command payload
+ * @rsvd: reserved
+ * @skip_pipeline_clear: 0 to wait until IPA pipeline is clear
+ * @offset: offset from IPA base address
+ * @value: value to write to register
+ * @value_mask: mask specifying which value bits to write to the register
+ */
+struct ipa_register_write {
+	u32 rsvd:15;
+	u32 skip_pipeline_clear:1;
+	u32 offset:16;
+	u32 value:32;
+	u32 value_mask:32;
 };
 
 /**
@@ -262,7 +327,19 @@ struct ipa_ip_packet_tag {
 	u32 tag;
 };
 
-/*! @brief Struct for the the IPA UL packet status header */
+/**
+ * struct ipa_ip_packet_tag_status - IPA_IP_PACKET_TAG_STATUS command payload
+ * @rsvd: reserved
+ * @tag_f_1: tag value returned within status
+ * @tag_f_2: tag value returned within status
+ */
+struct ipa_ip_packet_tag_status {
+	u32 rsvd:16;
+	u32 tag_f_1:16;
+	u32 tag_f_2:32;
+};
+
+/*! @brief Struct for the IPAv2.0 and IPAv2.5 UL packet status header */
 struct ipa_hw_pkt_status {
 	u32 status_opcode:8;
 	u32 exception:8;
@@ -273,14 +350,29 @@ struct ipa_hw_pkt_status {
 	u32 endp_dest_idx:5;
 	u32 reserved_2:3;
 	u32 metadata:32;
-	u32 filt_local:1;
-	u32 filt_global:1;
-	u32 filt_pipe_idx:5;
-	u32 filt_match:1;
-	u32 filt_rule_idx:6;
-	u32 ret_hdr:1;
-	u32 reserved_3:1;
-	u32 tag_f_1:16;
+	union {
+		struct {
+			u32 filt_local:1;
+			u32 filt_global:1;
+			u32 filt_pipe_idx:5;
+			u32 filt_match:1;
+			u32 filt_rule_idx:6;
+			u32 ret_hdr:1;
+			u32 reserved_3:1;
+			u32 tag_f_1:16;
+
+		} ipa_hw_v2_0_pkt_status;
+		struct {
+			u32 filt_local:1;
+			u32 filt_global:1;
+			u32 filt_pipe_idx:5;
+			u32 ret_hdr:1;
+			u32 filt_rule_idx:8;
+			u32 tag_f_1:16;
+
+		} ipa_hw_v2_5_pkt_status;
+	};
+
 	u32 tag_f_2:32;
 	u32 time_day_ctr:32;
 	u32 nat_hit:1;
@@ -289,16 +381,16 @@ struct ipa_hw_pkt_status {
 	u32 route_local:1;
 	u32 route_tbl_idx:5;
 	u32 route_match:1;
-	u32 reserved_4:1;
+	u32 ucp:1;
 	u32 route_rule_idx:8;
 	u32 hdr_local:1;
 	u32 hdr_offset:10;
 	u32 frag_hit:1;
 	u32 frag_rule:4;
-	u32 reserved_5:16;
+	u32 reserved_4:16;
 };
 
-#define IPA_PKT_STATUS_SIZE sizeof(struct ipa_hw_pkt_status)
+#define IPA_PKT_STATUS_SIZE 32
 
 /*! @brief Status header opcodes */
 enum ipa_hw_status_opcode {
@@ -306,6 +398,8 @@ enum ipa_hw_status_opcode {
 	IPA_HW_STATUS_OPCODE_PACKET = IPA_HW_STATUS_OPCODE_MIN,
 	IPA_HW_STATUS_OPCODE_NEW_FRAG_RULE,
 	IPA_HW_STATUS_OPCODE_DROPPED_PACKET,
+	IPA_HW_STATUS_OPCODE_SUSPENDED_PACKET,
+	IPA_HW_STATUS_OPCODE_XLAT_PACKET = 6,
 	IPA_HW_STATUS_OPCODE_MAX
 };
 

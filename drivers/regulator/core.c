@@ -949,6 +949,8 @@ static int machine_constraints_voltage(struct regulator_dev *rdev,
 	return 0;
 }
 
+static int _regulator_do_enable(struct regulator_dev *rdev);
+
 /**
  * set_machine_constraints - sets regulator constraints
  * @rdev: regulator source
@@ -1005,10 +1007,9 @@ static int set_machine_constraints(struct regulator_dev *rdev,
 	/* If the constraints say the regulator should be on at this point
 	 * and we have control then make sure it is enabled.
 	 */
-	if ((rdev->constraints->always_on || rdev->constraints->boot_on) &&
-	    ops->enable) {
-		ret = ops->enable(rdev);
-		if (ret < 0) {
+	if (rdev->constraints->always_on || rdev->constraints->boot_on) {
+		ret = _regulator_do_enable(rdev);
+		if (ret < 0 && ret != -EINVAL) {
 			rdev_err(rdev, "failed to enable\n");
 			goto out;
 		}
@@ -1441,7 +1442,7 @@ struct regulator *regulator_get_exclusive(struct device *dev, const char *id)
 }
 EXPORT_SYMBOL_GPL(regulator_get_exclusive);
 
-/* Locks held by regulator_put() */
+/* regulator_list_mutex lock held by regulator_put() */
 static void _regulator_put(struct regulator *regulator)
 {
 	struct regulator_dev *rdev;
@@ -1456,12 +1457,14 @@ static void _regulator_put(struct regulator *regulator)
 	/* remove any sysfs entries */
 	if (regulator->dev)
 		sysfs_remove_link(&rdev->dev.kobj, regulator->supply_name);
+	mutex_lock(&rdev->mutex);
 	kfree(regulator->supply_name);
 	list_del(&regulator->list);
 	kfree(regulator);
 
 	rdev->open_count--;
 	rdev->exclusive = 0;
+	mutex_unlock(&rdev->mutex);
 
 	module_put(rdev->owner);
 }
@@ -1563,6 +1566,8 @@ static void regulator_ena_gpio_free(struct regulator_dev *rdev)
 				gpio_free(pin->gpio);
 				list_del(&pin->list);
 				kfree(pin);
+				rdev->ena_pin = NULL;
+				return;
 			} else {
 				pin->request_count--;
 			}
@@ -1625,10 +1630,12 @@ static int _regulator_do_enable(struct regulator_dev *rdev)
 	trace_regulator_enable(rdev_get_name(rdev));
 
 	if (rdev->ena_pin) {
-		ret = regulator_ena_gpio_ctrl(rdev, true);
-		if (ret < 0)
-			return ret;
-		rdev->ena_gpio_state = 1;
+		if (!rdev->ena_gpio_state) {
+			ret = regulator_ena_gpio_ctrl(rdev, true);
+			if (ret < 0)
+				return ret;
+			rdev->ena_gpio_state = 1;
+		}
 	} else if (rdev->desc->ops->enable) {
 		ret = rdev->desc->ops->enable(rdev);
 		if (ret < 0)
@@ -1675,6 +1682,8 @@ static int _regulator_enable(struct regulator_dev *rdev)
 			if (ret < 0)
 				return ret;
 
+			_notifier_call_chain(rdev, REGULATOR_EVENT_ENABLE,
+						NULL);
 		} else if (ret < 0) {
 			rdev_err(rdev, "is_enabled() failed: %d\n", ret);
 			return ret;
@@ -1734,10 +1743,12 @@ static int _regulator_do_disable(struct regulator_dev *rdev)
 	trace_regulator_disable(rdev_get_name(rdev));
 
 	if (rdev->ena_pin) {
-		ret = regulator_ena_gpio_ctrl(rdev, false);
-		if (ret < 0)
-			return ret;
-		rdev->ena_gpio_state = 0;
+		if (rdev->ena_gpio_state) {
+			ret = regulator_ena_gpio_ctrl(rdev, false);
+			if (ret < 0)
+				return ret;
+			rdev->ena_gpio_state = 0;
+		}
 
 	} else if (rdev->desc->ops->disable) {
 		ret = rdev->desc->ops->disable(rdev);
@@ -1747,8 +1758,6 @@ static int _regulator_do_disable(struct regulator_dev *rdev)
 
 	trace_regulator_disable_complete(rdev_get_name(rdev));
 
-	_notifier_call_chain(rdev, REGULATOR_EVENT_DISABLE,
-			     NULL);
 	return 0;
 }
 
@@ -1772,6 +1781,8 @@ static int _regulator_disable(struct regulator_dev *rdev)
 				rdev_err(rdev, "failed to disable\n");
 				return ret;
 			}
+			_notifier_call_chain(rdev, REGULATOR_EVENT_DISABLE,
+					NULL);
 		}
 
 		rdev->use_count = 0;
@@ -1826,20 +1837,16 @@ static int _regulator_force_disable(struct regulator_dev *rdev)
 {
 	int ret = 0;
 
-	/* force disable */
-	if (rdev->desc->ops->disable) {
-		/* ah well, who wants to live forever... */
-		ret = rdev->desc->ops->disable(rdev);
-		if (ret < 0) {
-			rdev_err(rdev, "failed to force disable\n");
-			return ret;
-		}
-		/* notify other consumers that power has been forced off */
-		_notifier_call_chain(rdev, REGULATOR_EVENT_FORCE_DISABLE |
-			REGULATOR_EVENT_DISABLE, NULL);
+	ret = _regulator_do_disable(rdev);
+	if (ret < 0) {
+		rdev_err(rdev, "failed to force disable\n");
+		return ret;
 	}
 
-	return ret;
+	_notifier_call_chain(rdev, REGULATOR_EVENT_FORCE_DISABLE |
+			REGULATOR_EVENT_DISABLE, NULL);
+
+	return 0;
 }
 
 /**
@@ -2174,6 +2181,40 @@ int regulator_list_voltage(struct regulator *regulator, unsigned selector)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(regulator_list_voltage);
+
+/**
+ * regulator_list_corner_voltage - return the maximum voltage in microvolts that
+ *	can be physically configured for the regulator when operating at the
+ *	specified voltage corner
+ * @regulator: regulator source
+ * @corner: voltage corner value
+ * Context: can sleep
+ *
+ * This function can be used for regulators which allow scaling between
+ * different voltage corners as opposed to be different absolute voltages.  The
+ * absolute voltage for a given corner may vary part-to-part or for a given part
+ * at runtime based upon various factors.
+ *
+ * Returns a voltage corresponding to the specified voltage corner or a negative
+ * errno if the corner value can't be used on this system.
+ */
+int regulator_list_corner_voltage(struct regulator *regulator, int corner)
+{
+	struct regulator_dev *rdev = regulator->rdev;
+	int ret;
+
+	if (corner < rdev->constraints->min_uV ||
+	    corner > rdev->constraints->max_uV ||
+	    !rdev->desc->ops->list_corner_voltage)
+		return -EINVAL;
+
+	mutex_lock(&rdev->mutex);
+	ret = rdev->desc->ops->list_corner_voltage(rdev, corner);
+	mutex_unlock(&rdev->mutex);
+
+	return ret;
+}
+EXPORT_SYMBOL(regulator_list_corner_voltage);
 
 /**
  * regulator_is_supported_voltage - check if a voltage range can be supported
@@ -3808,6 +3849,15 @@ static const struct file_operations reg_consumers_fops = {
 	.release	= single_release,
 };
 
+static void rdev_deinit_debugfs(struct regulator_dev *rdev)
+{
+	if (!IS_ERR_OR_NULL(rdev)) {
+		debugfs_remove_recursive(rdev->debugfs);
+		rdev->debug_consumer->debugfs = NULL;
+		regulator_put(rdev->debug_consumer);
+	}
+}
+
 static void rdev_init_debugfs(struct regulator_dev *rdev)
 {
 	struct dentry *err_ptr = NULL;
@@ -3842,6 +3892,7 @@ static void rdev_init_debugfs(struct regulator_dev *rdev)
 		pr_err("Error-Bad Function Input\n");
 		goto error;
 	}
+	rdev->debug_consumer = reg;
 
 	reg_ops = rdev->desc->ops;
 	mode = S_IRUGO | S_IWUSR;
@@ -3851,7 +3902,6 @@ static void rdev_init_debugfs(struct regulator_dev *rdev)
 						reg, &reg_enable_fops);
 	if (IS_ERR(err_ptr)) {
 		pr_err("Error-Could not create enable file\n");
-		debugfs_remove_recursive(rdev->debugfs);
 		goto error;
 	}
 
@@ -3866,7 +3916,6 @@ static void rdev_init_debugfs(struct regulator_dev *rdev)
 					rdev->debugfs, reg, &reg_fdisable_fops);
 	if (IS_ERR(err_ptr)) {
 		pr_err("Error-Could not create force_disable file\n");
-		debugfs_remove_recursive(rdev->debugfs);
 		goto error;
 	}
 
@@ -3881,7 +3930,6 @@ static void rdev_init_debugfs(struct regulator_dev *rdev)
 						reg, &reg_volt_fops);
 	if (IS_ERR(err_ptr)) {
 		pr_err("Error-Could not create voltage file\n");
-		debugfs_remove_recursive(rdev->debugfs);
 		goto error;
 	}
 
@@ -3896,7 +3944,6 @@ static void rdev_init_debugfs(struct regulator_dev *rdev)
 						reg, &reg_mode_fops);
 	if (IS_ERR(err_ptr)) {
 		pr_err("Error-Could not create mode file\n");
-		debugfs_remove_recursive(rdev->debugfs);
 		goto error;
 	}
 
@@ -3911,18 +3958,26 @@ static void rdev_init_debugfs(struct regulator_dev *rdev)
 				rdev->debugfs, reg, &reg_optimum_mode_fops);
 	if (IS_ERR(err_ptr)) {
 		pr_err("Error-Could not create optimum_mode file\n");
-		debugfs_remove_recursive(rdev->debugfs);
 		goto error;
 	}
 
+	return;
+
 error:
+	rdev_deinit_debugfs(rdev);
 	return;
 }
+
 #else
+
+static inline void rdev_deinit_debugfs(struct regulator_dev *rdev)
+{
+}
+
 static inline void rdev_init_debugfs(struct regulator_dev *rdev)
 {
-	return;
 }
+
 #endif
 
 /**
@@ -4026,12 +4081,6 @@ regulator_register(const struct regulator_desc *regulator_desc,
 				 config->ena_gpio, ret);
 			goto wash;
 		}
-
-		if (config->ena_gpio_flags & GPIOF_OUT_INIT_HIGH)
-			rdev->ena_gpio_state = 1;
-
-		if (config->ena_gpio_invert)
-			rdev->ena_gpio_state = !rdev->ena_gpio_state;
 	}
 
 	/* set regulator constraints */
@@ -4137,8 +4186,8 @@ void regulator_unregister(struct regulator_dev *rdev)
 	if (rdev->supply)
 		regulator_put(rdev->supply);
 	regulator_proxy_consumer_unregister(rdev->proxy_consumer);
+	rdev_deinit_debugfs(rdev);
 	mutex_lock(&regulator_list_mutex);
-	debugfs_remove_recursive(rdev->debugfs);
 	flush_work(&rdev->disable_work.work);
 	WARN_ON(rdev->open_count);
 	unset_regulator_supplies(rdev);
@@ -4197,23 +4246,20 @@ int regulator_suspend_finish(void)
 
 	mutex_lock(&regulator_list_mutex);
 	list_for_each_entry(rdev, &regulator_list, list) {
-		struct regulator_ops *ops = rdev->desc->ops;
-
 		mutex_lock(&rdev->mutex);
-		if ((rdev->use_count > 0  || rdev->constraints->always_on) &&
-				ops->enable) {
-			error = ops->enable(rdev);
-			if (error)
-				ret = error;
+		if (rdev->use_count > 0  || rdev->constraints->always_on) {
+			if (!_regulator_is_enabled(rdev)) {
+				error = _regulator_do_enable(rdev);
+				if (error)
+					ret = error;
+			}
 		} else {
 			if (!has_full_constraints)
-				goto unlock;
-			if (!ops->disable)
 				goto unlock;
 			if (!_regulator_is_enabled(rdev))
 				goto unlock;
 
-			error = ops->disable(rdev);
+			error = _regulator_do_disable(rdev);
 			if (error)
 				ret = error;
 		}
@@ -4224,6 +4270,123 @@ unlock:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(regulator_suspend_finish);
+
+/* Add for vreg debug */
+#define VREG_NUM_MAX 100
+
+int vreg_dump_info(char *buf)
+{
+	char *p = buf;
+	struct regulator_dev *rdev;
+	unsigned on, mv;
+	int id;
+
+	mutex_lock(&regulator_list_mutex);
+
+	id = 0;
+	list_for_each_entry(rdev, &regulator_list, list) {
+		struct regulator_ops *ops = rdev->desc->ops;
+
+		p += snprintf(p, PAGE_SIZE, "[%2d]%10s: ",
+			id++, rdev->desc->name);
+
+		on = mv = 0;
+		mutex_lock(&rdev->mutex);
+
+		if (ops->is_enabled)
+			on = ops->is_enabled(rdev);
+		if (ops->get_voltage)
+			mv = ops->get_voltage(rdev) / 1000;
+
+		mutex_unlock(&rdev->mutex);
+
+		p += snprintf(p, PAGE_SIZE, "%s ", on ? "on " : "off");
+		p += snprintf(p, PAGE_SIZE, "%4d mv ", mv);
+		p += snprintf(p, PAGE_SIZE, "\n");
+	}
+
+	mutex_unlock(&regulator_list_mutex);
+
+	return p - buf;
+}
+
+
+/* save vreg config before sleep */
+static unsigned before_sleep_fetched;
+static unsigned before_sleep_configs[VREG_NUM_MAX];
+void vreg_before_sleep_save_configs(void)
+{
+	struct regulator_dev *rdev;
+	unsigned on, mv;
+	int id;
+
+	/* only save vreg configs when it has been fetched */
+	if (!before_sleep_fetched)
+		return;
+
+	pr_debug("%s(), before_sleep_fetched=%d\n",
+		__func__, before_sleep_fetched);
+	before_sleep_fetched = false;
+
+	mutex_lock(&regulator_list_mutex);
+
+	id = 0;
+	list_for_each_entry(rdev, &regulator_list, list) {
+		struct regulator_ops *ops = rdev->desc->ops;
+
+		on = mv = 0;
+		mutex_lock(&rdev->mutex);
+
+		if (ops->is_enabled)
+			on = ops->is_enabled(rdev);
+		if (ops->get_voltage)
+			mv = ops->get_voltage(rdev) / 1000;
+
+		mutex_unlock(&rdev->mutex);
+
+		before_sleep_configs[id] = mv | (on << 31);
+		if (++id >= VREG_NUM_MAX)
+			break;
+	}
+
+	mutex_unlock(&regulator_list_mutex);
+}
+
+int vreg_before_sleep_dump_info(char *buf)
+{
+	char *p = buf;
+
+	p += snprintf(p, PAGE_SIZE, "vreg_before_sleep:\n");
+	if (!before_sleep_fetched) {
+		struct regulator_dev *rdev;
+		unsigned on, mv;
+		int id;
+
+		before_sleep_fetched = true;
+
+		mutex_lock(&regulator_list_mutex);
+
+		id = 0;
+		list_for_each_entry(rdev, &regulator_list, list) {
+			p += snprintf(p, PAGE_SIZE, "[%2d]%10s: ",
+				id, rdev->desc->name);
+
+			mv = before_sleep_configs[id];
+			on = (mv & 0x80000000) >> 31;
+			mv &= ~0x80000000;
+
+			p += snprintf(p, PAGE_SIZE, "%s ", on ? "on " : "off");
+			p += snprintf(p, PAGE_SIZE, "%4d mv ", mv);
+			p += snprintf(p, PAGE_SIZE, "\n");
+
+			if (++id >= VREG_NUM_MAX)
+				break;
+		}
+
+		mutex_unlock(&regulator_list_mutex);
+	}
+	return p - buf;
+}
 
 /**
  * regulator_has_full_constraints - the system has fully specified constraints
@@ -4419,7 +4582,7 @@ static int __init regulator_init_complete(void)
 		ops = rdev->desc->ops;
 		c = rdev->constraints;
 
-		if (!ops->disable || (c && c->always_on))
+		if (c && c->always_on)
 			continue;
 
 		mutex_lock(&rdev->mutex);
@@ -4441,7 +4604,7 @@ static int __init regulator_init_complete(void)
 			 * goes wrong. */
 			if (!suppress_info_printing)
 				rdev_info(rdev, "disabling\n");
-			ret = ops->disable(rdev);
+			ret = _regulator_do_disable(rdev);
 			if (ret != 0) {
 				rdev_err(rdev, "couldn't disable: %d\n", ret);
 			}

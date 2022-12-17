@@ -308,6 +308,8 @@ struct hci_conn {
 
 	bdaddr_t	dst;
 	__u8		dst_type;
+	bdaddr_t	src;
+	__u8		src_type;
 	__u16		handle;
 	__u16		state;
 	__u8		mode;
@@ -600,6 +602,7 @@ int hci_conn_check_secure(struct hci_conn *conn, __u8 sec_level);
 int hci_conn_security(struct hci_conn *conn, __u8 sec_level, __u8 auth_type);
 int hci_conn_change_link_key(struct hci_conn *conn);
 int hci_conn_switch_role(struct hci_conn *conn, __u8 role);
+int hci_cfg_link_policy(struct hci_conn *conn);
 
 void hci_conn_enter_active_mode(struct hci_conn *conn, __u8 force_active);
 

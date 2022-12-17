@@ -55,6 +55,7 @@ static int kmem_cache_sanity_check(struct mem_cgroup *memcg, const char *name,
 			continue;
 		}
 
+#if !defined(CONFIG_SLUB)
 		/*
 		 * For simplicity, we won't check this in the list of memcg
 		 * caches. We have control over memcg naming, and if there
@@ -68,6 +69,7 @@ static int kmem_cache_sanity_check(struct mem_cgroup *memcg, const char *name,
 			s = NULL;
 			return -EINVAL;
 		}
+#endif
 	}
 
 	WARN_ON(strchr(name, ' '));	/* It confuses parsers */
@@ -322,7 +324,7 @@ struct kmem_cache *__init create_kmalloc_cache(const char *name, size_t size,
 struct kmem_cache *kmalloc_caches[KMALLOC_SHIFT_HIGH + 1];
 EXPORT_SYMBOL(kmalloc_caches);
 
-#ifdef CONFIG_ZONE_DMA
+#if defined(CONFIG_ZONE_DMA) && !defined(CONFIG_FORCE_KMALLOC_FROM_DMA_ZONE)
 struct kmem_cache *kmalloc_dma_caches[KMALLOC_SHIFT_HIGH + 1];
 EXPORT_SYMBOL(kmalloc_dma_caches);
 #endif
@@ -386,7 +388,7 @@ struct kmem_cache *kmalloc_slab(size_t size, gfp_t flags)
 	} else
 		index = fls(size - 1);
 
-#ifdef CONFIG_ZONE_DMA
+#if defined(CONFIG_ZONE_DMA) && !defined(CONFIG_FORCE_KMALLOC_FROM_DMA_ZONE)
 	if (unlikely((flags & GFP_DMA)))
 		return kmalloc_dma_caches[index];
 
@@ -445,6 +447,10 @@ void __init create_kmalloc_caches(unsigned long flags)
 			size_index[size_index_elem(i)] = 8;
 	}
 	for (i = KMALLOC_SHIFT_LOW; i <= KMALLOC_SHIFT_HIGH; i++) {
+
+		if (IS_ENABLED(CONFIG_FORCE_KMALLOC_FROM_DMA_ZONE))
+			flags |= SLAB_CACHE_DMA;
+
 		if (!kmalloc_caches[i]) {
 			kmalloc_caches[i] = create_kmalloc_cache(NULL,
 							1 << i, flags);
@@ -477,7 +483,7 @@ void __init create_kmalloc_caches(unsigned long flags)
 		}
 	}
 
-#ifdef CONFIG_ZONE_DMA
+#if defined(CONFIG_ZONE_DMA) && !defined(CONFIG_FORCE_KMALLOC_FROM_DMA_ZONE)
 	for (i = 0; i <= KMALLOC_SHIFT_HIGH; i++) {
 		struct kmem_cache *s = kmalloc_caches[i];
 
@@ -494,7 +500,6 @@ void __init create_kmalloc_caches(unsigned long flags)
 #endif
 }
 #endif /* !CONFIG_SLOB */
-
 
 #ifdef CONFIG_SLABINFO
 void print_slabinfo_header(struct seq_file *m)

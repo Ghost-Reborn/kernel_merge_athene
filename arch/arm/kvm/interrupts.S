@@ -49,6 +49,7 @@ __kvm_hyp_code_start:
 ENTRY(__kvm_tlb_flush_vmid_ipa)
 	push	{r2, r3}
 
+	dsb	ishst
 	add	r0, r0, #KVM_VTTBR
 	ldrd	r2, r3, [r0]
 	mcrr	p15, 6, r2, r3, c2	@ Write VTTBR
@@ -158,13 +159,9 @@ __kvm_vcpu_return:
 	@ Don't trap coprocessor accesses for host kernel
 	set_hstr vmexit
 	set_hdcr vmexit
-	set_hcptr vmexit, (HCPTR_TTA | HCPTR_TCP(10) | HCPTR_TCP(11))
+	set_hcptr vmexit, (HCPTR_TTA | HCPTR_TCP(10) | HCPTR_TCP(11)), after_vfp_restore
 
 #ifdef CONFIG_VFPv3
-	@ Save floating point registers we if let guest use them.
-	tst	r2, #(HCPTR_TCP(10) | HCPTR_TCP(11))
-	bne	after_vfp_restore
-
 	@ Switch VFP/NEON hardware state to the host's
 	add	r7, vcpu, #VCPU_VFP_GUEST
 	store_vfp_state r7
@@ -176,6 +173,8 @@ after_vfp_restore:
 	@ Restore FPEXC_EN which we clobbered on entry
 	pop	{r2}
 	VFPFMXR FPEXC, r2
+#else
+after_vfp_restore:
 #endif
 
 	@ Reset Hyp-role
@@ -218,6 +217,10 @@ after_vfp_restore:
  * function pointer can be passed).  The function being called must be mapped
  * in Hyp mode (see init_hyp_mode in arch/arm/kvm/arm.c).  Return values are
  * passed in r0 and r1.
+ *
+ * A function pointer with a value of 0xffffffff has a special meaning,
+ * and is used to implement __hyp_get_vectors in the same way as in
+ * arch/arm/kernel/hyp_stub.S.
  *
  * The calling convention follows the standard AAPCS:
  *   r0 - r3: caller save
@@ -291,6 +294,7 @@ THUMB(	orr	r2, r2, #PSR_T_BIT	)
 	ldr	r2, =BSYM(panic)
 	msr	ELR_hyp, r2
 	ldr	r0, =\panic_str
+	clrex				@ Clear exclusive monitor
 	eret
 .endm
 
@@ -361,6 +365,11 @@ hyp_hvc:
 host_switch_to_hyp:
 	pop	{r0, r1, r2}
 
+	/* Check for __hyp_get_vectors */
+	cmp	r0, #-1
+	mrceq	p15, 4, r0, c12, c0, 0	@ get HVBAR
+	beq	1f
+
 	push	{lr}
 	mrs	lr, SPSR
 	push	{lr}
@@ -376,7 +385,7 @@ THUMB(	orr	lr, #1)
 	pop	{lr}
 	msr	SPSR_csxf, lr
 	pop	{lr}
-	eret
+1:	eret
 
 guest_trap:
 	load_vcpu			@ Load VCPU pointer to r0
@@ -414,6 +423,10 @@ guest_trap:
 	mrcne	p15, 4, r2, c6, c0, 4	@ HPFAR
 	bne	3f
 
+	/* Preserve PAR */
+	mrrc	p15, 0, r0, r1, c7	@ PAR
+	push	{r0, r1}
+
 	/* Resolve IPA using the xFAR */
 	mcr	p15, 0, r2, c7, c8, 0	@ ATS1CPR
 	isb
@@ -424,13 +437,20 @@ guest_trap:
 	lsl	r2, r2, #4
 	orr	r2, r2, r1, lsl #24
 
+	/* Restore PAR */
+	pop	{r0, r1}
+	mcrr	p15, 0, r0, r1, c7	@ PAR
+
 3:	load_vcpu			@ Load VCPU pointer to r0
 	str	r2, [r0, #VCPU_HPFAR]
 
 1:	mov	r1, #ARM_EXCEPTION_HVC
 	b	__kvm_vcpu_return
 
-4:	pop	{r0, r1, r2}		@ Failed translation, return to guest
+4:	pop	{r0, r1}		@ Failed translation, return to guest
+	mcrr	p15, 0, r0, r1, c7	@ PAR
+	clrex
+	pop	{r0, r1, r2}
 	eret
 
 /*
@@ -445,7 +465,7 @@ switch_to_guest_vfp:
 	push	{r3-r7}
 
 	@ NEON/VFP used.  Turn on VFP access.
-	set_hcptr vmexit, (HCPTR_TCP(10) | HCPTR_TCP(11))
+	set_hcptr vmtrap, (HCPTR_TCP(10) | HCPTR_TCP(11))
 
 	@ Switch VFP/NEON hardware state to the guest's
 	add	r7, r0, #VCPU_VFP_HOST
@@ -456,6 +476,7 @@ switch_to_guest_vfp:
 
 	pop	{r3-r7}
 	pop	{r0-r2}
+	clrex
 	eret
 #endif
 
